@@ -1,15 +1,16 @@
 ---
 name: board-uiux-test
-description: tempboard 를 로컬로 띄워 Playwright 로 데스크톱(Chromium · WebKit) · 폰(iPhone 13 · Pixel 7 흉내) · 두 사람 동기화를 실제로 눌러 보는 시험 절차와 번들 스크립트. board-uiux-tester 에이전트가 쓴다. "UI 시험", "폰에서 되는지 봐 줘", "화면 깨지는지 확인", "두 사람이 같이 쓰는지 시험" 이면 이 스킬.
+description: Cera 를 로컬로 띄워 Playwright 로 데스크톱(Chromium · WebKit) · 폰(iPhone 13 · Pixel 7 흉내) · 두 사람 동기화를 실제로 눌러 보는 시험 절차와 번들 스크립트. board-uiux-tester 에이전트가 쓴다. "UI 시험", "폰에서 되는지 봐 줘", "화면 깨지는지 확인", "두 사람이 같이 쓰는지 시험" 이면 이 스킬.
 ---
 
 # board-uiux-test
 
 ## 보드 띄우기
 ```bash
-S=~/Projects/tempboard/.claude/skills/board-uiux-test/scripts
-cd ~/Projects/tempboard/web && npx vite build          # 최신 코드로
-URL=$($S/local_board.sh start)                          # 임시 TEMPBOARD_HOME, 터널 없음 → 편집 링크 출력
+R="$(git rev-parse --show-toplevel)"                    # 이 체크아웃(워크트리여도 된다)
+S="$R/.claude/skills/board-uiux-test/scripts"
+cd "$R/web" && npx vite build                           # 최신 코드로
+URL=$($S/local_board.sh start)                          # 임시 CERA_HOME, 터널 없음 → 편집 링크 출력
 python3 $S/ui_smoke.py "$URL" _workspace/shots/r1        # 기본 점검(아래)
 $S/local_board.sh stop                                  # 끝나면 꼭
 ```

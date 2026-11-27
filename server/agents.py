@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Agent tokens — storage, issuing, listing, revoking, and the `tempboard agent …` command.
+"""Agent tokens — storage, issuing, listing, revoking, and the `cera agent …` command.
 
-    tempboard agent add <id> --name Claude [--role edit|view] [--ttl 2h] [--json]   # the token is shown only once, at this point
-    tempboard agent list <id> [--json]
-    tempboard agent revoke <id> <token-id> | --all | --by mcp
+    cera agent add <id> --name Claude [--role edit|view] [--ttl 2h] [--json]   # the token is shown only once, at this point
+    cera agent list <id> [--json]
+    cera agent revoke <id> <token-id> | --all | --by mcp
 
 Token = `tb_ag_<token_urlsafe(24)>`. Only the sha256 is stored in `agents` in state.json (no plaintext; the file is 0600).
 The server accepts tokens only via the `Authorization: Bearer` header (server.AgentTokens). The supervisor loop re-reads
@@ -31,7 +31,7 @@ MAX_TTL = 30 * 86400
 
 
 def _sibling(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -143,7 +143,7 @@ def listing(sites, sid: str) -> List[dict]:
 
 
 def url_for(st: dict) -> Tuple[Optional[str], Optional[str]]:
-    """The address an agent should use as TEMPBOARD_URL, plus a note. Personal / Access mode accepts tokens only on this Mac, so a local address is returned."""
+    """The address an agent should use as CERA_URL, plus a note. Personal / Access mode accepts tokens only on this Mac, so a local address is returned."""
     local, public = st.get("local_url"), st.get("public_url")
     if st.get("mode") == "personal" or st.get("access"):
         return local, T("이 보드는 개인 · Access 모드라 에이전트 토큰은 이 컴퓨터 안(로컬 주소)에서만 통한다. 다른 컴퓨터의 에이전트는 "
@@ -210,18 +210,18 @@ def register(sub, ctx):
             return
         print(T(f"에이전트 토큰 {ent['id']} ({ent['name']} · {ent['role']}) — {_when(ent['expires_at'])} 까지",
                 f"Agent token {ent['id']} ({ent['name']} · {ent['role']}) — until {_when(ent['expires_at'])}"))
-        print(T("  에이전트(MCP `tempboard mcp`) 쪽 환경 변수 두 줄 — 토큰은 지금 한 번만 보인다:",
-                "  Two environment variables for the agent (MCP `tempboard mcp`) — the token is shown only this once:"))
-        print(f"    TEMPBOARD_URL=" + (url or T('<사이트가 닫혀 있다 — 열린 뒤 tempboard links ' + a.id + ' 의 주소>',
-                                                '<the site is closed — use the address from tempboard links ' + a.id + ' once it is open>')))
-        print(f"    TEMPBOARD_TOKEN={token}")
+        print(T("  에이전트(MCP `cera mcp`) 쪽 환경 변수 두 줄 — 토큰은 지금 한 번만 보인다:",
+                "  Two environment variables for the agent (MCP `cera mcp`) — the token is shown only this once:"))
+        print(f"    CERA_URL=" + (url or T('<사이트가 닫혀 있다 — 열린 뒤 cera links ' + a.id + ' 의 주소>',
+                                                '<the site is closed — use the address from cera links ' + a.id + ' once it is open>')))
+        print(f"    CERA_TOKEN={token}")
         if note:
             print(f"  ※ {note}")
         print(T("  ※ 토큰은 MCP 설정의 env 칸에 넣는다 — 셸에 그대로 붙이거나 채팅 · 에이전트에게 보이면 셸 기록 · 대화 기록에 남는다"
                 "(그랬다면 취소하고 새로 발급).",
                 "  Note: put the token in the env field of the MCP config — pasting it into a shell or showing it in a chat / to an agent "
                 "leaves it in shell history / conversation logs (if that happened, revoke it and issue a new one)."))
-        print(T(f"  끊으려면 tempboard agent revoke {a.id} {ent['id']}", f"  To cut it off: tempboard agent revoke {a.id} {ent['id']}"))
+        print(T(f"  끊으려면 cera agent revoke {a.id} {ent['id']}", f"  To cut it off: cera agent revoke {a.id} {ent['id']}"))
 
     def cmd_list(a):
         ctx.need(a.id)
@@ -230,7 +230,7 @@ def register(sub, ctx):
             print(json.dumps(rows, ensure_ascii=False))
             return
         if not rows:
-            print(T("토큰이 없다 — tempboard agent add " + a.id + " --name <이름>", "No tokens — tempboard agent add " + a.id + " --name <name>"))
+            print(T("토큰이 없다 — cera agent add " + a.id + " --name <이름>", "No tokens — cera agent add " + a.id + " --name <name>"))
         for r in rows:
             print(f"{r.get('id')}  {r.get('name', ''):16} {r.get('role', ''):4}  ~{_when(r.get('expires_at'))}  ({r.get('by', '')})")
 
@@ -243,7 +243,7 @@ def register(sub, ctx):
             print(json.dumps([{k: v for k, v in g.items() if k != "sha256"} for g in gone], ensure_ascii=False))
             return
         if not gone:
-            raise SystemExit(T("맞는 토큰이 없다 — tempboard agent list " + a.id, "No matching token — tempboard agent list " + a.id))
+            raise SystemExit(T("맞는 토큰이 없다 — cera agent list " + a.id, "No matching token — cera agent list " + a.id))
         live = ctx.live_status(ctx.read_state(a.id) or {}) == "running"
         print(T(f"토큰 {len(gone)}개 취소 — " + ("2초 안에 끊긴다" if live else "사이트는 닫혀 있다"),
                 f"Revoked {len(gone)} token(s) — " + ("cut off within 2 seconds" if live else "the site is closed")))

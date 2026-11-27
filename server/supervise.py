@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""tempboard supervise loop + state file (standard library only).
+"""Cera supervise loop + state file (standard library only).
 
-`bin/tempboard _serve` (quick tunnel, 5 attempts) and `tempboard site run` (named tunnel, unlimited exponential backoff)
+`bin/cera _serve` (quick tunnel, 5 attempts) and `cera site run` (named tunnel, unlimited exponential backoff)
 share the same loop. One process starts the server + (optionally) a tunnel child, and every second it
   - checks expiry (expires_at),
   - re-reads state.json if its mtime changed and calls access.reload(st) / hosts.set(...)
-    (so `tempboard keys --rotate` and agent-token revocation take effect within 2 seconds; SIGHUP still means "stop").
+    (so `cera keys --rotate` and agent-token revocation take effect within 2 seconds; SIGHUP still means "stop").
 
 All state-file writes go through update_state() — take a flock on `sites/<id>/state.lock`, read -> fn -> atomic replace (0600).
 So a supervisor public_url write overlapping with `keys --rotate` never loses either field.
@@ -26,7 +26,7 @@ from typing import Callable, List, Optional
 
 try:
     import fcntl
-except ImportError:   # Windows — no locking (tempboard targets macOS and Linux)
+except ImportError:   # Windows — no locking (Cera targets macOS and Linux)
     fcntl = None
 
 
@@ -36,8 +36,8 @@ def state_path(sites, sid) -> Path:
 
 
 def T(ko, en):
-    """Korean or English text (server/i18n.py: TEMPBOARD_LANG > `tempboard lang` > locale > English)."""
-    key = "tempboard_i18n"
+    """Korean or English text (server/i18n.py: CERA_LANG > `cera lang` > locale > English)."""
+    key = "cera_i18n"
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().parent / "i18n.py")
         mod = importlib.util.module_from_spec(spec)

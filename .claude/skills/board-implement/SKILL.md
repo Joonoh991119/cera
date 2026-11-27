@@ -1,6 +1,6 @@
 ---
 name: board-implement
-description: tempboard 코드(web/src · server · bin)에 기능을 구현하는 방법 — 코드 지도, Excalidraw 0.18 함정, 동기화 규칙, 글꼴 칸, 빌드 · 시험 · 버전 올리기. board-implementer 에이전트가 쓰고, 리더의 통합 단계도 쓴다. tempboard 코드를 고치거나 버그를 잡거나 기능을 더하는 일이면 이 스킬.
+description: Cera 코드(web/src · server · bin)에 기능을 구현하는 방법 — 코드 지도, Excalidraw 0.18 함정, 동기화 규칙, 글꼴 칸, 빌드 · 시험 · 버전 올리기. board-implementer 에이전트가 쓰고, 리더의 통합 단계도 쓴다. Cera 코드를 고치거나 버그를 잡거나 기능을 더하는 일이면 이 스킬.
 ---
 
 # board-implement
@@ -15,7 +15,7 @@ description: tempboard 코드(web/src · server · bin)에 기능을 구현하�
 | `web/src/textstyle.js` · `mathgate.js` | 순수 로직(시험 있음) |
 | `web/src/kfonts*.css` | 한글 글꼴을 Excalidraw 글꼴 칸에 unicode-range 로 붙임. `scripts/fetch-kfonts.py` 가 생성 |
 | `server/server.py` | 표준 라이브러리 서버. 요소 병합 `wins()`, 파일(이미지 data URL ≤10 MB, png/jpeg/gif/webp/svg), 한 번 2000 요소 |
-| `bin/tempboard` | CLI(start/list/links/stop/export/delete), dist 내려받기 |
+| `bin/cera` | CLI(start/list/links/stop/export/delete), dist 내려받기 |
 
 ## 동기화 규칙
 - 보드 상태 = Excalidraw 요소 배열 + files. 새 기능은 **요소로 표현**한다(도형 · 텍스트 · 이미지 · 화살표 · frame, 부가 정보는 `customData`). 그래야 서버 병합(version/versionNonce)과 다른 사람 화면이 그대로 동작한다.
@@ -42,11 +42,12 @@ description: tempboard 코드(web/src · server · bin)에 기능을 구현하�
 
 ## 빌드 · 시험
 ```bash
-cd ~/Projects/tempboard/web && npm test && npx vite build
-cd ~/Projects/tempboard && python3 -m unittest discover -s tests -q
-claude plugin validate ~/Projects/tempboard
+R="$(git rev-parse --show-toplevel)"   # 이 체크아웃(워크트리여도 된다)
+cd "$R/web" && npm test && npx vite build
+cd "$R" && python3 -m unittest discover -s tests -q
+claude plugin validate "$R"
 ```
 순수 로직은 `web/tests/<이름>.test.mjs`(node:test). UI 확인은 board-uiux-test 스킬의 `local_board.sh`.
 
 ## 버전 올리기(통합 단계만)
-`.claude-plugin/plugin.json` · `.claude-plugin/marketplace.json` · `web/package.json` · `web/package-lock.json` 의 루트 두 곳(`version`, `packages[""].version`)만 — lock 파일에 sed 를 쓰지 않는다(의존성 버전까지 바뀐 적 있다). 릴리스 자산 `tempboard-dist.tar.gz` 는 `scripts/release-dist.sh`, push · release 는 사용자가 요청할 때만.
+`.claude-plugin/plugin.json` · `.claude-plugin/marketplace.json` · `web/package.json` · `web/package-lock.json` 의 루트 두 곳(`version`, `packages[""].version`)만 — lock 파일에 sed 를 쓰지 않는다(의존성 버전까지 바뀐 적 있다). 릴리스 자산 `cera-dist.tar.gz` 는 `scripts/release-dist.sh`, push · release 는 사용자가 요청할 때만.

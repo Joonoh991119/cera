@@ -1,4 +1,4 @@
-"""tempboard 기본 UI 점검 — 데스크톱(Chromium · WebKit) + 폰(iPhone 13 · Pixel 7), 두 사람 동기화.
+"""Cera 기본 UI 점검 — 데스크톱(Chromium · WebKit) + 폰(iPhone 13 · Pixel 7), 두 사람 동기화.
 usage: python3 ui_smoke.py <edit-url> <shots-dir>
 기능별 시험은 이 파일을 복사해 _workspace/tests/ 에서 고쳐 쓴다."""
 import json, sys, time

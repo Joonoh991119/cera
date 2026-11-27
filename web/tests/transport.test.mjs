@@ -97,7 +97,7 @@ test("R1(실제 서버) — ack 직후 저장 전 강제 종료 · 같은 ID 수
   const base = `http://127.0.0.1:${port}`;
   let serverLog = "";   // kept so a failed restart says why (port still busy, Python missing, ...)
   const start = (interval) => {
-    const p = spawn(process.env.TEMPBOARD_TEST_PYTHON || "python3", [SERVER, "--data", data, "--port", String(port), "--test-user", "시험", "--save-interval", String(interval)], { stdio: ["ignore", "ignore", "pipe"] });
+    const p = spawn(process.env.CERA_TEST_PYTHON || process.env.TEMPBOARD_TEST_PYTHON || "python3", [SERVER, "--data", data, "--port", String(port), "--test-user", "시험", "--save-interval", String(interval)], { stdio: ["ignore", "ignore", "pipe"] });
     p.stderr.on("data", (b) => { serverLog = (serverLog + b.toString()).slice(-2000); });
     p.on("exit", (code, sig) => { serverLog += `\n[server exited code=${code} signal=${sig}]`; });
     return p;

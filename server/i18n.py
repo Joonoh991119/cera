@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Language choice for CLI, server and MCP text: Korean ("ko") or English ("en").
 
-Order: $TEMPBOARD_LANG (ko | en) > the saved choice in $TEMPBOARD_HOME/config.json ("lang", set by
-`tempboard lang ko|en|auto`) > the system locale ($LC_ALL, $LC_MESSAGES, $LANG starting with "ko") > English.
+Order: $CERA_LANG (ko | en; the old name TEMPBOARD_LANG also works) > the saved choice in $CERA_HOME/config.json ("lang", set by
+`cera lang ko|en|auto`) > the system locale ($LC_ALL, $LC_MESSAGES, $LANG starting with "ko") > English.
 
 Usage, with both texts side by side at the call site:
 
@@ -13,8 +13,10 @@ Standard library only; importable on Python 3.9.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -22,8 +24,28 @@ LANGS = ("ko", "en")
 _cache: dict = {}
 
 
+def _env_module():
+    """server/env.py (CERA_* names with the old TEMPBOARD_* fallback), loaded once by path as `cera_env`."""
+    key = "cera_env"
+    if key not in sys.modules:
+        spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().with_name("env.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop(key, None)
+            raise
+    return sys.modules[key]
+
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """CERA_<name>, else the old TEMPBOARD_<name> (see server/env.py)."""
+    return _env_module().env(name, default)
+
+
 def _home() -> Path:
-    return Path(os.environ.get("TEMPBOARD_HOME", Path.home() / ".tempboard"))
+    return _env_module().home()
 
 
 def config_path() -> Path:
@@ -31,7 +53,7 @@ def config_path() -> Path:
 
 
 def saved() -> Optional[str]:
-    """The language saved with `tempboard lang`, or None (auto)."""
+    """The language saved with `cera lang`, or None (auto)."""
     try:
         v = json.loads(config_path().read_text(encoding="utf-8")).get("lang")
     except (OSError, ValueError, AttributeError):
@@ -68,9 +90,9 @@ def from_locale() -> str:
 
 
 def lang() -> str:
-    env = (os.environ.get("TEMPBOARD_LANG") or "").strip().lower()
-    if env in LANGS:
-        return env
+    v = (env("LANG") or "").strip().lower()
+    if v in LANGS:
+        return v
     key = (str(config_path()), os.environ.get("LC_ALL"), os.environ.get("LC_MESSAGES"), os.environ.get("LANG"))
     if key not in _cache:
         _cache.clear()

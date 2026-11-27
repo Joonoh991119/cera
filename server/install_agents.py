@@ -1,27 +1,27 @@
 # SPDX-License-Identifier: MIT
-"""tempboard install / uninstall: attach to and detach from Claude Code, Codex and Antigravity.
+"""Cera install / uninstall: attach to and detach from Claude Code, Codex and Antigravity.
 
-    tempboard install --agent claude|codex|antigravity|all [--mode plugin|link] [--source OWNER/REPO|PATH] [--dry-run]
-    tempboard uninstall --agent claude|codex|antigravity|all [--mode plugin|link] [--dry-run]
-    tempboard install --print-config claude|codex|antigravity     # print only the MCP config snippet to paste (writes nothing)
+    cera install --agent claude|codex|antigravity|all [--mode plugin|link] [--source OWNER/REPO|PATH] [--dry-run]
+    cera uninstall --agent claude|codex|antigravity|all [--mode plugin|link] [--dry-run]
+    cera install --print-config claude|codex|antigravity     # print only the MCP config snippet to paste (writes nothing)
 
 plugin mode (default): calls each tool's own installer; the tool manages versions and updates.
-  claude       claude plugin marketplace add <source> → claude plugin install tempboard@tempboard
-  codex        codex plugin marketplace add <source> → codex plugin add tempboard@tempboard
+  claude       claude plugin marketplace add <source> → claude plugin install cera@cera
+  codex        codex plugin marketplace add <source> → codex plugin add cera@cera
   antigravity  agy plugin install <git URL|path>   (if agy is missing, only print instructions)
 link mode (development, using the checkout as is): point at this repository without copying.
-  common         ~/.local/bin/tempboard → <repo>/bin/tempboard
-  claude       claude mcp add --scope user tempboard -- <python> <repo>/bin/tempboard mcp  + ~/.claude/skills/tempboard link
-  codex        codex mcp add tempboard -- <python> <repo>/bin/tempboard mcp               + ~/.agents/skills/tempboard link
-  antigravity  ~/.gemini/config/mcp_config.json: merge mcpServers.tempboard (backup .bak-<timestamp>) + ~/.gemini/config/skills/tempboard link
+  common         ~/.local/bin/cera → <repo>/bin/cera
+  claude       claude mcp add --scope user cera -- <python> <repo>/bin/cera mcp  + ~/.claude/skills/cera link
+  codex        codex mcp add cera -- <python> <repo>/bin/cera mcp               + ~/.agents/skills/cera link
+  antigravity  ~/.gemini/config/mcp_config.json: merge mcpServers.cera (backup .bak-<timestamp>) + ~/.gemini/config/skills/cera link
 Rules: running it repeatedly gives the same result (idempotent). User config files are never edited by hand; MCP registration for Claude and Codex goes only through each tool's CLI.
-  If a tempboard entry already exists and differs, **nothing is changed**: the differences and the command to change it are shown and the script exits with 3 (to protect a remote token in env).
+  If a cera entry already exists and differs, **nothing is changed**: the differences and the command to change it are shown and the script exits with 3 (to protect a remote token in env).
   Only Antigravity's mcp_config.json is merged with the json module (backed up before changing; a symlink is written through to the file it points to; re-read after writing to verify).
-Exit codes: 0 = done, 1 = failed, 2 = bad arguments, 3 = an existing tempboard MCP entry differs and was left alone (the command to run is printed).
+Exit codes: 0 = done, 1 = failed, 2 = bad arguments, 3 = an existing cera MCP entry differs and was left alone (the command to run is printed).
 Do not install plugin and link modes for the same tool (the skill and MCP would show up twice). `all` targets only the tools that are installed.
 Paths: CLAUDE_CONFIG_DIR (default ~/.claude), CODEX_HOME (default ~/.codex) · ~/.gemini/config · ~/.agents/skills · ~/.local/bin.
 
-There is also a fixed entry point, $TEMPBOARD_HOME/bin/tempboard, used by always-on mode (site install); see write_launcher.
+There is also a fixed entry point, $CERA_HOME/bin/cera, used by always-on mode (site install); see write_launcher.
 Standard library only, Python 3.9.
 """
 from __future__ import annotations
@@ -41,7 +41,7 @@ from typing import List, Optional
 
 def T(ko, en):
     """Korean / English text (language per server/i18n.py). Loaded lazily by path so this module needs no package layout."""
-    key = "tempboard_i18n"
+    key = "cera_i18n"
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().with_name("i18n.py"))
         mod = importlib.util.module_from_spec(spec)
@@ -57,9 +57,10 @@ def T(ko, en):
 AGENTS = ("claude", "codex", "antigravity")
 EXE = {"claude": "claude", "codex": "codex", "antigravity": "agy"}
 LABEL = {"claude": "Claude Code", "codex": "Codex", "antigravity": "Antigravity"}
-NAME = "tempboard"                       # name of the plugin, marketplace, MCP server and skill
+NAME = "cera"                       # name of the plugin, marketplace, MCP server and skill
 SELECTOR = f"{NAME}@{NAME}"
-DEFAULT_SOURCE = "Joonoh991119/tempboard"
+OLD_NAME = "tempboard"               # the name before 0.5.0 — only detected and reported (see legacy_report), never removed
+DEFAULT_SOURCE = "Joonoh991119/cera"
 OWNER_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(@[^\s]+)?$")
 
 
@@ -82,9 +83,9 @@ class Paths:
     def skill(self) -> Path:
         return self.root / "skills" / NAME
 
-    def skill_link(self, agent) -> Path:
+    def skill_link(self, agent, name=NAME) -> Path:
         return {"claude": self.claude / "skills", "codex": self.home / ".agents" / "skills",
-                "antigravity": self.gemini / "skills"}[agent] / NAME
+                "antigravity": self.gemini / "skills"}[agent] / name
 
     @property
     def ag_mcp(self) -> Path:
@@ -115,54 +116,54 @@ def _read_json(path: Path):
     return json.loads(txt)
 
 
-def _is_tempboard_skill(path: Path) -> bool:
+def _is_cera_skill(path: Path) -> bool:
     try:
         head = (path / "SKILL.md").read_text(encoding="utf-8")[:400]
     except OSError:
         return False
-    return re.search(r"^name:\s*tempboard\s*$", head, re.M) is not None
+    return re.search(r"^name:\s*cera\s*$", head, re.M) is not None
 
 
-def _is_tempboard_cli(path: Path) -> bool:
+def _is_cera_cli(path: Path) -> bool:
     try:
-        return "tempboard" in path.resolve().read_text(encoding="utf-8", errors="replace")[:600]
+        return "cera" in path.resolve().read_text(encoding="utf-8", errors="replace")[:600]
     except OSError:
         return False
 
 
-def plugin_installed(p: Paths, agent) -> bool:
+def plugin_installed(p: Paths, agent, name=NAME) -> bool:
     if agent == "claude":
         try:
             d = _read_json(p.claude / "plugins" / "installed_plugins.json") or {}
         except ValueError:
             return False
-        return any(k.split("@")[0] == NAME for k in (d.get("plugins") or {}))
+        return any(k.split("@")[0] == name for k in (d.get("plugins") or {}))
     if agent == "codex":
-        return any(x.is_dir() for x in (p.codex / "plugins" / "cache").glob(f"*/{NAME}"))
-    return (p.gemini / "plugins" / NAME).exists()
+        return any(x.is_dir() for x in (p.codex / "plugins" / "cache").glob(f"*/{name}"))
+    return (p.gemini / "plugins" / name).exists()
 
 
-def mcp_registered(p: Paths, agent) -> bool:
+def mcp_registered(p: Paths, agent, name=NAME) -> bool:
     if agent == "claude":
         try:
             d = _read_json(p.claude_json) or {}
         except ValueError:
             return False
-        return NAME in (d.get("mcpServers") or {})
+        return name in (d.get("mcpServers") or {})
     if agent == "codex":
         if shutil.which("codex"):   # ask codex itself, so any TOML shape works (tables, inline tables, dotted keys, quoted headers)
-            return codex_existing(p, None).state in ("same", "differs")
+            return codex_existing(p, None, name).state in ("same", "differs")
         try:
             txt = (p.codex / "config.toml").read_text(encoding="utf-8")
         except OSError:
             return False
-        return re.search(rf"""^\s*(\[\s*mcp_servers\s*\.\s*["']?{NAME}["']?\s*\]|mcp_servers\s*\.\s*["']?{NAME}["']?\s*[.=]|{NAME}\s*=\s*\{{)""",
+        return re.search(rf"""^\s*(\[\s*mcp_servers\s*\.\s*["']?{name}["']?\s*\]|mcp_servers\s*\.\s*["']?{name}["']?\s*[.=]|{name}\s*=\s*\{{)""",
                          txt, re.M) is not None
     try:
         d = _read_json(p.ag_mcp) or {}
     except ValueError:
         return False
-    return isinstance(d, dict) and NAME in (d.get("mcpServers") or {})
+    return isinstance(d, dict) and name in (d.get("mcpServers") or {})
 
 
 def our_link(link: Path, target_check) -> bool:
@@ -170,8 +171,8 @@ def our_link(link: Path, target_check) -> bool:
 
 
 def link_installed(p: Paths, agent) -> bool:
-    """Treat it as link mode if our skill link exists, or if the tempboard MCP is registered without the plugin (links that are not ours do not count)."""
-    return our_link(p.skill_link(agent), _is_tempboard_skill) or (mcp_registered(p, agent) and not plugin_installed(p, agent))
+    """Treat it as link mode if our skill link exists, or if the cera MCP is registered without the plugin (links that are not ours do not count)."""
+    return our_link(p.skill_link(agent), _is_cera_skill) or (mcp_registered(p, agent) and not plugin_installed(p, agent))
 
 
 def foreign_at(link: Path, target: Path, is_ours) -> bool:
@@ -194,7 +195,7 @@ def _same(cur, argv) -> bool:
 
 
 def claude_existing(p: Paths, argv) -> Existing:
-    """The tempboard entry in ~/.claude.json (user scope). Read-only, via the json module."""
+    """The cera entry in ~/.claude.json (user scope). Read-only, via the json module."""
     try:
         d = _read_json(p.claude_json)
     except ValueError:
@@ -203,7 +204,7 @@ def claude_existing(p: Paths, argv) -> Existing:
     if e is None:
         return Existing("absent")
     if not isinstance(e, dict):
-        return Existing("error", why=T(f"{p.claude_json} 의 mcpServers.tempboard 가 객체가 아니다", f"mcpServers.tempboard in {p.claude_json} is not an object"))
+        return Existing("error", why=T(f"{p.claude_json} 의 mcpServers.cera 가 객체가 아니다", f"mcpServers.cera in {p.claude_json} is not an object"))
     transport = e.get("type") or ("http" if e.get("url") else "stdio")
     cur = (e.get("command"), list(e.get("args") or [])) if transport == "stdio" else (None, None)
     extras = []
@@ -216,17 +217,17 @@ def claude_existing(p: Paths, argv) -> Existing:
     return Existing("differs", cur, extras, transport=transport)
 
 
-def codex_existing(p: Paths, argv) -> Existing:
-    """Ask with `codex mcp get tempboard --json` (whatever the TOML shape, we get what codex read). The output contains env values, so it is never printed."""
+def codex_existing(p: Paths, argv, name=NAME) -> Existing:
+    """Ask with `codex mcp get cera --json` (whatever the TOML shape, we get what codex read). The output contains env values, so it is never printed."""
     if not p.codex.exists():
         return Existing("absent")   # codex reads nothing if the CODEX_HOME folder is missing, so there is no entry either
     try:
-        r = subprocess.run(["codex", "mcp", "get", NAME, "--json"], stdin=subprocess.DEVNULL, capture_output=True,
+        r = subprocess.run(["codex", "mcp", "get", name, "--json"], stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
         return Existing("error", why=T(f"codex mcp get 을 부르지 못했다({type(e).__name__})", f"Could not run codex mcp get ({type(e).__name__})"))
     if r.returncode != 0:
-        if f"No MCP server named '{NAME}'" in (r.stderr + r.stdout):
+        if f"No MCP server named '{name}'" in (r.stderr + r.stdout):
             return Existing("absent")
         return Existing("error", why=T(f"codex mcp get 이 실패했다(exit {r.returncode}) — codex 가 {p.codex / 'config.toml'} 를 "
                                        "읽지 못하는 것 같다. `codex mcp list` 로 확인한다",
@@ -258,8 +259,8 @@ def codex_existing(p: Paths, argv) -> Existing:
 def conflict_text(agent, where: str, ex: Existing, argv) -> str:
     """Text shown when an existing entry differs: the differences (values only for command and args), the names of fields that would be lost, and the one-liner to change it."""
     q = lambda xs: " ".join(_q(str(x)) for x in xs)
-    lines = [T(f"  그대로 둠: {LABEL[agent]} 에 tempboard MCP 항목이 이미 있고 다르다 — 아무것도 바꾸지 않았다({where})",
-               f"  Left as is: {LABEL[agent]} already has a different tempboard MCP entry — nothing was changed ({where})")]
+    lines = [T(f"  그대로 둠: {LABEL[agent]} 에 cera MCP 항목이 이미 있고 다르다 — 아무것도 바꾸지 않았다({where})",
+               f"  Left as is: {LABEL[agent]} already has a different cera MCP entry — nothing was changed ({where})")]
     if ex.transport != "stdio":
         lines.append(T(f"    방식     지금 {ex.transport}  →  새로 stdio", f"    type     now {ex.transport}  →  new stdio"))
     else:
@@ -274,9 +275,9 @@ def conflict_text(agent, where: str, ex: Existing, argv) -> str:
     lines.append(T(f"  바꾸려면(터미널에서 한 줄):\n    {rm} && {add}", f"  To change it (one line in a terminal):\n    {rm} && {add}"))
     if ex.extras:
         lines.append(T(f"  주의: 이 한 줄은 지금 항목의 {' · '.join(ex.extras)} 도 지운다. 지키려면 {where} 에서 command · args 만 손으로 고친다"
-                       f"(조각: tempboard install --print-config {agent}).",
+                       f"(조각: cera install --print-config {agent}).",
                        f"  Note: this line also deletes {' · '.join(ex.extras)} of the current entry. To keep them, edit only command / args by hand in {where} "
-                       f"(snippet: tempboard install --print-config {agent})."))
+                       f"(snippet: cera install --print-config {agent})."))
     lines.append(T("  (늘 켜 두기 · 플러그인 업데이트에는 이 일이 필요 없다 — 체크아웃 · 파이썬을 바꿨을 때만 생긴다)",
                    "  (Always-on mode and plugin updates do not need this — it only comes up when you change the checkout or Python)"))
     return "\n".join(lines)
@@ -284,26 +285,70 @@ def conflict_text(agent, where: str, ex: Existing, argv) -> str:
 
 def foreign_at_all(p: Paths, agent) -> List[Path]:
     out = []
-    for link, target, chk in ((p.local_bin / NAME, p.cli, _is_tempboard_cli), (p.skill_link(agent), p.skill, _is_tempboard_skill)):
+    for link, target, chk in ((p.local_bin / NAME, p.cli, _is_cera_cli), (p.skill_link(agent), p.skill, _is_cera_skill)):
         if foreign_at(link, target, chk):
             out.append(link)
     return out
 
 
-def marketplace_known(p: Paths, agent) -> bool:
+def marketplace_known(p: Paths, agent, name=NAME) -> bool:
     if agent == "claude":
         try:
             d = _read_json(p.claude / "plugins" / "known_marketplaces.json") or {}
         except ValueError:
             return False
-        return NAME in d
+        return name in d
     if agent == "codex":
         try:
             txt = (p.codex / "config.toml").read_text(encoding="utf-8")
         except OSError:
             return False
-        return re.search(rf'^\[marketplaces\.(?:{NAME}|"{NAME}")\]\s*$', txt, re.M) is not None
+        return re.search(rf'^\[marketplaces\.(?:{name}|"{name}")\]\s*$', txt, re.M) is not None
     return False
+
+
+def legacy_report(p: Paths, agent) -> List[str]:
+    """Lines about what the old name (tempboard, before 0.5.0) left in this tool: what was found, then the exact commands to
+    remove it. Read-only — nothing is removed automatically (an old MCP entry may hold a remote token in env)."""
+    o = OLD_NAME
+    found, cmds = [], []
+    if plugin_installed(p, agent, o):
+        found.append(T(f"플러그인 {o}", f"plugin {o}"))
+        cmds.append({"claude": f"claude plugin uninstall {o}@{o}", "codex": f"codex plugin remove {o}@{o}",
+                     "antigravity": f"agy plugin uninstall {o}"}[agent])
+    if marketplace_known(p, agent, o):
+        found.append(T(f"마켓플레이스 {o}", f"marketplace {o}"))
+        cmds.append(f"{agent} plugin marketplace remove {o}")
+    if mcp_registered(p, agent, o):
+        if agent == "claude":
+            found.append(T(f"MCP 항목 {o} ({p.claude_json})", f"MCP entry {o} ({p.claude_json})"))
+            cmds.append(f"claude mcp remove --scope user {o}")
+        elif agent == "codex":
+            found.append(T(f"MCP 항목 {o} ({p.codex / 'config.toml'})", f"MCP entry {o} ({p.codex / 'config.toml'})"))
+            cmds.append(f"codex mcp remove {o}")
+        else:
+            found.append(T(f"MCP 항목 mcpServers.{o} ({p.ag_mcp})", f"MCP entry mcpServers.{o} ({p.ag_mcp})"))
+            cmds.append(T(f"# {p.ag_mcp} 에서 mcpServers.{o} 항목을 지운다", f"# delete the mcpServers.{o} entry from {p.ag_mcp}"))
+    sl = p.skill_link(agent, o)
+    if sl.is_symlink():
+        found.append(T(f"스킬 링크 {sl}", f"skill link {sl}"))
+        cmds.append(f"rm {_q(str(sl))}")
+    if not found:
+        return []
+    lines = [T(f"  ※ 옛 이름({o})으로 깔린 것이 있다 — 자동으로 지우지 않았다: {' · '.join(found)}",
+               f"  Note: found an install under the old name ({o}) — it was not removed automatically: {', '.join(found)}"),
+             T("    Cera 와 함께 두면 스킬 · MCP 가 두 번 보인다. 지우려면:", "    Next to Cera, the skill and MCP show up twice. To remove it:")]
+    lines += [f"      {c}" for c in cmds]
+    return lines
+
+
+def legacy_local_bin(p: Paths) -> List[str]:
+    """~/.local/bin/tempboard from an old link-mode install (reported once, not per tool)."""
+    lb = p.local_bin / OLD_NAME
+    if not lb.is_symlink():
+        return []
+    return [T(f"  ※ 옛 이름의 명령 링크가 있다: {lb} → {os.readlink(lb)} (자동으로 지우지 않았다). 지우려면:  rm {_q(str(lb))}",
+              f"  Note: an old command link exists: {lb} → {os.readlink(lb)} (not removed automatically). To remove it:  rm {_q(str(lb))}")]
 
 
 # ------------------------------------------------------------------ actions (plan, then show or execute)
@@ -312,7 +357,7 @@ class Plan:
         self.dry = dry_run
         self.failed = False
         self.conflict = False         # an existing entry differs and was left alone -> exit 3
-        self.local_bin_done = False   # ~/.local/bin/tempboard is shared by several tools, so handle it only once
+        self.local_bin_done = False   # ~/.local/bin/cera is shared by several tools, so handle it only once
 
     def say(self, msg):
         print(msg, flush=True)
@@ -363,7 +408,7 @@ class Plan:
                 self.say(T(f"  건너뜀: {link} 는 링크가 아니다(손대지 않음)", f"  Skipped: {link} is not a link (left alone)"))
             return
         if not is_ours(link):
-            self.say(T(f"  건너뜀: {link} 는 tempboard 를 가리키지 않는다", f"  Skipped: {link} does not point to tempboard"))
+            self.say(T(f"  건너뜀: {link} 는 Cera 를 가리키지 않는다", f"  Skipped: {link} does not point to Cera"))
             return
         self.say(f"  - {link}")
         if not self.dry:
@@ -460,15 +505,15 @@ def backup_path(path: Path) -> Path:
 def install_link(p: Paths, agent, plan: Plan) -> None:
     if plugin_installed(p, agent):
         print(T(f"  거부: {LABEL[agent]} 에는 이미 플러그인으로 깔려 있다 — 둘 다 깔면 스킬 · MCP 가 두 번 보인다.\n"
-                f"  먼저:  tempboard uninstall --agent {agent} --mode plugin",
+                f"  먼저:  cera uninstall --agent {agent} --mode plugin",
                 f"  Refused: {LABEL[agent]} already has the plugin installed — installing both shows the skill and MCP twice.\n"
-                f"  First:  tempboard uninstall --agent {agent} --mode plugin"), file=sys.stderr)
+                f"  First:  cera uninstall --agent {agent} --mode plugin"), file=sys.stderr)
         plan.failed = True
         return
     bad = foreign_at_all(p, agent)
     if bad:   # avoid a half install: stop before doing anything
         for b in bad:
-            print(T(f"  거부: {b} 에 tempboard 가 아닌 것이 있다 — 직접 옮긴 뒤 다시", f"  Refused: {b} holds something that is not tempboard — move it yourself and retry"), file=sys.stderr)
+            print(T(f"  거부: {b} 에 Cera 가 아닌 것이 있다 — 직접 옮긴 뒤 다시", f"  Refused: {b} holds something that is not Cera — move it yourself and retry"), file=sys.stderr)
         plan.failed = True
         return
     argv = mcp_argv(p)
@@ -479,9 +524,9 @@ def install_link(p: Paths, agent, plan: Plan) -> None:
         state, why = read_json_obj(p.ag_mcp)
         if state == "bad":
             print(T(f"  거부: {p.ag_mcp} 를 고칠 수 없다({why}) — 아무것도 바꾸지 않았다. 고친 뒤 다시, 또는 "
-                    "tempboard install --print-config antigravity",
+                    "cera install --print-config antigravity",
                     f"  Refused: cannot edit {p.ag_mcp} ({why}) — nothing was changed. Fix it and retry, or use "
-                    "tempboard install --print-config antigravity"), file=sys.stderr)
+                    "cera install --print-config antigravity"), file=sys.stderr)
             plan.failed = True
             return
     elif exe:
@@ -499,9 +544,9 @@ def install_link(p: Paths, agent, plan: Plan) -> None:
         plan.note(T(f"{p.root} 는 플러그인 캐시(판 번호 폴더)다 — 플러그인을 올리면 이 링크들이 끊긴다. link 모드는 git 체크아웃에서 쓴다",
                     f"{p.root} is a plugin cache (versioned folder) — upgrading the plugin breaks these links. Use link mode from a git checkout"))
     if not plan.local_bin_done:
-        plan.symlink(p.local_bin / NAME, p.cli, _is_tempboard_cli)
+        plan.symlink(p.local_bin / NAME, p.cli, _is_cera_cli)
         plan.local_bin_done = True
-    plan.symlink(p.skill_link(agent), p.skill, _is_tempboard_skill)
+    plan.symlink(p.skill_link(agent), p.skill, _is_cera_skill)
     if agent == "antigravity":
         def merge(d):
             d.setdefault("mcpServers", {})
@@ -510,17 +555,17 @@ def install_link(p: Paths, agent, plan: Plan) -> None:
             entry["command"], entry["args"] = argv[0], argv[1:]
             d["mcpServers"][NAME] = entry
             return d
-        plan.json_edit(p.ag_mcp, merge, T("mcpServers.tempboard 의 command · args", "command / args of mcpServers.tempboard"))
+        plan.json_edit(p.ag_mcp, merge, T("mcpServers.cera 의 command · args", "command / args of mcpServers.cera"))
         if not shutil.which("agy"):
             plan.note(T("agy 가 없다 — 파일만 써 두었다. Antigravity 를 설치하면 이 설정을 읽는다(App 은 다시 열기, CLI 는 /mcp 로 다시 읽기)",
                         "agy is missing — only the file was written. Antigravity reads this config once installed (reopen the App; in the CLI re-read with /mcp)"))
         return
     if not exe:
-        plan.note(T(f"{EXE[agent]} 명령이 없다 — MCP 등록은 건너뛰었다. 나중에: tempboard install --print-config {agent}",
-                    f"The {EXE[agent]} command is missing — MCP registration was skipped. Later: tempboard install --print-config {agent}"))
+        plan.note(T(f"{EXE[agent]} 명령이 없다 — MCP 등록은 건너뛰었다. 나중에: cera install --print-config {agent}",
+                    f"The {EXE[agent]} command is missing — MCP registration was skipped. Later: cera install --print-config {agent}"))
         return
     if ex.state == "same":
-        plan.say(T(f"  = MCP tempboard ({LABEL[agent]}, 이미 그대로)", f"  = MCP tempboard ({LABEL[agent]}, already as wanted)"))
+        plan.say(T(f"  = MCP cera ({LABEL[agent]}, 이미 그대로)", f"  = MCP cera ({LABEL[agent]}, already as wanted)"))
         return
     # Absent -> add it through the tool's CLI (the tool writes the file). Codex gets a config.toml backup first.
     ensure_codex_home(p, agent, plan)
@@ -566,18 +611,18 @@ def source_for(agent, source: str) -> str:
 def install_plugin(p: Paths, agent, plan: Plan, source: str) -> None:
     if link_installed(p, agent):
         print(T(f"  거부: {LABEL[agent]} 에는 이미 링크 모드로 깔려 있다 — 둘 다 깔면 스킬 · MCP 가 두 번 보인다.\n"
-                f"  먼저:  tempboard uninstall --agent {agent} --mode link",
+                f"  먼저:  cera uninstall --agent {agent} --mode link",
                 f"  Refused: {LABEL[agent]} is already installed in link mode — installing both shows the skill and MCP twice.\n"
-                f"  First:  tempboard uninstall --agent {agent} --mode link"), file=sys.stderr)
+                f"  First:  cera uninstall --agent {agent} --mode link"), file=sys.stderr)
         plan.failed = True
         return
     exe = shutil.which(EXE[agent])
     if not exe:
         if agent == "antigravity":
             plan.note(T("agy(Antigravity CLI)가 없다 — 설치한 뒤:  agy plugin install " + source_for(agent, source)
-                        + "\n     지금 바로 쓰려면:  tempboard install --agent antigravity --mode link",
+                        + "\n     지금 바로 쓰려면:  cera install --agent antigravity --mode link",
                         "agy (Antigravity CLI) is missing — after installing it:  agy plugin install " + source_for(agent, source)
-                        + "\n     To use it right now:  tempboard install --agent antigravity --mode link"))
+                        + "\n     To use it right now:  cera install --agent antigravity --mode link"))
         else:
             print(T(f"  {EXE[agent]} 명령이 없다 — {LABEL[agent]} 를 설치한 뒤 다시(또는 --mode link)",
                     f"  The {EXE[agent]} command is missing — install {LABEL[agent]} and retry (or use --mode link)"), file=sys.stderr)
@@ -603,25 +648,25 @@ def install_plugin(p: Paths, agent, plan: Plan, source: str) -> None:
 
 # ------------------------------------------------------------------ uninstall
 def uninstall_link(p: Paths, agent, plan: Plan) -> None:
-    plan.unlink(p.skill_link(agent), _is_tempboard_skill)
+    plan.unlink(p.skill_link(agent), _is_cera_skill)
     if agent == "antigravity":
         if p.ag_mcp.exists():
             def drop(d):
                 (d.get("mcpServers") or {}).pop(NAME, None)
                 return d
-            plan.json_edit(p.ag_mcp, drop, T("mcpServers.tempboard 지움", "mcpServers.tempboard removed"))
+            plan.json_edit(p.ag_mcp, drop, T("mcpServers.cera 지움", "mcpServers.cera removed"))
         return
     if shutil.which(EXE[agent]):
         ex = claude_existing(p, None) if agent == "claude" else codex_existing(p, None)
         if ex.state == "absent":
-            plan.say(T(f"  = MCP tempboard ({LABEL[agent]}) 없음", f"  = no MCP tempboard ({LABEL[agent]})"))
+            plan.say(T(f"  = MCP cera ({LABEL[agent]}) 없음", f"  = no MCP cera ({LABEL[agent]})"))
             return
         if ex.extras:   # back up the config file before removing an entry that has env (token) or similar fields
             plan.backup(p.claude_json if agent == "claude" else p.codex / "config.toml")
         plan.run(_mcp_remove(agent), quiet_fail=True)
     elif mcp_registered(p, agent):
-        plan.note(T(f"{EXE[agent]} 명령이 없어 MCP 등록을 지우지 못했다 — 설정 파일에서 tempboard 항목을 직접 지운다",
-                    f"The {EXE[agent]} command is missing, so the MCP registration was not removed — delete the tempboard entry from the config file yourself"))
+        plan.note(T(f"{EXE[agent]} 명령이 없어 MCP 등록을 지우지 못했다 — 설정 파일에서 cera 항목을 직접 지운다",
+                    f"The {EXE[agent]} command is missing, so the MCP registration was not removed — delete the cera entry from the config file yourself"))
 
 
 def uninstall_plugin(p: Paths, agent, plan: Plan) -> None:
@@ -640,12 +685,12 @@ def uninstall_plugin(p: Paths, agent, plan: Plan) -> None:
 
 
 def drop_local_bin_if_unused(p: Paths, plan: Plan, removed) -> None:
-    """~/.local/bin/tempboard is shared by all three link modes; remove it only when no link-mode install other than the one just removed remains."""
-    if any(p.skill_link(a).is_symlink() and _is_tempboard_skill(p.skill_link(a)) for a in AGENTS if a not in removed):
+    """~/.local/bin/cera is shared by all three link modes; remove it only when no link-mode install other than the one just removed remains."""
+    if any(p.skill_link(a).is_symlink() and _is_cera_skill(p.skill_link(a)) for a in AGENTS if a not in removed):
         return
     lb = p.local_bin / NAME
     if lb.is_symlink() and os.path.realpath(lb) == os.path.realpath(p.cli):   # keep a link that points to a different checkout
-        plan.unlink(lb, _is_tempboard_cli)
+        plan.unlink(lb, _is_cera_cli)
 
 
 # ------------------------------------------------------------------ config snippets
@@ -660,10 +705,10 @@ def print_config(p: Paths, agent) -> None:
             "antigravity": T(f"{p.ag_mcp} 에 넣는다(작업 폴더만이면 .agents/mcp_config.json)",
                              f"Put it in {p.ag_mcp} (for one working folder only: .agents/mcp_config.json)")}[agent]
     print(f"# {note}", file=sys.stderr)
-    print(T("# 이미 tempboard 항목이 있으면 그 항목의 env(토큰) 등을 지키도록 command · args 만 바꾼다 — "
-            "`tempboard install --agent … --mode link` 가 다른 점과 할 일을 보여 준다",
-            "# If a tempboard entry already exists, change only command / args so its env (token) etc. is kept — "
-            "`tempboard install --agent … --mode link` shows the differences and what to do"), file=sys.stderr)
+    print(T("# 이미 cera 항목이 있으면 그 항목의 env(토큰) 등을 지키도록 command · args 만 바꾼다 — "
+            "`cera install --agent … --mode link` 가 다른 점과 할 일을 보여 준다",
+            "# If a cera entry already exists, change only command / args so its env (token) etc. is kept — "
+            "`cera install --agent … --mode link` shows the differences and what to do"), file=sys.stderr)
     print(T(f"# 파이썬({argv[0]})을 바꾸거나 지우면 이 조각을 다시 만든다", f"# If you change or delete Python ({argv[0]}), regenerate this snippet"), file=sys.stderr)
     if agent == "codex":
         print(f"[mcp_servers.{NAME}]")
@@ -677,17 +722,21 @@ def print_config(p: Paths, agent) -> None:
 # ------------------------------------------------------------------ fixed entry point (always-on mode)
 LAUNCHER = r'''#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# tempboard fixed launcher — written by `tempboard site install` (do not edit). The always-on service (launchd / systemd) runs this.
+# Cera fixed launcher — written by `cera site install` (do not edit). The always-on service (launchd / systemd) runs this.
 # Plugin upgrades move the install folder. If the recorded folder (ROOT) is gone, use the highest version found in the known install locations.
 import glob, json, os, sys
 ROOT = {root!r}
 
+def env(name):
+    # CERA_<name>, else the old TEMPBOARD_<name> (as in server/env.py)
+    return os.environ.get("CERA_" + name) or os.environ.get("TEMPBOARD_" + name)
+
 def korean():
-    v = (os.environ.get("TEMPBOARD_LANG") or "").strip().lower()
+    v = (env("LANG") or "").strip().lower()
     if v in ("ko", "en"):
         return v == "ko"
     try:
-        with open(os.path.join(os.environ.get("TEMPBOARD_HOME") or os.path.join(os.path.expanduser("~"), ".tempboard"), "config.json"), encoding="utf-8") as fh:
+        with open(os.path.join(env("HOME") or os.path.join(os.path.expanduser("~"), ".cera"), "config.json"), encoding="utf-8") as fh:
             v = json.load(fh).get("lang")
         if v in ("ko", "en"):
             return v == "ko"
@@ -708,16 +757,16 @@ def ver(root):
 
 def found():
     here = os.path.realpath(__file__)
-    ok = lambda r: os.path.isfile(os.path.join(r, "bin", "tempboard")) and os.path.realpath(os.path.join(r, "bin", "tempboard")) != here
+    ok = lambda r: os.path.isfile(os.path.join(r, "bin", "cera")) and os.path.realpath(os.path.join(r, "bin", "cera")) != here
     in_cache = "/plugins/cache/" in ROOT.replace(os.sep, "/")
     if ok(ROOT) and not in_cache:
         return ROOT   # git checkout (link mode): use as is
     home = os.path.expanduser("~")
-    pats = [os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude"), "plugins", "cache", "*", "tempboard", "*"),
-            os.path.join(os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"), "plugins", "cache", "*", "tempboard", "*"),
-            os.path.join(home, ".gemini", "config", "plugins", "tempboard")]
+    pats = [os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude"), "plugins", "cache", "*", "cera", "*"),
+            os.path.join(os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"), "plugins", "cache", "*", "cera", "*"),
+            os.path.join(home, ".gemini", "config", "plugins", "cera")]
     roots = [r for pat in pats for r in glob.glob(pat) if ok(r)]
-    lb = os.path.join(home, ".local", "bin", "tempboard")
+    lb = os.path.join(home, ".local", "bin", "cera")
     if os.path.exists(lb):
         r = os.path.dirname(os.path.dirname(os.path.realpath(lb)))
         if ok(r):
@@ -729,11 +778,11 @@ def found():
 root = found()
 if not root:
     if korean():
-        sys.stderr.write("tempboard 를 찾지 못했다(" + ROOT + " 가 없다) — 플러그인을 다시 깔고 `tempboard site install --load`\n")
+        sys.stderr.write("Cera 를 찾지 못했다(" + ROOT + " 가 없다) — 플러그인을 다시 깔고 `cera site install --load`\n")
     else:
-        sys.stderr.write("tempboard was not found (" + ROOT + " is missing) — reinstall the plugin and run `tempboard site install --load`\n")
+        sys.stderr.write("Cera was not found (" + ROOT + " is missing) — reinstall the plugin and run `cera site install --load`\n")
     sys.exit(1)
-cli = os.path.join(root, "bin", "tempboard")
+cli = os.path.join(root, "bin", "cera")
 os.execv(sys.executable, [sys.executable, cli] + sys.argv[1:])
 '''
 
@@ -781,21 +830,21 @@ def path_note(p: Paths) -> Optional[str]:
     dirs = [os.path.realpath(d) for d in os.environ.get("PATH", "").split(os.pathsep) if d]
     if os.path.realpath(p.local_bin) not in dirs:
         return T(f"{p.local_bin} 가 PATH 에 없다 — 셸 설정(~/.zshrc 등)에  export PATH=\"$HOME/.local/bin:$PATH\"  를 더하면 "
-                 "어디서나 `tempboard` 가 된다(MCP 는 절대경로라 상관없다)",
+                 "어디서나 `cera` 가 된다(MCP 는 절대경로라 상관없다)",
                  f"{p.local_bin} is not on PATH — add  export PATH=\"$HOME/.local/bin:$PATH\"  to your shell config (~/.zshrc etc.) "
-                 "to get `tempboard` everywhere (MCP uses an absolute path, so it is unaffected)")
+                 "to get `cera` everywhere (MCP uses an absolute path, so it is unaffected)")
     return None
 
 
 _PRINT_CONFIG_HELP_KO = """--print-config 에는 도구 하나를 준다: claude · codex · antigravity
-  tempboard install --print-config claude        > tempboard-mcp.json   # JSON 조각
-  tempboard install --print-config codex         > tempboard-mcp.toml   # TOML 조각
-  tempboard install --print-config antigravity   > tempboard-mcp.json
+  cera install --print-config claude        > cera-mcp.json   # JSON 조각
+  cera install --print-config codex         > cera-mcp.toml   # TOML 조각
+  cera install --print-config antigravity   > cera-mcp.json
 stdout 에는 조각만 나온다(설명은 stderr). 아무것도 쓰거나 부르지 않는다."""
 _PRINT_CONFIG_HELP_EN = """--print-config takes one tool: claude · codex · antigravity
-  tempboard install --print-config claude        > tempboard-mcp.json   # JSON snippet
-  tempboard install --print-config codex         > tempboard-mcp.toml   # TOML snippet
-  tempboard install --print-config antigravity   > tempboard-mcp.json
+  cera install --print-config claude        > cera-mcp.json   # JSON snippet
+  cera install --print-config codex         > cera-mcp.toml   # TOML snippet
+  cera install --print-config antigravity   > cera-mcp.json
 Only the snippet goes to stdout (the explanation goes to stderr). Nothing is written or run."""
 PRINT_CONFIG_HELP = _PRINT_CONFIG_HELP_KO   # kept for compatibility; use print_config_help() for the chosen language
 
@@ -833,14 +882,18 @@ def cmd_install(ctx, a):
             install_link(p, agent, plan)
         else:
             install_plugin(p, agent, plan, a.source)
+        for line in legacy_report(p, agent):
+            plan.say(line)
+    for line in legacy_local_bin(p):
+        plan.say(line)
     if mode == "link" and not plan.failed:
         n = path_note(p)
         if n:
             plan.say("")
             plan.say(f"※ {n}")
     if not plan.failed and not plan.conflict and not a.dry_run:
-        print(T("끝 — 도구를 다시 시작하면 스킬 `tempboard` 와 MCP 도구(site_open · board_add …)가 보인다.",
-                "Done — restart the tool and the skill `tempboard` and the MCP tools (site_open, board_add …) will appear."))
+        print(T("끝 — 도구를 다시 시작하면 스킬 `cera` 와 MCP 도구(site_open · board_add …)가 보인다.",
+                "Done — restart the tool and the skill `cera` and the MCP tools (site_open, board_add …) will appear."))
     if plan.failed:
         sys.exit(1)
     if plan.conflict:
@@ -867,14 +920,22 @@ def cmd_uninstall(ctx, a):
                 removed.append(agent)
             else:
                 uninstall_plugin(p, agent, plan)
+    for agent in ts:
+        lines = legacy_report(p, agent)
+        if lines:
+            plan.say(f"[{LABEL[agent]}]")
+            for line in lines:
+                plan.say(line)
     if removed:
         drop_local_bin_if_unused(p, plan, removed)
+    for line in legacy_local_bin(p):
+        plan.say(line)
     if plan.failed:
         sys.exit(1)
 
 
 def register(sub, ctx):
-    """Called by the extension hook (EXT_MODULES) in bin/tempboard."""
+    """Called by the extension hook (EXT_MODULES) in bin/cera."""
     s = sub.add_parser("install", help=T("Claude Code · Codex · Antigravity 에 붙이기(plugin · link 모드)", "Attach to Claude Code, Codex and Antigravity (plugin / link mode)"),
                        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     s.add_argument("--agent", choices=list(AGENTS) + ["all"], default=None)

@@ -1,11 +1,11 @@
-"""Tests for agent tokens (server hook-chain entry, re-reading, 'AI' presence), the patch endpoint, and the `tempboard agent` CLI.
+"""Tests for agent tokens (server hook-chain entry, re-reading, 'AI' presence), the patch endpoint, and the `cera agent` CLI.
 
-Everything uses temporary folders and a temporary TEMPBOARD_HOME (~/.tempboard is never touched). No real tunnel is opened."""
+Everything uses temporary folders and a temporary CERA_HOME (~/.cera is never touched). No real tunnel is opened."""
 from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import hashlib
 import http.client
@@ -23,11 +23,11 @@ import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 
 
 def _load(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / "server" / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -297,7 +297,7 @@ class Patch(Server):
 
 
 class Cli(unittest.TestCase):
-    """`tempboard agent add/list/revoke` against a real site (start --tunnel none)."""
+    """`cera agent add/list/revoke` against a real site (start --tunnel none)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -305,7 +305,7 @@ class Cli(unittest.TestCase):
         dist = t / "dist"
         dist.mkdir()
         (dist / "index.html").write_text("<!doctype html><title>tb</title>")
-        self.env = {**os.environ, "TEMPBOARD_HOME": str(t / "home"), "TEMPBOARD_DIST": str(dist)}
+        self.env = {**os.environ, "CERA_HOME": str(t / "home"), "CERA_DIST": str(dist)}
         out = self.cli("start", "--tunnel", "none", "--title", "t", "--json")
         self.site = json.loads(out)
         self.sid = self.site["id"]
@@ -332,16 +332,16 @@ class Cli(unittest.TestCase):
             time.sleep(0.05)
 
     def test_english_output(self):
-        """With TEMPBOARD_LANG=en, `agent add / list / revoke` print English and no Korean."""
+        """With CERA_LANG=en, `agent add / list / revoke` print English and no Korean."""
         hangul = re.compile("[\uac00-\ud7a3]")
-        self.env["TEMPBOARD_LANG"] = "en"
+        self.env["CERA_LANG"] = "en"
         try:
             empty = self.cli("agent", "list", self.sid)
             self.assertIn("No tokens", empty)
             out = self.cli("agent", "add", self.sid, "--name", "Remote")
             self.assertIn("Agent token", out)
             self.assertIn("the token is shown only this once", out)
-            self.assertRegex(out, r"(?m)^\s*TEMPBOARD_TOKEN=tb_ag_\S+$")
+            self.assertRegex(out, r"(?m)^\s*CERA_TOKEN=tb_ag_\S+$")
             self.assertIn("agent revoke", out)
             self.assertIsNone(hangul.search(out), out)
             tid = re.search(r"Agent token (\w+) ", out).group(1)
@@ -359,7 +359,7 @@ class Cli(unittest.TestCase):
             self.assertIn("Could not read --ttl", bad.stderr + bad.stdout)
             self.assertIsNone(hangul.search(bad.stderr + bad.stdout))
         finally:
-            self.env["TEMPBOARD_LANG"] = "ko"
+            self.env["CERA_LANG"] = "ko"
 
     def test_add_view_revoke(self):
         v = json.loads(self.cli("agent", "add", self.sid, "--name", "X", "--role", "view", "--json"))
@@ -448,7 +448,7 @@ class SupervisorStartWindow(unittest.TestCase):
 
         def build(*a, **kw):
             out = srv.build(*a, **kw)
-            sv.update_state(sites, "s1", lambda cur: cur.update(agents=[]))   # a revoke inside the start window (simulates tempboard agent revoke)
+            sv.update_state(sites, "s1", lambda cur: cur.update(agents=[]))   # a revoke inside the start window (simulates cera agent revoke)
             return out
         fake = types.SimpleNamespace(security=srv.security, Access=srv.Access, build=build)
         stop = threading.Event()

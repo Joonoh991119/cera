@@ -1,13 +1,13 @@
-"""Import tests: the importer (server/importers.py), the server /import endpoint, the `tempboard import` CLI, and MCP board_import.
+"""Import tests: the importer (server/importers.py), the server /import endpoint, the `cera import` CLI, and MCP board_import.
 
 Covered: merging twice = original x 3 with zero orphans and a new-board round trip; the CLI against a running and a stopped site; MCP path and extension rejection; 30 images > 12 MB;
 permissions (view-only key and view token get 403); input validation (MIME, header, path escape, type, broken elements); the library; page numbers.
-Everything uses temporary folders and a temporary TEMPBOARD_HOME (~/.tempboard is never touched), and no real tunnel."""
+Everything uses temporary folders and a temporary CERA_HOME (~/.cera is never touched), and no real tunnel."""
 from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import base64
 import copy
@@ -28,12 +28,12 @@ import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 PY39 = Path("/usr/bin/python3")
 
 
 def _load(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / "server" / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -72,7 +72,7 @@ def sample_doc():
                simulatePressure=True, lastCommittedPoint=None)
     els = a + b + arr + [page, note, img, ink]
     ak.assign_indices([], els)
-    return {"type": "excalidraw", "version": 2, "source": "tempboard", "elements": els, "appState": {},
+    return {"type": "excalidraw", "version": 2, "source": "cera", "elements": els, "appState": {},
             "files": {"oldfileid0001": {"id": "oldfileid0001", "mimeType": "image/png", "dataURL": durl(PNG1), "created": 1}}}
 
 
@@ -371,7 +371,7 @@ class Endpoint(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
-    """export -> merge twice and new-board round trip, against a running and a stopped site, and 30 images > 12 MB -- the real `tempboard` CLI."""
+    """export -> merge twice and new-board round trip, against a running and a stopped site, and 30 images > 12 MB -- the real `cera` CLI."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -381,7 +381,7 @@ class Cli(unittest.TestCase):
         (dist / "index.html").write_text("<!doctype html><title>tb</title>")
         self.t = t
         self.home = t / "home"
-        self.env = {**os.environ, "TEMPBOARD_HOME": str(self.home), "TEMPBOARD_DIST": str(dist)}
+        self.env = {**os.environ, "CERA_HOME": str(self.home), "CERA_DIST": str(dist)}
         out = self.run_cli("start", "--tunnel", "none", "--json", "--title", "시험")
         self.sid = json.loads(out)["id"]
 
@@ -505,8 +505,8 @@ class Mcp(unittest.TestCase):
         dist.mkdir()
         (dist / "index.html").write_text("<!doctype html><title>tb</title>")
         self.t = t
-        self.env = {**os.environ, "TEMPBOARD_HOME": str(t / "home"), "TEMPBOARD_DIST": str(dist)}
-        for k in ("TEMPBOARD_URL", "TEMPBOARD_TOKEN", "TEMPBOARD_AGENT_NAME"):
+        self.env = {**os.environ, "CERA_HOME": str(t / "home"), "CERA_DIST": str(dist)}
+        for k in ("CERA_URL", "CERA_TOKEN", "CERA_AGENT_NAME"):
             self.env.pop(k, None)
         self.p = subprocess.Popen([sys.executable, str(CLI), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, env=self.env, cwd=str(t))
@@ -757,8 +757,8 @@ class R1CliError(Cli):
 class Py39(unittest.TestCase):
     def test_import_and_parse_on_39(self):
         code = ("import importlib.util,sys,json;"
-                f"spec=importlib.util.spec_from_file_location('tempboard_importers',{str(HERE / 'server' / 'importers.py')!r});"
-                "m=importlib.util.module_from_spec(spec);sys.modules['tempboard_importers']=m;spec.loader.exec_module(m);"
+                f"spec=importlib.util.spec_from_file_location('cera_importers',{str(HERE / 'server' / 'importers.py')!r});"
+                "m=importlib.util.module_from_spec(spec);sys.modules['cera_importers']=m;spec.loader.exec_module(m);"
                 "p=m.parse('a.excalidraw',json.dumps({'type':'excalidraw','elements':[{'id':'a1','type':'rectangle','x':0,'y':0,'width':5,'height':5}]}).encode());"
                 "print(len(m.prepare(p['elements'],[],'merge')))")
         p = subprocess.run([str(PY39), "-c", code], capture_output=True, text=True, timeout=60)

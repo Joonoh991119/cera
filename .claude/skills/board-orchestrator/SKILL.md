@@ -1,9 +1,9 @@
 ---
 name: board-orchestrator
-description: tempboard 기능 하네스의 지휘 절차 — 조사팀(board-scout) → 오케스트레이터(board-orchestrator) 고르기 → 구현팀(board-implementer) → 리뷰어(board-reviewer) → UI/UX 시험자(board-uiux-tester) → 판정 → 통합. tempboard 에 기능을 더하거나 다른 도구(drawio · tldraw · OneNote · GoodNotes · Miro)의 기능을 체리피킹하거나, 판서 · 미팅용 기능 · 글꼴 · 수식 · 도형 · 손글씨 보정 · 내보내기를 조사하고 넣자는 요청이면 반드시 이 스킬을 쓴다. 후속 요청 — "다시 실행", "그 기능만 다시", "리뷰만 다시", "UI 시험만 다시", "이전 결과 기반으로 보완", "빠진 기능 더해", "결과 개선" — 도 이 스킬. 보드를 열고 닫는 운영(링크 만들기 · 닫기 · 꺼내기)은 이 스킬이 아니라 플러그인 스킬 `tempboard`.
+description: Cera 기능 하네스의 지휘 절차 — 조사팀(board-scout) → 오케스트레이터(board-orchestrator) 고르기 → 구현팀(board-implementer) → 리뷰어(board-reviewer) → UI/UX 시험자(board-uiux-tester) → 판정 → 통합. Cera 에 기능을 더하거나 다른 도구(drawio · tldraw · OneNote · GoodNotes · Miro)의 기능을 체리피킹하거나, 판서 · 미팅용 기능 · 글꼴 · 수식 · 도형 · 손글씨 보정 · 내보내기를 조사하고 넣자는 요청이면 반드시 이 스킬을 쓴다. 후속 요청 — "다시 실행", "그 기능만 다시", "리뷰만 다시", "UI 시험만 다시", "이전 결과 기반으로 보완", "빠진 기능 더해", "결과 개선" — 도 이 스킬. 보드를 열고 닫는 운영(링크 만들기 · 닫기 · 꺼내기)은 이 스킬이 아니라 플러그인 스킬 `cera`.
 ---
 
-# board-orchestrator — tempboard 기능 하네스
+# board-orchestrator — Cera 기능 하네스
 
 메인 세션(리더)이 이 절차를 돈다. 리더는 판단을 직접 하지 않고 역할 에이전트에게 맡긴 뒤 결과 파일만 읽어 다음 단계로 넘긴다. 역할을 나누는 이유: 조사한 사람이 고르면 자기 후보를 과대평가하고, 구현한 사람이 리뷰하면 자기 설명에 앵커링되고, 코드를 읽은 사람이 UI 를 시험하면 "이렇게 누르면 되는데" 를 안다. 각 단계의 눈을 깨끗하게 두려고 나눈다.
 

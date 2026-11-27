@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Packaging tests: the manifest generator (packaging/gen.py), the manifests for the three tools, the MCP files, the shared SKILL.md, license notices,
-the MCP command handshake, and fetching dist into $TEMPBOARD_HOME/dist/<version>/ from a read-only plugin root.
+the MCP command handshake, and fetching dist into $CERA_HOME/dist/<version>/ from a read-only plugin root.
 
-Only temporary folders are used (TEMPBOARD_HOME, a copied repo). No real tunnel and no real Release download (a fake tarball server)."""
+Only temporary folders are used (CERA_HOME, a copied repo). No real tunnel and no real Release download (a fake tarball server)."""
 from __future__ import annotations
 
 import http.server
@@ -23,11 +23,11 @@ import urllib.request
 from pathlib import Path
 
 # Korean assertions below: pin the language before anything spawns the CLI or imports server code.
-os.environ["TEMPBOARD_LANG"] = "ko"
+os.environ["CERA_LANG"] = "ko"
 
 HERE = Path(__file__).resolve().parents[1]
 GEN = HERE / "packaging" / "gen.py"
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 GENERATED = ["plugin.json", "mcp.json", ".antigravity-plugin/plugin.json", "mcp_config.json", ".claude-plugin/marketplace.json"]
 # Files that do not yet carry an SPDX line. Once a file gets one, remove it from this set (the test below enforces this).
 SPDX_PENDING = set()
@@ -69,7 +69,7 @@ class Generator(unittest.TestCase):
             mp = json.loads((root / ".claude-plugin/marketplace.json").read_text())
             self.assertEqual(mp["plugins"][0]["version"], "9.8.7")
             # a variable in command is rejected
-            src["mcpServers"]["tempboard"]["command"] = "${CLAUDE_PLUGIN_ROOT}/x"
+            src["mcpServers"]["cera"]["command"] = "${CLAUDE_PLUGIN_ROOT}/x"
             (root / ".claude-plugin/plugin.json").write_text(json.dumps(src))
             self.assertNotEqual(gen("--check", root=root).returncode, 0)
 
@@ -115,28 +115,28 @@ class Manifests(unittest.TestCase):
         """2 manifests + 4 generated files (+ web/package.json) all have license MIT and the same name and version."""
         src = load(".claude-plugin/plugin.json")
         mp = load(".claude-plugin/marketplace.json")
-        entry = next(p for p in mp["plugins"] if p["name"] == "tempboard")
+        entry = next(p for p in mp["plugins"] if p["name"] == "cera")
         for name, d in (("claude", src), ("marketplace", entry), ("agent-plugins", load("plugin.json")),
                         ("antigravity", load(".antigravity-plugin/plugin.json"))):
             self.assertEqual(d["license"], "MIT", name)
-            self.assertEqual(d["name"], "tempboard", name)
+            self.assertEqual(d["name"], "cera", name)
             self.assertEqual(d["version"], src["version"], name)
         self.assertEqual(load("web/package.json")["license"], "MIT")
 
     def test_mcp_definitions(self):
         """Claude uses ${CLAUDE_PLUGIN_ROOT}, Codex and Antigravity use ${PLUGIN_ROOT}, and the command is a single python3."""
-        claude = load(".claude-plugin/plugin.json")["mcpServers"]["tempboard"]
-        self.assertEqual(claude, {"command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/tempboard", "mcp"]})
+        claude = load(".claude-plugin/plugin.json")["mcpServers"]["cera"]
+        self.assertEqual(claude, {"command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/cera", "mcp"]})
         ap = load("mcp.json")
         self.assertEqual(ap["$schema"], "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json")
-        self.assertEqual(ap["mcpServers"]["tempboard"], {"type": "stdio", "command": "python3",
-                                                         "args": ["${PLUGIN_ROOT}/bin/tempboard", "mcp"]})
+        self.assertEqual(ap["mcpServers"]["cera"], {"type": "stdio", "command": "python3",
+                                                         "args": ["${PLUGIN_ROOT}/bin/cera", "mcp"]})
         self.assertEqual(load("plugin.json")["$schema"], "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json")
         ag = load(".antigravity-plugin/plugin.json")
         self.assertEqual(ag["$schema"], "https://antigravity.google/schemas/v1/plugin.json")
-        mc = load("mcp_config.json")["mcpServers"]["tempboard"]
+        mc = load("mcp_config.json")["mcpServers"]["cera"]
         self.assertEqual(mc["command"], "python3")
-        self.assertTrue(mc["args"][0].startswith("${PLUGIN_ROOT}/bin/tempboard"))
+        self.assertTrue(mc["args"][0].startswith("${PLUGIN_ROOT}/bin/cera"))
         for rel in ("plugin.json", "mcp.json", ".antigravity-plugin/plugin.json", "mcp_config.json"):
             self.assertNotIn("CLAUDE_PLUGIN_ROOT", (HERE / rel).read_text(), rel)
 
@@ -162,7 +162,7 @@ class SkillAndCommands(unittest.TestCase):
             self.assertEqual(name, sk.name)
             desc = re.search(r"^description:\s*(.+)$", m.group(1), re.M).group(1)
             self.assertLessEqual(len(desc), 1024)
-            self.assertIn("../../bin/tempboard", txt)
+            self.assertIn("../../bin/cera", txt)
 
     def test_commands_and_mcp_tools_documented(self):
         names = {p.stem for p in (HERE / "commands").glob("*.md")}
@@ -170,13 +170,13 @@ class SkillAndCommands(unittest.TestCase):
         tools = ["site_list", "site_open", "site_close", "board_list", "board_create", "board_read", "board_add",
                  "board_update", "board_delete", "board_wait", "board_export", "board_import"]
         readme = (HERE / "docs/guide.md").read_text(encoding="utf-8")
-        skill = (HERE / "skills/tempboard/SKILL.md").read_text(encoding="utf-8")
+        skill = (HERE / "skills/cera/SKILL.md").read_text(encoding="utf-8")
         for t in tools:
             self.assertIn(t, readme, t)
             self.assertIn(t, skill, t)
 
     def test_readme_personal_guide_follows_site_guide_order(self):
-        """The guide's order of human to-dos matches the order of `tempboard site guide` (personal.GUIDE_*)."""
+        """The guide's order of human to-dos matches the order of `cera site guide` (personal.GUIDE_*)."""
         readme = (HERE / "docs/guide.md").read_text(encoding="utf-8")
         steps = ["Add a domain", "cloudflared tunnel login", "site init --hostname", "site run", "site install --load",
                  "One-time PIN", "Self-hosted", "Application Audience (AUD) Tag", "--access-aud", "members.json", "Service Auth"]
@@ -185,7 +185,7 @@ class SkillAndCommands(unittest.TestCase):
         self.assertEqual(pos, sorted(pos), list(zip(steps, pos)))
         with tempfile.TemporaryDirectory() as td:
             out = subprocess.run([sys.executable, str(CLI), "site", "guide"], capture_output=True, text=True, timeout=30,
-                                 env={**os.environ, "TEMPBOARD_HOME": td}).stdout
+                                 env={**os.environ, "CERA_HOME": td}).stdout
         gpos = [out.find(s) for s in steps]
         self.assertNotIn(-1, gpos, list(zip(steps, gpos)))
         self.assertEqual(gpos, sorted(gpos))
@@ -254,7 +254,7 @@ class Notices(unittest.TestCase):
 
 class License(unittest.TestCase):
     def test_license_and_spdx(self):
-        """LICENSE has the fractional-indexing CC0 line, and server/*.py, bin/tempboard and packaging/gen.py start with an SPDX header."""
+        """LICENSE has the fractional-indexing CC0 line, and server/*.py, bin/cera and packaging/gen.py start with an SPDX header."""
         lic = (HERE / "LICENSE").read_text(encoding="utf-8")
         self.assertTrue(lic.startswith("MIT License"))
         self.assertIn("Copyright (c) 2026 Joonoh Park and contributors", lic)
@@ -300,13 +300,13 @@ class McpCommands(unittest.TestCase):
         """The Claude manifest's command (${CLAUDE_PLUGIN_ROOT} -> repo) and the Codex/Antigravity command (${PLUGIN_ROOT} -> repo)
         both answer initialize and tools/list."""
         with tempfile.TemporaryDirectory() as td:
-            env = {**os.environ, "TEMPBOARD_HOME": td}
+            env = {**os.environ, "CERA_HOME": td}
             for rel, var, key in ((".claude-plugin/plugin.json", "${CLAUDE_PLUGIN_ROOT}", None), ("mcp.json", "${PLUGIN_ROOT}", None),
                                   ("mcp_config.json", "${PLUGIN_ROOT}", None)):
-                srv = load(rel)["mcpServers"]["tempboard"]
+                srv = load(rel)["mcpServers"]["cera"]
                 argv = [shutil.which(srv["command"]) or sys.executable] + [a.replace(var, str(HERE)) for a in srv["args"]]
                 init, tools = mcp_handshake(argv, env)
-                self.assertEqual(init["serverInfo"]["name"], "tempboard", rel)
+                self.assertEqual(init["serverInfo"]["name"], "cera", rel)
                 self.assertIn("board_add", tools, rel)
                 self.assertIn("site_open", tools, rel)
 
@@ -317,7 +317,7 @@ class FakeRelease(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):   # noqa: N802
         type(self).hits += 1
-        if not self.path.endswith("/tempboard-dist.tar.gz") or "/missing/" in self.path:
+        if not self.path.endswith("/cera-dist.tar.gz") or "/missing/" in self.path:
             self.send_response(404)
             self.end_headers()
             return
@@ -342,8 +342,8 @@ def tarball(marker: str) -> bytes:
 
 
 class ReadOnlyRoot(unittest.TestCase):
-    """From a read-only copy of the plugin root (no web/dist) and an empty TEMPBOARD_HOME, start --tunnel none --json works,
-    and dist is created in $TEMPBOARD_HOME/dist/<version>/. Downloads come from a fake tarball server (TEMPBOARD_RELEASE_URL)."""
+    """From a read-only copy of the plugin root (no web/dist) and an empty CERA_HOME, start --tunnel none --json works,
+    and dist is created in $CERA_HOME/dist/<version>/. Downloads come from a fake tarball server (CERA_RELEASE_URL)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -359,13 +359,13 @@ class ReadOnlyRoot(unittest.TestCase):
         FakeRelease.hits = 0
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeRelease)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-        env = {k: v for k, v in os.environ.items() if k not in ("TEMPBOARD_DIST",) and "proxy" not in k.lower()}
-        self.env = {**env, "TEMPBOARD_HOME": str(self.home), "NO_PROXY": "*",
-                    "TEMPBOARD_RELEASE_URL": f"http://127.0.0.1:{self.httpd.server_address[1]}/v-test/"}
+        env = {k: v for k, v in os.environ.items() if k not in ("CERA_DIST",) and "proxy" not in k.lower()}
+        self.env = {**env, "CERA_HOME": str(self.home), "NO_PROXY": "*",
+                    "CERA_RELEASE_URL": f"http://127.0.0.1:{self.httpd.server_address[1]}/v-test/"}
         self.ver = json.loads((HERE / ".claude-plugin/plugin.json").read_text())["version"]
 
     def tearDown(self):
-        subprocess.run([sys.executable, str(self.root / "bin" / "tempboard"), "stop", "--all"], env=self.env,
+        subprocess.run([sys.executable, str(self.root / "bin" / "cera"), "stop", "--all"], env=self.env,
                        capture_output=True, timeout=30)
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -374,12 +374,12 @@ class ReadOnlyRoot(unittest.TestCase):
         self.tmp.cleanup()
 
     def start(self):
-        p = subprocess.run([sys.executable, "-B", str(self.root / "bin" / "tempboard"), "start", "--tunnel", "none", "--json"],
+        p = subprocess.run([sys.executable, "-B", str(self.root / "bin" / "cera"), "start", "--tunnel", "none", "--json"],
                            env=self.env, capture_output=True, text=True, timeout=90)
         self.assertEqual(p.returncode, 0, p.stderr[-2000:])
         return json.loads(p.stdout)
 
-    def test_dist_goes_to_tempboard_home(self):
+    def test_dist_goes_to_cera_home(self):
         self.assertFalse(os.access(self.root / "bin", os.W_OK), "사본이 읽기 전용이 아니다")
         j = self.start()
         dist = self.home / "dist" / self.ver
@@ -395,8 +395,8 @@ class ReadOnlyRoot(unittest.TestCase):
 
     def test_missing_release_asset_says_so(self):
         """A 404 reports that the Release asset for that version is missing, not 'check your network'."""
-        env = {**self.env, "TEMPBOARD_RELEASE_URL": self.env["TEMPBOARD_RELEASE_URL"] + "missing/", "PATH": "/usr/bin:/bin"}
-        p = subprocess.run([sys.executable, "-B", str(self.root / "bin" / "tempboard"), "start", "--tunnel", "none", "--json"],
+        env = {**self.env, "CERA_RELEASE_URL": self.env["CERA_RELEASE_URL"] + "missing/", "PATH": "/usr/bin:/bin"}
+        p = subprocess.run([sys.executable, "-B", str(self.root / "bin" / "cera"), "start", "--tunnel", "none", "--json"],
                            env=env, capture_output=True, text=True, timeout=60)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn(f"v{self.ver} Release 자산", p.stderr)
@@ -404,7 +404,7 @@ class ReadOnlyRoot(unittest.TestCase):
     def test_no_write_access_and_no_release_gives_clear_error(self):
         FakeRelease.body = b"not a tarball"
         env = {**self.env, "PATH": "/usr/bin:/bin"}   # no npm -> after the download fails, the build cannot run either
-        p = subprocess.run([sys.executable, "-B", str(self.root / "bin" / "tempboard"), "start", "--tunnel", "none", "--json"],
+        p = subprocess.run([sys.executable, "-B", str(self.root / "bin" / "cera"), "start", "--tunnel", "none", "--json"],
                            env=env, capture_output=True, text=True, timeout=60)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(p.stdout, "", "실패해도 stdout 은 비어 있다(MCP 가 JSON 으로 읽는다)")
@@ -419,11 +419,11 @@ class DevCheckout(unittest.TestCase):
         code = ("import importlib.machinery,importlib.util,sys;l=importlib.machinery.SourceFileLoader('tbcli',sys.argv[1]);"
                 "s=importlib.util.spec_from_loader('tbcli',l);m=importlib.util.module_from_spec(s);l.exec_module(m);print(m.DIST)")
         with tempfile.TemporaryDirectory() as td:
-            env = {k: v for k, v in os.environ.items() if k != "TEMPBOARD_DIST"}
-            out = subprocess.run([sys.executable, "-c", code, str(CLI)], env={**env, "TEMPBOARD_HOME": td},
+            env = {k: v for k, v in os.environ.items() if k not in ("CERA_DIST", "TEMPBOARD_DIST")}
+            out = subprocess.run([sys.executable, "-c", code, str(CLI)], env={**env, "CERA_HOME": td},
                                  capture_output=True, text=True, timeout=30).stdout.strip()
             self.assertEqual(out, str(HERE / "web" / "dist"))
-            out = subprocess.run([sys.executable, "-c", code, str(CLI)], env={**env, "TEMPBOARD_HOME": td, "TEMPBOARD_DIST": "/x/y"},
+            out = subprocess.run([sys.executable, "-c", code, str(CLI)], env={**env, "CERA_HOME": td, "CERA_DIST": "/x/y"},
                                  capture_output=True, text=True, timeout=30).stdout.strip()
             self.assertEqual(out, "/x/y")
 

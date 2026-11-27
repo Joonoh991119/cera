@@ -38,7 +38,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 
 def _load_i18n():
-    name = "tempboard_i18n"
+    name = "cera_i18n"
     mod = sys.modules.get(name)
     if mod is None:
         spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().with_name("i18n.py"))
@@ -53,7 +53,7 @@ def T(ko: str, en: str) -> str:
 
 
 def _load_fracindex():
-    name = "tempboard_fracindex"
+    name = "cera_fracindex"
     mod = sys.modules.get(name)
     if mod is None:
         spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().with_name("fracindex.py"))
@@ -72,7 +72,7 @@ is_valid_key = _fi.is_valid_key
 # Excalidraw FONT_FAMILY integer slots. The default is the Board.jsx FONTS default "meet" (gothic) = Nunito (6).
 FONT_NUNITO = 6
 DEFAULT_FONT = FONT_NUNITO
-# Excalidraw FONT_METADATA[...].metrics.lineHeight. Unregistered slots (21–24, added by tempboard)
+# Excalidraw FONT_METADATA[...].metrics.lineHeight. Unregistered slots (21–24, added by Cera)
 # fall back to the Excalifont value (1.25) in getLineHeight.
 LINE_HEIGHT = {1: 1.25, 2: 1.15, 3: 1.2, 5: 1.25, 6: 1.35, 7: 1.15, 8: 1.25, 9: 1.15}
 LINE_HEIGHT_FALLBACK = 1.25

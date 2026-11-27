@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: MIT
-"""tempboard MCP server — stdio JSON-RPC, standard library only (runs on Python 3.9).
+"""Cera MCP server — stdio JSON-RPC, standard library only (runs on Python 3.9).
 
-    python3 bin/tempboard mcp            # Claude Code, Codex and Antigravity launch this command
+    python3 bin/cera mcp            # Claude Code, Codex and Antigravity launch this command
 
 Spec: MCP 2025-11-25 / 2025-06-18 / 2025-03-26 (https://modelcontextprotocol.io/specification/2025-11-25).
 One line on stdin/stdout = one JSON-RPC message. **Only JSON-RPC goes to stdout** (logs and accidental prints go to stderr).
 
-Same Mac (default): reads the site address (local_url) from $TEMPBOARD_HOME/sites/*/state.json and, the first time a site is used, creates its own agent
+Same Mac (default): reads the site address (local_url) from $CERA_HOME/sites/*/state.json and, the first time a site is used, creates its own agent
 token (by:"mcp"). On exit it revokes that token (best effort). It appears on screen as '<name> · AI' (the name is clientInfo.name;
-the environment variable TEMPBOARD_AGENT_NAME takes precedence).
-Remote (a board on another computer): giving TEMPBOARD_URL=<board address> plus one (or both) of the following hides the site_* tools and uses only that address.
-  - TEMPBOARD_TOKEN=tb_ag_…  : agent token (`tempboard agent add <site> --name …`). For temporary boards (quick tunnel).
+the environment variable CERA_AGENT_NAME takes precedence).
+Remote (a board on another computer): giving CERA_URL=<board address> plus one (or both) of the following hides the site_* tools and uses only that address.
+  - CERA_TOKEN=tb_ag_…  : agent token (`cera agent add <site> --name …`). For temporary boards (quick tunnel).
   - CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET : Cloudflare Access service token (personal board web / Access mode).
-      Sent in the CF-Access-Client-Id / CF-Access-Client-Secret headers. (The old names TEMPBOARD_CF_CLIENT_ID/SECRET are also accepted.)
-      In Access mode, agent tokens are not used for requests from outside this Mac, so the service token alone is enough, without TEMPBOARD_TOKEN.
-  If TEMPBOARD_URL is set but neither is, a warning is printed to stderr at startup and the board tools report an error.
+      Sent in the CF-Access-Client-Id / CF-Access-Client-Secret headers. (CERA_CF_CLIENT_ID/SECRET are also accepted.)
+      In Access mode, agent tokens are not used for requests from outside this Mac, so the service token alone is enough, without CERA_TOKEN.
+  If CERA_URL is set but neither is, a warning is printed to stderr at startup and the board tools report an error.
 
 All board writes go through the HTTP API (writing to disk directly while the server is running would be overwritten). Elements are built by agentkit (the element factory).
 """
@@ -51,7 +51,7 @@ ELEMENTS_BYTES = 45_000        # cap on element JSON per board_read(elements) ca
 READ_LIMIT = 120              # board_read default line / element count — so summary text + structured fit within MAX_RESPONSE
 MAX_RESPONSE = 60_000          # cap in bytes on a tool response (text + structured) — stays within the Claude Code default MCP output cap (25k tokens) even when filled with Korean (3 bytes · about 1 token per character)
 _INSTRUCTIONS_KO = (
-    "tempboard 는 여러 사람이 같이 보는 화이트보드다. 보드는 지금 다른 사람이 보고 있을 수 있다.\n"
+    "Cera 는 여러 사람이 같이 보는 화이트보드다. 보드는 지금 다른 사람이 보고 있을 수 있다.\n"
     "- 지우기(board_delete) · 공개 터널 열기(site_open tunnel:\"cloudflared\") 전에는 사용자에게 먼저 묻는다.\n"
     "- 먼저 board_read(요약)로 보드를 읽는다. 줄 끝의 (vN · 라벨 vM) 이 그 요소의 판이다. 글 · 색을 고치는 board_update 에는 "
     "base_version=N(라벨 있는 상자면 label_base_version=M 도)을 꼭 준다 — 그사이 사람이 고쳤으면 덮지 않고 conflict 로 돌아온다. "
@@ -62,7 +62,7 @@ _INSTRUCTIONS_KO = (
     "The board is shared and may be watched live. Ask the user before deleting or opening a public tunnel."
 )
 _INSTRUCTIONS_EN = (
-    "tempboard is a whiteboard that several people view together. Someone else may be looking at the board right now.\n"
+    "Cera is a whiteboard that several people view together. Someone else may be looking at the board right now.\n"
     "- Ask the user first before deleting (board_delete) or opening a public tunnel (site_open tunnel:\"cloudflared\").\n"
     "- Read the board first with board_read (summary). The (vN · label vM) at the end of a line is that element's version. "
     "When board_update changes text or color, always pass base_version=N (and label_base_version=M too for a box that has a label) — "
@@ -80,7 +80,7 @@ def instructions() -> str:
 
 
 def _sibling(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -103,7 +103,7 @@ importers = _sibling("importers")   # board_import
 
 
 def log(*a):
-    print("tempboard-mcp:", *a, file=sys.stderr, flush=True)
+    print("cera-mcp:", *a, file=sys.stderr, flush=True)
 
 
 class ToolError(Exception):
@@ -111,7 +111,7 @@ class ToolError(Exception):
 
 
 def agent_name_for(client_name: Optional[str]) -> str:
-    env = os.environ.get("TEMPBOARD_AGENT_NAME")
+    env = _sibling("i18n").env("AGENT_NAME")
     if env and env.strip():
         return agents.clean_name(env)
     n = (client_name or "").strip().lower()
@@ -187,17 +187,18 @@ class Session:
         self.tokens: Dict[str, dict] = {}         # sid → the token entry I created (id, expires_at)
         self.remote = None
         self.remote_error = None
-        url, tok = os.environ.get("TEMPBOARD_URL"), os.environ.get("TEMPBOARD_TOKEN") or None
-        cid = os.environ.get("CF_ACCESS_CLIENT_ID") or os.environ.get("TEMPBOARD_CF_CLIENT_ID")
-        sec = os.environ.get("CF_ACCESS_CLIENT_SECRET") or os.environ.get("TEMPBOARD_CF_CLIENT_SECRET")
+        env = _sibling("i18n").env   # CERA_* first, then the old TEMPBOARD_* names
+        url, tok = env("URL"), env("TOKEN") or None
+        cid = os.environ.get("CF_ACCESS_CLIENT_ID") or env("CF_CLIENT_ID")
+        sec = os.environ.get("CF_ACCESS_CLIENT_SECRET") or env("CF_CLIENT_SECRET")
         extra = {"CF-Access-Client-Id": cid, "CF-Access-Client-Secret": sec} if cid and sec else {}
         if url:
             if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
-                self.remote_error = T(f"TEMPBOARD_URL 이 http(s) 주소가 아니다: {url[:80]}", f"TEMPBOARD_URL is not an http(s) address: {url[:80]}")
+                self.remote_error = T(f"CERA_URL 이 http(s) 주소가 아니다: {url[:80]}", f"CERA_URL is not an http(s) address: {url[:80]}")
             elif not tok and not extra:
-                self.remote_error = T("TEMPBOARD_URL 만 있고 인증이 없다 — TEMPBOARD_TOKEN(에이전트 토큰) 또는 "
+                self.remote_error = T("CERA_URL 만 있고 인증이 없다 — CERA_TOKEN(에이전트 토큰) 또는 "
                                       "CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET(Access 서비스 토큰)을 준다",
-                                      "TEMPBOARD_URL is set but there is no authentication — give TEMPBOARD_TOKEN (agent token) or "
+                                      "CERA_URL is set but there is no authentication — give CERA_TOKEN (agent token) or "
                                       "CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET (Access service token)")
             if self.remote_error:
                 log(T("주의:", "Warning:"), self.remote_error)
@@ -248,8 +249,8 @@ class Session:
                 if code == 200:
                     break
                 if time.time() > deadline:
-                    raise ToolError(T(f"토큰이 {sid} 에서 아직 받아들여지지 않는다(HTTP {code}) — 사이트 감독이 살아 있는지 tempboard list",
-                                      f"The token is not yet accepted by {sid} (HTTP {code}) — check with tempboard list that the site supervisor is alive"))
+                    raise ToolError(T(f"토큰이 {sid} 에서 아직 받아들여지지 않는다(HTTP {code}) — 사이트 감독이 살아 있는지 cera list",
+                                      f"The token is not yet accepted by {sid} (HTTP {code}) — check with cera list that the site supervisor is alive"))
                 time.sleep(0.15)
             self.conns[sid], self.tokens[sid] = c, ent
             return c, sid
@@ -504,7 +505,7 @@ class Tools:
         if tunnel not in ("none", "cloudflared"):
             raise ToolError(T('tunnel 은 "none" 또는 "cloudflared"', 'tunnel must be "none" or "cloudflared"'))
         title = a.get("title") or T("보드", "Board")
-        argv = [sys.executable, str(self.s.ctx.ROOT / "bin" / "tempboard"), "start", "--json", "--tunnel", tunnel,
+        argv = [sys.executable, str(self.s.ctx.ROOT / "bin" / "cera"), "start", "--json", "--tunnel", tunnel,
                 "--title", _str(title, "title", 80)]
         if a.get("ttl"):
             argv += ["--ttl", _str(str(a["ttl"]), "ttl", 12)]
@@ -515,14 +516,14 @@ class Tools:
         try:
             p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
         except subprocess.TimeoutExpired:
-            raise ToolError(T("사이트를 여는 데 너무 오래 걸린다(화면 파일 빌드?) — tempboard start 를 직접 실행해 본다",
-                              "Opening the site takes too long (building the UI files?) — try running tempboard start yourself"))
+            raise ToolError(T("사이트를 여는 데 너무 오래 걸린다(화면 파일 빌드?) — cera start 를 직접 실행해 본다",
+                              "Opening the site takes too long (building the UI files?) — try running cera start yourself"))
         if p.returncode != 0:
             raise ToolError(T("사이트를 열지 못했다: ", "Could not open the site: ") + (p.stderr or p.stdout)[-800:])
         try:
             out = json.loads(p.stdout)
         except ValueError:
-            raise ToolError(T("tempboard start 출력을 읽지 못했다: ", "Could not read the output of tempboard start: ") + p.stdout[-300:])
+            raise ToolError(T("cera start 출력을 읽지 못했다: ", "Could not read the output of cera start: ") + p.stdout[-300:])
         sid = out["id"]
         st = self.s.ctx.read_state(sid) or {}
         self.s.conn(sid)   # create the token now (so it shows as AI on the human screen)
@@ -539,7 +540,7 @@ class Tools:
     def site_close(self, a):
         sid = self.s.resolve_site(a.get("site"))
         self.s.drop(sid)
-        p = subprocess.run([sys.executable, str(self.s.ctx.ROOT / "bin" / "tempboard"), "stop", sid], stdin=subprocess.DEVNULL,
+        p = subprocess.run([sys.executable, str(self.s.ctx.ROOT / "bin" / "cera"), "stop", sid], stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=60)
         if p.returncode != 0:
             raise ToolError(T("닫지 못했다: ", "Could not close: ") + (p.stderr or p.stdout)[-400:])
@@ -1227,7 +1228,7 @@ class Tools:
         out_dir.mkdir(parents=True, exist_ok=True)
         name = re.sub(r"[^\w가-힣.-]+", "_", title).strip("_")[:60] or bid
         p = out_dir / f"{name}-{bid}.excalidraw"
-        doc = {"type": "excalidraw", "version": 2, "source": "tempboard", "elements": els,
+        doc = {"type": "excalidraw", "version": 2, "source": "cera", "elements": els,
                "appState": {"viewBackgroundColor": "#ffffff"}, "files": files}
         p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         return T(f"{p} 에 저장했다(요소 {len(els)} · 그림 {len(files)}).", f"Saved to {p} (elements {len(els)} · images {len(files)})."), {"path": str(p), "elements": len(els), "files": len(files)}
@@ -1308,8 +1309,8 @@ def tool_defs(remote: bool) -> List[dict]:
     w = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
     defs = [
         {"name": "site_list", "title": T("사이트 목록", "List sites"),
-         "description": T("이 컴퓨터의 tempboard 사이트(열림 · 닫힘)와 열린 사이트의 초대 링크.",
-                          "The tempboard sites on this computer (open / closed) and the invite links of open sites."),
+         "description": T("이 컴퓨터의 Cera 사이트(열림 · 닫힘)와 열린 사이트의 초대 링크.",
+                          "The Cera sites on this computer (open / closed) and the invite links of open sites."),
          "inputSchema": obj({}), "annotations": ro},
         {"name": "site_open", "title": T("사이트 열기", "Open a site"),
          "description": T("새 화이트보드 사이트를 연다(첫 보드 포함). 기본은 이 컴퓨터에서만(tunnel:\"none\"). "
@@ -1411,8 +1412,8 @@ def tool_defs(remote: bool) -> List[dict]:
                              "at": {"description": T("merge 자리 — \"right\"(기본) · \"below\" · {x, y}(묶음 가운데)", "merge position — \"right\" (default), \"below\" or {x, y} (center of the group)")}}, ["path"]),
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}},
         {"name": "board_export", "title": T(".excalidraw 로 저장", "Save as .excalidraw"),
-         "description": T("보드를 .excalidraw 파일로 저장한다(기본 $TEMPBOARD_HOME/exports). excalidraw.com 에서 열린다.",
-                          "Saves the board as a .excalidraw file (default $TEMPBOARD_HOME/exports). It opens on excalidraw.com."),
+         "description": T("보드를 .excalidraw 파일로 저장한다(기본 $CERA_HOME/exports). excalidraw.com 에서 열린다.",
+                          "Saves the board as a .excalidraw file (default $CERA_HOME/exports). It opens on excalidraw.com."),
          "inputSchema": obj({"site": SITE, "board": BOARD, "out_dir": {"type": "string"}}), "annotations": w},
     ]
     if remote:
@@ -1420,18 +1421,18 @@ def tool_defs(remote: bool) -> List[dict]:
     return defs
 
 
-_REMOTE_HELP_KO = """원격(다른 컴퓨터의 보드): TEMPBOARD_URL=<보드 주소> 와 아래 둘 중 하나(또는 둘 다)를 주면 site_* 도구를 숨기고 그 주소만 쓴다.
-  - TEMPBOARD_TOKEN=tb_ag_…  : 에이전트 토큰(`tempboard agent add <사이트> --name …`). 임시 보드(quick tunnel)용.
+_REMOTE_HELP_KO = """원격(다른 컴퓨터의 보드): CERA_URL=<보드 주소> 와 아래 둘 중 하나(또는 둘 다)를 주면 site_* 도구를 숨기고 그 주소만 쓴다.
+  - CERA_TOKEN=tb_ag_…  : 에이전트 토큰(`cera agent add <사이트> --name …`). 임시 보드(quick tunnel)용.
   - CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET : Cloudflare Access 서비스 토큰(개인 보드 웹 · Access 모드).
-    CF-Access-Client-Id / CF-Access-Client-Secret 머리로 보낸다. (옛 이름 TEMPBOARD_CF_CLIENT_ID/SECRET 도 받는다.)
-    Access 모드에서는 에이전트 토큰이 이 맥 밖 요청에 쓰이지 않으므로 TEMPBOARD_TOKEN 없이 서비스 토큰만 주면 된다.
-  TEMPBOARD_URL 만 있고 둘 다 없으면 시작할 때 stderr 에 경고하고, 보드 도구는 오류로 안내한다."""
-_REMOTE_HELP_EN = """Remote (a board on another computer): give TEMPBOARD_URL=<board address> plus one of the following (or both) and the site_* tools are hidden and only that address is used.
-  - TEMPBOARD_TOKEN=tb_ag_…  : an agent token (`tempboard agent add <site> --name …`). For temporary boards (quick tunnel).
+    CF-Access-Client-Id / CF-Access-Client-Secret 머리로 보낸다. (CERA_CF_CLIENT_ID/SECRET 도 받는다.)
+    Access 모드에서는 에이전트 토큰이 이 맥 밖 요청에 쓰이지 않으므로 CERA_TOKEN 없이 서비스 토큰만 주면 된다.
+  CERA_URL 만 있고 둘 다 없으면 시작할 때 stderr 에 경고하고, 보드 도구는 오류로 안내한다."""
+_REMOTE_HELP_EN = """Remote (a board on another computer): give CERA_URL=<board address> plus one of the following (or both) and the site_* tools are hidden and only that address is used.
+  - CERA_TOKEN=tb_ag_…  : an agent token (`cera agent add <site> --name …`). For temporary boards (quick tunnel).
   - CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET : a Cloudflare Access service token (personal board web / Access mode).
-    Sent in the CF-Access-Client-Id / CF-Access-Client-Secret headers. (The old names TEMPBOARD_CF_CLIENT_ID/SECRET are also accepted.)
-    In Access mode an agent token is not used for requests from outside this Mac, so give only the service token without TEMPBOARD_TOKEN.
-  If TEMPBOARD_URL is set but neither is, a warning goes to stderr at startup and the board tools answer with an error."""
+    Sent in the CF-Access-Client-Id / CF-Access-Client-Secret headers. (CERA_CF_CLIENT_ID/SECRET are also accepted.)
+    In Access mode an agent token is not used for requests from outside this Mac, so give only the service token without CERA_TOKEN.
+  If CERA_URL is set but neither is, a warning goes to stderr at startup and the board tools answer with an error."""
 
 
 def remote_help() -> str:
@@ -1527,7 +1528,7 @@ class Server:
             ver = want if want in PROTOCOLS else LATEST
             return self.send({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": ver, "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "tempboard", "title": T("tempboard 화이트보드", "tempboard whiteboard"), "version": self.s.ctx.version()},
+                "serverInfo": {"name": "cera", "title": T("Cera 화이트보드", "Cera whiteboard"), "version": self.s.ctx.version()},
                 "instructions": instructions()}})
         if method == "ping":
             return self.send({"jsonrpc": "2.0", "id": mid, "result": {}})
@@ -1586,9 +1587,9 @@ def register(sub, ctx):
     import argparse
     p = sub.add_parser("mcp", help=T("MCP 서버(stdio) — Claude Code · Codex · Antigravity 가 띄운다", "MCP server (stdio) — started by Claude Code, Codex or Antigravity"),
                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                       description=T("stdio MCP 서버. 같은 맥에서는 $TEMPBOARD_HOME 의 사이트를 쓴다(환경변수 TEMPBOARD_AGENT_NAME 으로 "
+                       description=T("stdio MCP 서버. 같은 맥에서는 $CERA_HOME 의 사이트를 쓴다(환경변수 CERA_AGENT_NAME 으로 "
                                      "화면 이름을 정한다).",
-                                     "stdio MCP server. On the same Mac it uses the sites in $TEMPBOARD_HOME (set the on-screen name with the "
-                                     "environment variable TEMPBOARD_AGENT_NAME)."),
+                                     "stdio MCP server. On the same Mac it uses the sites in $CERA_HOME (set the on-screen name with the "
+                                     "environment variable CERA_AGENT_NAME)."),
                        epilog=remote_help())
     p.set_defaults(f=lambda a: main(ctx))

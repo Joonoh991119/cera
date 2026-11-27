@@ -25,13 +25,13 @@ import unittest
 from pathlib import Path
 
 # Korean assertions below: pin the language before anything spawns the CLI or imports server code.
-os.environ["TEMPBOARD_LANG"] = "ko"
+os.environ["CERA_LANG"] = "ko"
 
 HERE = Path(__file__).resolve().parents[1]
 
 
 def _load(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / "server" / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -130,15 +130,15 @@ _SAVED_ENV = None
 def setUpModule():
     """A local fake JWKS (http) is accepted only when this environment variable is set -- turned on only for this module and restored afterwards (so it does not leak into other test modules)."""
     global _SAVED_ENV
-    _SAVED_ENV = os.environ.get("TEMPBOARD_TEST_INSECURE_JWKS")
-    os.environ["TEMPBOARD_TEST_INSECURE_JWKS"] = "1"
+    _SAVED_ENV = os.environ.get("CERA_TEST_INSECURE_JWKS")
+    os.environ["CERA_TEST_INSECURE_JWKS"] = "1"
 
 
 def tearDownModule():
     if _SAVED_ENV is None:
-        os.environ.pop("TEMPBOARD_TEST_INSECURE_JWKS", None)
+        os.environ.pop("CERA_TEST_INSECURE_JWKS", None)
     else:
-        os.environ["TEMPBOARD_TEST_INSECURE_JWKS"] = _SAVED_ENV
+        os.environ["CERA_TEST_INSECURE_JWKS"] = _SAVED_ENV
 
 
 @unittest.skipUnless(OPENSSL, "openssl 없음 — JWT 시험 건너뜀")
@@ -279,14 +279,14 @@ class Verify(KeysMixin, unittest.TestCase):
             self.assertTrue(self.ca.authenticate(R({h: "x", "Cf-Access-Jwt-Assertion": tok}, True, False)).deny, h)
 
     def test_jwks_url_https_only_and_no_redirect(self):
-        """http override only when TEMPBOARD_TEST_INSECURE_JWKS=1, file: is always rejected, and redirects are not followed."""
-        old = os.environ.pop("TEMPBOARD_TEST_INSECURE_JWKS")
+        """http override only when CERA_TEST_INSECURE_JWKS=1, file: is always rejected, and redirects are not followed."""
+        old = os.environ.pop("CERA_TEST_INSECURE_JWKS")
         try:
             with self.assertRaises(ValueError):
                 cfa.CfAccess(TEAM, AUD, jwks_url=self.js.url)
             cfa.CfAccess(TEAM, AUD, jwks_url="https://x.example/certs")
         finally:
-            os.environ["TEMPBOARD_TEST_INSECURE_JWKS"] = old
+            os.environ["CERA_TEST_INSECURE_JWKS"] = old
         for bad in ("file:///etc/passwd", "ftp://x/certs", ""):
             with self.assertRaises(ValueError):
                 cfa.Jwks(bad)

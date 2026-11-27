@@ -3,7 +3,7 @@
 
 Three entry points use this one module:
   - server `POST /api/whiteboard/boards/import` (new board) and `POST /api/whiteboard/boards/:id/import` (merge) → parse + apply
-  - CLI  `tempboard import <site> <file> [--board ID | --new [--title T]] [--at x,y] [--json]` (register)
+  - CLI  `cera import <site> <file> [--board ID | --new [--title T]] [--at x,y] [--json]` (register)
   - MCP  `board_import` (tb_mcp → read_path + parse + push)
 
 Flow
@@ -47,7 +47,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def _sibling(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -78,7 +78,7 @@ CHUNK = 2000                          # one server merge (MAX_ELEMENTS_PER_POST)
 MAX_BODY = 12 * 1024 * 1024           # server MAX_BODY (one request) — measured on the whole body to send (UTF-8, after re-encoding the JSON)
 SCENE_MIME = "application/vnd.excalidraw+json"   # marker that a scene is embedded in an image (PNG tEXt / SVG comment) (Excalidraw 'embed scene' export)
 CUSTOM_KEYS = {"latex": "str", "size": "num", "color": "color", "w0": "num", "h0": "num", "tbPage": "int", "tbBg": "bool"}
-# customData keeps only the fields tempboard uses (formula, whiteboard page, background). tbBy (who drew it) is not accepted; if an agent supplies it, the server stamps it again
+# customData keeps only the fields Cera uses (formula, whiteboard page, background). tbBy (who drew it) is not accepted; if an agent supplies it, the server stamps it again
 FILE_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 BOARD_ID = re.compile(r"^[a-z0-9]{8,32}$")
 
@@ -919,7 +919,7 @@ def apply(board, parsed: dict, mode: str, at, client: str, by: str, save_file: C
 # ────────────────────────────────────────────── HTTP client (CLI, MCP)
 def stripped(parsed: dict) -> str:
     """The .excalidraw document (JSON text) without image data URLs — sent to /import (images go separately to /files)."""
-    doc = {"type": "excalidraw", "version": 2, "source": "tempboard-import", "elements": parsed["elements"],
+    doc = {"type": "excalidraw", "version": 2, "source": "cera-import", "elements": parsed["elements"],
            "files": {fid: {"id": fid, "mimeType": r["mimeType"]} for fid, r in (parsed.get("files") or {}).items()}}
     return json.dumps(doc, ensure_ascii=False)
 
@@ -931,9 +931,9 @@ def body_bytes(body: dict) -> int:
 
 def too_big_message(n: int) -> str:
     return T(f"보낼 내용이 서버 한도 {MAX_BODY // (1024 * 1024)} MB 를 넘는다({n / 1024 / 1024:.1f} MB, 그림 제외) — "
-             "요소가 너무 많다. 사이트를 닫고(tempboard stop) `tempboard import` 로 넣는다",
+             "요소가 너무 많다. 사이트를 닫고(cera stop) `cera import` 로 넣는다",
              f"The content to send exceeds the server limit of {MAX_BODY // (1024 * 1024)} MB ({n / 1024 / 1024:.1f} MB, images excluded) — "
-             "too many elements. Close the site (tempboard stop) and use `tempboard import`")
+             "too many elements. Close the site (cera stop) and use `cera import`")
 
 
 def check_body(body: dict) -> None:
@@ -1028,14 +1028,14 @@ def summary(res: dict) -> str:
     return line
 
 
-# ────────────────────────────────────────────── CLI(tempboard import)
+# ────────────────────────────────────────────── CLI(cera import)
 def _http(base: str, key: Optional[str]):
     import urllib.error
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def req(method, path, body):
-        h = {"X-Whiteboard": "1", "Accept": "application/json", "X-Tb-Name": "tempboard%20import"}
+        h = {"X-Whiteboard": "1", "Accept": "application/json", "X-Tb-Name": "cera%20import"}
         if key:
             h["X-Tb-Key"] = key
         data = None
@@ -1091,7 +1091,7 @@ def run_cli(ctx, a) -> dict:
         raise SystemExit(T("사이트가 켜지는 중이다 — 잠시 뒤 다시", "The site is starting up — try again shortly"))
     srv = ctx.load_server()
     store = srv.Store(ctx.SITES / st["id"] / "data")
-    who = {"id": "tempboard import", "name": "tempboard import"}
+    who = {"id": "cera import", "name": "cera import"}
     made = None
     try:
         if mode == "new":

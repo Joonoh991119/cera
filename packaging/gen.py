@@ -5,13 +5,13 @@
     python3 packaging/gen.py           # write the files
     python3 packaging/gen.py --check   # on mismatch, print a diff and exit 1 (CI, tests)
 
-Source (edit by hand): .claude-plugin/plugin.json - name, version, description, author, license, keywords, mcpServers.
+Source (edit by hand): .claude-plugin/plugin.json - name (its capitalised form is the Antigravity displayName), version, description, author, license, keywords, mcpServers.
 Generated files (do not edit by hand; edit the source, then run this script):
   plugin.json                      Agent Plugins 1.0 manifest - Codex reads it before .claude-plugin
   mcp.json                         Agent Plugins MCP - ${PLUGIN_ROOT} (Codex substitutes it in args)
   .antigravity-plugin/plugin.json  Antigravity manifest - shadows the root plugin.json
   mcp_config.json                  Antigravity plugin MCP - ${PLUGIN_ROOT}
-  .claude-plugin/marketplace.json  only plugins[tempboard].version and license are synced (other fields are left as they are)
+  .claude-plugin/marketplace.json  only plugins[cera].version and license are synced (other fields are left as they are)
 Checked only, never written (versions are bumped by hand at integration time): version and license in web/package.json, and in web/package-lock.json
   version, packages[""].version and packages[""].license must equal the source.
   THIRD_PARTY_NOTICES.md must match web/package-lock.json and web/node_modules (packaging/notices.py; only when node_modules exists).
@@ -78,7 +78,7 @@ def outputs(root: Path = ROOT) -> dict:
     out = {}
     out["plugin.json"] = dump({"$schema": AGENT_PLUGINS_SCHEMA, **common, **meta})
     out["mcp.json"] = dump({"$schema": AGENT_MCP_SCHEMA, "mcpServers": portable_servers(src, True)})
-    ag = {"$schema": ANTIGRAVITY_SCHEMA, "name": src["name"], "displayName": src["name"], "description": src["description"],
+    ag = {"$schema": ANTIGRAVITY_SCHEMA, "name": src["name"], "displayName": src["name"][:1].upper() + src["name"][1:], "description": src["description"],
           "version": src["version"]}
     ag.update({k: src[k] for k in ("author", "license") if k in src})
     out[".antigravity-plugin/plugin.json"] = dump(ag)

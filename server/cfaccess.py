@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Cloudflare Access verification (standard library only) — the auth-chain (authn) entry `CfAccess`.
 
-When the personal board web (`tempboard site ...`) is wrapped in Cloudflare Access, the server trusts **only** the
+When the personal board web (`cera site ...`) is wrapped in Cloudflare Access, the server trusts **only** the
 `Cf-Access-Jwt-Assertion` header on the original request. It ignores the email header (`Cf-Access-Authenticated-User-Email`)
 and the cookie (`CF_Authorization`) — those can be forged by another process on the same machine or via DNS rebinding.
 A signature cannot be produced without Cloudflare's private key.
@@ -55,12 +55,12 @@ TEAM_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 AUD_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,256}$")
 _B64U = re.compile(r"^[A-Za-z0-9_-]*$")
 # A non-https jwks_url (local fake JWKS) is for tests only — accepted only when this environment variable is set to "1"
-INSECURE_JWKS_ENV = "TEMPBOARD_TEST_INSECURE_JWKS"
+INSECURE_JWKS_ENV = "CERA_TEST_INSECURE_JWKS"
 
 
-def T(ko, en):
-    """Korean or English text (server/i18n.py: TEMPBOARD_LANG > `tempboard lang` > locale > English)."""
-    key = "tempboard_i18n"
+def _i18n():
+    """server/i18n.py, loaded once by path as `cera_i18n` (it also carries env())."""
+    key = "cera_i18n"
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / "i18n.py")
         mod = importlib.util.module_from_spec(spec)
@@ -70,12 +70,22 @@ def T(ko, en):
         except BaseException:
             sys.modules.pop(key, None)
             raise
-    return sys.modules[key].T(ko, en)
+    return sys.modules[key]
+
+
+def T(ko, en):
+    """Korean or English text (server/i18n.py: CERA_LANG > `cera lang` > locale > English)."""
+    return _i18n().T(ko, en)
+
+
+def _env(name):
+    """CERA_<name>, else the old TEMPBOARD_<name> (server/env.py)."""
+    return _i18n().env(name)
 
 
 def _security():
-    """The same security module object as server.py (`tempboard_security`) — shares the Auth class."""
-    key = "tempboard_security"
+    """The same security module object as server.py (`cera_security`) — shares the Auth class."""
+    key = "cera_security"
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / "security.py")
         mod = importlib.util.module_from_spec(spec)
@@ -228,12 +238,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def check_jwks_url(url: str) -> str:
-    """https only. http (local fake JWKS) only when TEMPBOARD_TEST_INSECURE_JWKS=1 (for tests). file: etc. are always rejected."""
+    """https only. http (local fake JWKS) only when CERA_TEST_INSECURE_JWKS=1 (for tests). file: etc. are always rejected."""
     u = str(url or "")
     scheme = u.split(":", 1)[0].lower()
     if scheme == "https":
         return u
-    if scheme == "http" and os.environ.get(INSECURE_JWKS_ENV) == "1":
+    if scheme == "http" and _env("TEST_INSECURE_JWKS") == "1":
         return u
     raise ValueError(T(f"JWKS 주소는 https 만 받는다: {u!r} (http 는 시험에서 {INSECURE_JWKS_ENV}=1 일 때만)",
                        f"The JWKS URL must be https: {u!r} (http only in tests with {INSECURE_JWKS_ENV}=1)"))
@@ -256,7 +266,7 @@ class Jwks:
         self.last_error: Optional[str] = None
 
     def _get(self) -> dict:
-        req = urllib.request.Request(self.url, headers={"User-Agent": "tempboard", "Accept": "application/json"})
+        req = urllib.request.Request(self.url, headers={"User-Agent": "cera", "Accept": "application/json"})
         if self._opener:
             open_ = self._opener
         else:

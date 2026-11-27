@@ -1,7 +1,7 @@
 """CLI tests: state-file locking (concurrent writes keep every field), keys --rotate (within 2 seconds the old key gets 403 and the new key 200, open WS closed),
 start --json prints exactly one JSON document (even on the npm build path), the extension slot (EXT_MODULES), and Python 3.9 (/usr/bin/python3).
 
-Every test uses a temporary TEMPBOARD_HOME (~/.tempboard is never touched). No real cloudflared tunnel is opened."""
+Every test uses a temporary CERA_HOME (~/.cera is never touched). No real cloudflared tunnel is opened."""
 from __future__ import annotations
 
 import base64
@@ -22,18 +22,18 @@ import unittest
 from pathlib import Path
 
 # Korean assertions below: pin the language before anything spawns the CLI or imports server code.
-os.environ["TEMPBOARD_LANG"] = "ko"
+os.environ["CERA_LANG"] = "ko"
 
 HERE = Path(__file__).resolve().parents[1]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 PY39 = Path("/usr/bin/python3")
 
 
 def run(args, env, py=None, timeout=60, root=None, check=True):
-    p = subprocess.run([py or sys.executable, str((root or HERE) / "bin" / "tempboard"), *args], env=env, capture_output=True,
+    p = subprocess.run([py or sys.executable, str((root or HERE) / "bin" / "cera"), *args], env=env, capture_output=True,
                        text=True, timeout=timeout)
     if check and p.returncode != 0:
-        raise AssertionError(f"tempboard {args} → {p.returncode}\nstdout:{p.stdout}\nstderr:{p.stderr}")
+        raise AssertionError(f"cera {args} → {p.returncode}\nstdout:{p.stdout}\nstderr:{p.stderr}")
     return p
 
 
@@ -47,11 +47,11 @@ def get(port, path, headers):
 
 
 def copy_tree(dst: Path):
-    """A fake repository holding only bin/tempboard and server/{server,security,supervise}.py (ROOT becomes this)."""
+    """A fake repository holding only bin/cera and server/{server,security,supervise,i18n,env}.py (ROOT becomes this)."""
     (dst / "bin").mkdir(parents=True)
     (dst / "server").mkdir()
-    shutil.copy(CLI, dst / "bin" / "tempboard")
-    for n in ("server.py", "security.py", "supervise.py", "i18n.py"):
+    shutil.copy(CLI, dst / "bin" / "cera")
+    for n in ("server.py", "security.py", "supervise.py", "i18n.py", "env.py"):
         shutil.copy(HERE / "server" / n, dst / "server" / n)
     return dst
 
@@ -63,7 +63,7 @@ class Base(unittest.TestCase):
         self.dist = self.t / "dist"
         self.dist.mkdir()
         (self.dist / "index.html").write_text("<!doctype html><title>tb</title>")
-        self.env = {**os.environ, "TEMPBOARD_HOME": str(self.t / "home"), "TEMPBOARD_DIST": str(self.dist)}
+        self.env = {**os.environ, "CERA_HOME": str(self.t / "home"), "CERA_DIST": str(self.dist)}
         self.started = []
 
     def tearDown(self):
@@ -389,7 +389,7 @@ class StartJson(Base):
         npm.chmod(0o755)
         empty = self.t / "emptydist"
         empty.mkdir()   # an empty folder -- takes the download / build path
-        env = {**self.env, "TEMPBOARD_DIST": str(empty), "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
+        env = {**self.env, "CERA_DIST": str(empty), "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
                "https_proxy": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9", "no_proxy": "", "NO_PROXY": ""}
         p = run(["start", "--tunnel", "none", "--json"], env, root=root)
         out = json.loads(p.stdout)   # must be a single JSON document
@@ -447,12 +447,12 @@ class Python39(Base):
 
 
 class Language(Base):
-    """`tempboard lang` and the English / Korean switch of CLI text (TEMPBOARD_LANG > saved > locale > English)."""
+    """`cera lang` and the English / Korean switch of CLI text (CERA_LANG > saved > locale > English)."""
 
     def env_for(self, lang=None, **extra):
-        e = {k: v for k, v in self.env.items() if k not in ("TEMPBOARD_LANG", "LC_ALL", "LC_MESSAGES", "LANG")}
+        e = {k: v for k, v in self.env.items() if k not in ("CERA_LANG", "TEMPBOARD_LANG", "LC_ALL", "LC_MESSAGES", "LANG")}
         if lang:
-            e["TEMPBOARD_LANG"] = lang
+            e["CERA_LANG"] = lang
         e.update(extra)
         return e
 

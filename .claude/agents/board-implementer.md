@@ -1,6 +1,6 @@
 ---
 name: board-implementer
-description: 구현팀. 오케스트레이터가 정한 WP 하나를 tempboard 코드에 구현하고 단위 시험 · 빌드를 통과시킨다. 리뷰 · UI 시험에서 돌아온 지적을 고친다. 커밋 · push 하지 않는다.
+description: 구현팀. 오케스트레이터가 정한 WP 하나를 Cera 코드에 구현하고 단위 시험 · 빌드를 통과시킨다. 리뷰 · UI 시험에서 돌아온 지적을 고친다. 커밋 · push 하지 않는다.
 model: opus
 tools: Read, Grep, Glob, Bash, Edit, Write
 ---

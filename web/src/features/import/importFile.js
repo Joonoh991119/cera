@@ -62,9 +62,9 @@ export function classifyDrop(files) {
 
 /** Actual bytes of the body to send (JSON to UTF-8): a " inside content becomes \" and each Korean character is 3 bytes. */
 export function bodyBytes(body) { return new TextEncoder().encode(JSON.stringify(body)).length; }
-export function tooBigMessage(n) {   // message read by a guest who arrived via a link: guests do not have tempboard
-  return tr(`파일이 너무 커서 화면에서 넣을 수 없어요(${(n / 1024 / 1024).toFixed(1)} MB · 한도 ${MAX_BODY / 1024 / 1024} MB). 보드를 연 사람에게 파일을 보내 주세요 — 그 사람은 컴퓨터에서 tempboard import 로 넣을 수 있어요.`,
-    `This file is too big to add here (${(n / 1024 / 1024).toFixed(1)} MB · limit ${MAX_BODY / 1024 / 1024} MB). Send it to the person who opened the board — they can add it on their computer with tempboard import.`);
+export function tooBigMessage(n) {   // message read by a guest who arrived via a link: guests do not have Cera
+  return tr(`파일이 너무 커서 화면에서 넣을 수 없어요(${(n / 1024 / 1024).toFixed(1)} MB · 한도 ${MAX_BODY / 1024 / 1024} MB). 보드를 연 사람에게 파일을 보내 주세요 — 그 사람은 컴퓨터에서 cera import 로 넣을 수 있어요.`,
+    `This file is too big to add here (${(n / 1024 / 1024).toFixed(1)} MB · limit ${MAX_BODY / 1024 / 1024} MB). Send it to the person who opened the board — they can add it on their computer with cera import.`);
 }
 
 /** Toast to show after moving to a new board: the board view is redrawn, so the next view picks it up and shows it. */
@@ -144,7 +144,7 @@ export function stripDoc(doc, sha1 = sha1js) {
   }
   const outFiles = {};
   for (const [fid, nid] of remap) outFiles[nid] = { id: nid, mimeType: files.has(nid) ? files.get(nid).mimeType : ((doc.files[fid] || {}).mimeType || "") };
-  return { doc: { type: "excalidraw", version: 2, source: "tempboard-import", elements, files: outFiles }, files: [...files.values()], dropped };
+  return { doc: { type: "excalidraw", version: 2, source: "cera-import", elements, files: outFiles }, files: [...files.values()], dropped };
 }
 
 /** Center of the currently visible view (scene coordinates): where to merge. */

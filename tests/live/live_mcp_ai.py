@@ -1,9 +1,9 @@
-"""Live test: what is drawn through MCP (`bin/tempboard mcp`) appears on the human's screen immediately, and the human's chip shows 'AI'.
+"""Live test: what is drawn through MCP (`bin/cera mcp`) appears on the human's screen immediately, and the human's chip shows 'AI'.
 
 The name (live_*.py) keeps it out of unittest discover. It needs Playwright (Python).
-    TEMPBOARD_DIST=<built dist> python3 tests/live/live_mcp_ai.py --shots DIR [--skip-30s]
-It opens a site with no tunnel in a temporary TEMPBOARD_HOME (--home, default: a new folder under $TMPDIR) via MCP site_open and closes it when done.
-~/.tempboard is never touched. The result goes to stdout as one JSON document; the exit code is 1 if anything failed.
+    CERA_DIST=<built dist> python3 tests/live/live_mcp_ai.py --shots DIR [--skip-30s]
+It opens a site with no tunnel in a temporary CERA_HOME (--home, default: a new folder under $TMPDIR) via MCP site_open and closes it when done.
+~/.cera is never touched. The result goes to stdout as one JSON document; the exit code is 1 if anything failed.
 
 Desktop Chromium human view: elements are visible within 1.5 seconds after board_add, a 'Claude' + 'AI' badge appears in the chip row within 1 second,
 and disappears 30 seconds after the last action. On a phone (WebKit iPhone 13) the human window shows 'AI' and the top bar does not overflow (390px screenshot).
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import argparse
 import json
@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CLI = ROOT / "bin" / "tempboard"
+CLI = ROOT / "bin" / "cera"
 
 
 class Mcp:
@@ -93,10 +93,10 @@ def run(args) -> dict:
     T0 = time.time()
     ck, tm = rep["checks"], rep["timings"]
     home = Path(args.home) if args.home else Path(tempfile.mkdtemp(prefix="tbmcp."))
-    env = {**os.environ, "TEMPBOARD_HOME": str(home)}
-    env.pop("TEMPBOARD_URL", None)
-    env.pop("TEMPBOARD_TOKEN", None)
-    env.pop("TEMPBOARD_AGENT_NAME", None)
+    env = {**os.environ, "CERA_HOME": str(home)}
+    env.pop("CERA_URL", None)
+    env.pop("CERA_TOKEN", None)
+    env.pop("CERA_AGENT_NAME", None)
     shots = Path(args.shots) if args.shots else None
     if shots:
         shots.mkdir(parents=True, exist_ok=True)

@@ -100,7 +100,7 @@ function App() {
   if (me === false) return (   // key rotation and expiry both land here (the server does not say which one)
     <div className="wb-page"><h1>{tr("초대 링크가 필요해요", "You need an invite link")}</h1>
       <p className="wb-muted">{tr("링크가 바뀌었거나 끝났을 수 있어요. 보드를 연 사람에게 새 링크를 받으세요.", "The link may have changed or expired. Ask the person who opened the board for a new one.")}</p>
-      <p className="wb-muted">{tr("보드를 연 사람이라면 터미널에서 ", "If you opened the board, run ")}<code>tempboard links</code>{tr(" 로 새 링크를 볼 수 있어요.", " in a terminal to see the new links.")}</p></div>
+      <p className="wb-muted">{tr("보드를 연 사람이라면 터미널에서 ", "If you opened the board, run ")}<code>cera links</code>{tr(" 로 새 링크를 볼 수 있어요.", " in a terminal to see the new links.")}</p></div>
   );
   if (me === null) return <Login onDone={setMe} />;
   const m = hash.match(/^#b=([a-z0-9]+)/);

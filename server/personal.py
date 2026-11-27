@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
-"""tempboard site — personal board web: keep your own domain (board.<your-domain>) open at the same address all the time.
+"""Cera site — personal board web: keep your own domain (board.<your-domain>) open at the same address all the time.
 
-    tempboard site guide                         # the steps a human must do (domain -> login -> Access)
-    tempboard site init --hostname board.example.com [--access-team T --access-aud A] [--token-file F] [--keep-awake]
-    tempboard site run                           # foreground supervision (server + cloudflared named tunnel, reopened without limit)
-    tempboard site install [--dry-run] [--load]  # keep it always on (macOS LaunchAgent, Linux systemd user unit)
-    tempboard site uninstall [--dry-run] [--load]
-    tempboard site port [N|auto]                 # change only the port (when another program is using it)
-    tempboard site status | doctor [--verbose] | links
+    cera site guide                         # the steps a human must do (domain -> login -> Access)
+    cera site init --hostname board.example.com [--access-team T --access-aud A] [--token-file F] [--keep-awake]
+    cera site run                           # foreground supervision (server + cloudflared named tunnel, reopened without limit)
+    cera site install [--dry-run] [--load]  # keep it always on (macOS LaunchAgent, Linux systemd user unit)
+    cera site uninstall [--dry-run] [--load]
+    cera site port [N|auto]                 # change only the port (when another program is using it)
+    cera site status | doctor [--verbose] | links
 
-Temporary boards (`tempboard start`) are unchanged. A personal site keeps state.json (mode "personal",
+Temporary boards (`cera start`) are unchanged. A personal site keeps state.json (mode "personal",
 expires_at 0), cloudflared.yml, tunnel.json (tunnel credentials, 0600), and (optionally) members.json under the same `sites/<id>/`, so
-`tempboard list`, `links`, `keys --rotate`, `stop` and `export` keep working. The global `~/.cloudflared/config.yml` is left untouched
+`cera list`, `links`, `keys --rotate`, `stop` and `export` keep working. The global `~/.cloudflared/config.yml` is left untouched
 (cert.pem is only read). The server and supervise loop are the ones in server.py and supervise.py (this file only handles the CLI and config files).
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ import importlib.util
 
 
 def _sibling(name):
-    key = "tempboard_" + name
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().parent / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -76,10 +76,10 @@ GUIDE_DOMAIN = T("""\
   2. 이 컴퓨터에서:  cloudflared tunnel login
      브라우저가 열리면 Cloudflare 에 로그인 → 1의 도메인을 고르고 'Authorize'.
      끝나면 ~/.cloudflared/cert.pem 이 생긴다(이 파일로 터널을 만든다 — 남에게 주지 않는다).
-  3. 다시:  tempboard site init --hostname board.<내도메인>
-     (터널 만들기 · DNS 연결 · 설정 파일 · 점검은 tempboard 가 한다)
-  4. tempboard site run  으로 띄워 https://board.<내도메인>/ 이 열리는지 본다.  tempboard site doctor 로 점검.
-  5. 늘 켜 두기:  tempboard site install --load   (로그인할 때 자동으로 켜지고, 죽으면 다시 띄운다)
+  3. 다시:  cera site init --hostname board.<내도메인>
+     (터널 만들기 · DNS 연결 · 설정 파일 · 점검은 Cera 가 한다)
+  4. cera site run  으로 띄워 https://board.<내도메인>/ 이 열리는지 본다.  cera site doctor 로 점검.
+  5. 늘 켜 두기:  cera site install --load   (로그인할 때 자동으로 켜지고, 죽으면 다시 띄운다)
   {stop}
 """, """\
 What you do by hand, once, in this order:
@@ -89,26 +89,26 @@ What you do by hand, once, in this order:
   2. On this computer:  cloudflared tunnel login
      When the browser opens, log in to Cloudflare -> pick the domain from step 1 and click 'Authorize'.
      This creates ~/.cloudflared/cert.pem (it is used to create the tunnel -- keep it private).
-  3. Then:  tempboard site init --hostname board.<your-domain>
-     (tempboard creates the named tunnel, routes the DNS record, writes the config files and checks the result)
-  4. Start it with tempboard site run and check that https://board.<your-domain>/ opens.  Check it with tempboard site doctor.
-  5. Keep it running:  tempboard site install --load   (always-on service: starts at login and restarts if it dies)
+  3. Then:  cera site init --hostname board.<your-domain>
+     (Cera creates the named tunnel, routes the DNS record, writes the config files and checks the result)
+  4. Start it with cera site run and check that https://board.<your-domain>/ opens.  Check it with cera site doctor.
+  5. Keep it running:  cera site install --load   (always-on service: starts at login and restarts if it dies)
   {stop}
 """)
 
 GUIDE_TOKEN = T("""\
 대시보드로 터널을 만들 때(원격 관리 · cert.pem 없이):
-  1. https://one.dash.cloudflare.com → Networks → Tunnels → Create a tunnel → Cloudflared → 이름 tempboard.
+  1. https://one.dash.cloudflare.com → Networks → Tunnels → Create a tunnel → Cloudflared → 이름 cera.
   2. 보이는 토큰을 파일에 저장하고 권한을 줄인다:  chmod 600 <파일>   (토큰을 명령줄에 붙이지 않는다 — ps 에 보인다)
   3. 그 터널의 Public Hostname(Published application): board.<내도메인> → 서비스 http://127.0.0.1:{port}
-  4. tempboard site init --hostname board.<내도메인> --token-file <파일>
+  4. cera site init --hostname board.<내도메인> --token-file <파일>
   (Access 를 앞단에서도 강제하려면 3의 경로에서 'Protect with Access' 를 켠다)
 """, """\
 To create the tunnel in the dashboard instead (remotely managed, no cert.pem):
-  1. https://one.dash.cloudflare.com -> Networks -> Tunnels -> Create a tunnel -> Cloudflared -> name it tempboard.
+  1. https://one.dash.cloudflare.com -> Networks -> Tunnels -> Create a tunnel -> Cloudflared -> name it cera.
   2. Save the token it shows to a file and restrict its permissions:  chmod 600 <file>   (never paste the token on a command line -- ps shows it)
   3. For that tunnel's Public Hostname (Published application): board.<your-domain> -> service http://127.0.0.1:{port}
-  4. tempboard site init --hostname board.<your-domain> --token-file <file>
+  4. cera site init --hostname board.<your-domain> --token-file <file>
   (To enforce Access at the edge as well, turn on 'Protect with Access' for the route in step 3)
 """)
 
@@ -119,13 +119,13 @@ GUIDE_ACCESS = T("""\
   C. Access → Applications → Add an application → Self-hosted → 도메인 board.<내도메인> →
      정책: Action 'Allow', Include 'Emails'(들어올 주소) 또는 'Emails ending in'(@example.org) → 저장.
   D. 만든 앱을 열어 'Application Audience (AUD) Tag' 를 복사한다.
-  E. tempboard site init --hostname board.<내도메인> --access-team <팀> --access-aud <AUD>
-     이미 늘 켜 두기로 돌고 있으면  tempboard site install --load  (내렸다 다시 올린다).
+  E. cera site init --hostname board.<내도메인> --access-team <팀> --access-aud <AUD>
+     이미 늘 켜 두기로 돌고 있으면  cera site install --load  (내렸다 다시 올린다).
   F. (선택) 편집 · 보기를 나누려면 {members} 를 만든다:
        {{"edit": ["me@example.com", "@example.org"], "view": ["guest@gmail.com"]}}
      파일이 없으면 Access 를 통과한 사람은 모두 편집이다. 파일을 만들면 edit · view 에 적힌 사람만 들어온다
      (Access 를 통과한 모두를 그대로 들이려면 "edit": ["*"]). edit · view 는 꼭 [ ] 목록으로 쓴다.
-     고치면 곧바로 먹는다(다시 켤 필요 없음). 형식이 틀리면 아무도 못 들어오니 tempboard site doctor 로 확인한다.
+     고치면 곧바로 먹는다(다시 켤 필요 없음). 형식이 틀리면 아무도 못 들어오니 cera site doctor 로 확인한다.
   G. (선택) 다른 기계의 에이전트: Access → Service credentials → Service Tokens → Create → Client ID · Secret 을 받아 둔다 →
      C 의 앱에 정책을 하나 더: Action 'Service Auth', Include 'Service Token' = 그 토큰 →
      {members} 를 이렇게(사람 칸도 함께 — 에이전트만 적으면 사람이 아무도 못 들어온다):
@@ -139,13 +139,13 @@ GUIDE_ACCESS = T("""\
   C. Under Access -> Applications -> Add an application -> Self-hosted -> domain board.<your-domain> ->
      policy: Action 'Allow', Include 'Emails' (the addresses to admit) or 'Emails ending in' (@example.org) -> save.
   D. Open the application and copy its 'Application Audience (AUD) Tag'.
-  E. tempboard site init --hostname board.<your-domain> --access-team <team> --access-aud <AUD>
-     If the always-on service is already running, run  tempboard site install --load  (it is taken down and brought up again).
+  E. cera site init --hostname board.<your-domain> --access-team <team> --access-aud <AUD>
+     If the always-on service is already running, run  cera site install --load  (it is taken down and brought up again).
   F. (Optional) To separate editors from viewers, create {members}:
        {{"edit": ["me@example.com", "@example.org"], "view": ["guest@gmail.com"]}}
      Without the file, everyone who passes Access can edit. With the file, only the people listed under edit or view get in
      (use "edit": ["*"] to admit everyone who passes Access). edit and view must be written as [ ] lists.
-     Changes apply immediately (no restart needed). A malformed file locks everyone out, so check it with tempboard site doctor.
+     Changes apply immediately (no restart needed). A malformed file locks everyone out, so check it with cera site doctor.
   G. (Optional) For agents on other machines: Access -> Service credentials -> Service Tokens -> Create -> keep the Client ID and Secret ->
      add a second policy to the application from C: Action 'Service Auth', Include 'Service Token' = that token ->
      write {members} like this (list the people too -- if you list only agents, no person can get in):
@@ -157,13 +157,13 @@ GUIDE_ACCESS = T("""\
 
 def stop_howto(sid=DEFAULT_ID) -> str:
     """How to turn it off — guide, `site run --help`, and the first line of run all print the same text."""
-    return (T(f"끄기: 전경으로 띄운 site run 은 Ctrl+C · 늘 켜 두기(서비스)는 tempboard stop {sid}(다음 로그인 때 다시 켜짐) "
-            f"또는 tempboard site uninstall --load{'' if sid == DEFAULT_ID else ' --id ' + sid}(아주 끄기)", f"To stop: a foreground site run with Ctrl+C - the always-on service with tempboard stop {sid} (it starts again at the next login) "
-            f"or tempboard site uninstall --load{'' if sid == DEFAULT_ID else ' --id ' + sid} (to remove it for good)"))
+    return (T(f"끄기: 전경으로 띄운 site run 은 Ctrl+C · 늘 켜 두기(서비스)는 cera stop {sid}(다음 로그인 때 다시 켜짐) "
+            f"또는 cera site uninstall --load{'' if sid == DEFAULT_ID else ' --id ' + sid}(아주 끄기)", f"To stop: a foreground site run with Ctrl+C - the always-on service with cera stop {sid} (it starts again at the next login) "
+            f"or cera site uninstall --load{'' if sid == DEFAULT_ID else ' --id ' + sid} (to remove it for good)"))
 
 
 def guide_text(ctx=None, sid=DEFAULT_ID, port=DEFAULT_PORT) -> str:
-    members = str(ctx.SITES / sid / "members.json") if ctx else f"~/.tempboard/sites/{sid}/members.json"
+    members = str(ctx.SITES / sid / "members.json") if ctx else f"~/.cera/sites/{sid}/members.json"
     return "\n".join([GUIDE_DOMAIN.format(stop=stop_howto(sid)), GUIDE_TOKEN.format(port=port), GUIDE_ACCESS.format(members=members)])
 
 
@@ -195,9 +195,9 @@ def check_port(p) -> int:
 
 
 def default_port() -> int:
-    """Default port for site init — TEMPBOARD_SITE_PORT (tests, multiple sites) if set."""
+    """Default port for site init — CERA_SITE_PORT (tests, multiple sites) if set."""
     try:
-        return check_port(os.environ.get("TEMPBOARD_SITE_PORT") or DEFAULT_PORT)
+        return check_port(_sibling("i18n").env("SITE_PORT") or DEFAULT_PORT)
     except SystemExit:
         return DEFAULT_PORT
 
@@ -237,13 +237,13 @@ def _idflag(sid) -> str:
 
 
 def port_fix_cmd(sid, alt) -> str:
-    return f"tempboard site port {alt}{_idflag(sid)}"
+    return f"cera site port {alt}{_idflag(sid)}"
 
 
 def port_conflict_text(sid, port, alt, token_mode=False) -> str:
     lines = [T(f"포트 {port}: 다른 프로그램이 쓰는 중이라 켜지 못했다.", f"Port {port}: another program is using it, so the board could not start."),
              T(f"  고치기(그대로 붙여 넣기):  {port_fix_cmd(sid, alt)}", f"  Fix (paste as is):  {port_fix_cmd(sid, alt)}"),
-             T(f"  그 뒤:  tempboard site run{_idflag(sid)}   (늘 켜 두기로 돌고 있으면 저절로 다시 뜬다)", f"  Then:  tempboard site run{_idflag(sid)}   (if the always-on service is running, it comes back up by itself)"),
+             T(f"  그 뒤:  cera site run{_idflag(sid)}   (늘 켜 두기로 돌고 있으면 저절로 다시 뜬다)", f"  Then:  cera site run{_idflag(sid)}   (if the always-on service is running, it comes back up by itself)"),
              T(f"  어떤 프로그램인지 보기:  lsof -nP -iTCP:{port} -sTCP:LISTEN", f"  See which program it is:  lsof -nP -iTCP:{port} -sTCP:LISTEN")]
     if token_mode:
         lines.append(T(f"  원격 관리 터널이면 대시보드의 Public Hostname 서비스도 http://127.0.0.1:{alt} 로 바꾼다", f"  For a remotely managed tunnel, also change the Public Hostname service in the dashboard to http://127.0.0.1:{alt}"))
@@ -278,7 +278,7 @@ def mode_ok(path: Path) -> bool:
 def need_personal(ctx, sid) -> dict:
     st = ctx.read_state(sid)
     if not st or st.get("mode") != "personal":
-        raise SystemExit(T(f"개인 사이트 {sid} 가 없다 — 먼저  tempboard site init --hostname board.<내도메인>  (순서: tempboard site guide)", f"There is no personal site {sid} - first run  tempboard site init --hostname board.<your-domain>  (steps: tempboard site guide)"))
+        raise SystemExit(T(f"개인 사이트 {sid} 가 없다 — 먼저  cera site init --hostname board.<내도메인>  (순서: cera site guide)", f"There is no personal site {sid} - first run  cera site init --hostname board.<your-domain>  (steps: cera site guide)"))
     return st
 
 
@@ -299,7 +299,7 @@ def _y(s) -> str:
 def render_config(st: dict) -> str:
     """cloudflared.yml — for this one site only (separate from the global ~/.cloudflared/config.yml)."""
     lines = [
-        "# Generated by tempboard — `tempboard site init` rewrites this file (manual edits are lost).",
+        "# Generated by Cera — `cera site init` rewrites this file (manual edits are lost).",
         f"tunnel: {_y(st.get('tunnel_id') or st['tunnel_name'])}",
         f"credentials-file: {_y(st['credentials_file'])}",
         "ingress:",
@@ -323,8 +323,21 @@ def tunnel_argv(st: dict, cf: str, sites: Path) -> List[str]:
             st.get("tunnel_id") or st["tunnel_name"]]
 
 
-def service_label(sid) -> str:
-    return f"com.tempboard.{sid}"
+# Before 0.5.0 the service was named after tempboard. New installs use the cera names; uninstall (and install, which replaces it)
+# also finds the old-named service — only a file this program wrote (its label or description is inside) is touched.
+OLD_SERVICE_PREFIX = ("com.tempboard.", "tempboard-")
+
+
+def service_label(sid, legacy=False) -> str:
+    return f"{OLD_SERVICE_PREFIX[0] if legacy else 'com.cera.'}{sid}"
+
+
+def unit_name(sid, legacy=False) -> str:
+    return f"{OLD_SERVICE_PREFIX[1] if legacy else 'cera-'}{sid}.service"
+
+
+def service_description(sid, legacy=False) -> str:
+    return f"{'tempboard' if legacy else 'Cera'} personal board ({sid})"
 
 
 def platform_name(arg=None) -> Optional[str]:
@@ -337,20 +350,40 @@ def platform_name(arg=None) -> Optional[str]:
     return None
 
 
-def service_path(sid, plat) -> Path:
+def service_path(sid, plat, legacy=False) -> Path:
     if plat == "macos":
-        return Path.home() / "Library" / "LaunchAgents" / f"{service_label(sid)}.plist"
+        return Path.home() / "Library" / "LaunchAgents" / f"{service_label(sid, legacy)}.plist"
     base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    return base / "systemd" / "user" / f"tempboard-{sid}.service"
+    return base / "systemd" / "user" / unit_name(sid, legacy)
+
+
+def service_is_ours(path: Path, sid, legacy=False) -> bool:
+    """Whether the file at path is the service file this program wrote for sid (its label or description is inside)."""
+    try:
+        body = path.read_bytes()
+    except OSError:
+        return False
+    return service_label(sid, legacy).encode() in body or service_description(sid, legacy).encode() in body
+
+
+def installed_service(sid, plat):
+    """(path, legacy) of the service file in place — the cera one, else an old tempboard one written by this program; (cera path, False) if neither."""
+    path = service_path(sid, plat)
+    if not path.exists():
+        old = service_path(sid, plat, legacy=True)
+        if old.exists() and service_is_ours(old, sid, legacy=True):
+            return old, True
+    return path, False
 
 
 def _service_env(ctx, cf: Optional[str]) -> dict:
     dirs = ([str(Path(cf).parent)] if cf else []) + SYS_PATH
-    env = {"PATH": ":".join(dict.fromkeys(dirs)), "TEMPBOARD_HOME": str(Path(ctx.HOME).expanduser().absolute()),
+    env = {"PATH": ":".join(dict.fromkeys(dirs)), "CERA_HOME": str(Path(ctx.HOME).expanduser().absolute()),
            "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8",
-           "TEMPBOARD_SERVICE": "1"}   # lets site run know it started 'as a service' — if a supervisor is already running, it waits and takes over
-    if os.environ.get("TEMPBOARD_DIST"):
-        env["TEMPBOARD_DIST"] = str(Path(os.environ["TEMPBOARD_DIST"]).expanduser().absolute())
+           "CERA_SERVICE": "1"}   # lets site run know it started 'as a service' — if a supervisor is already running, it waits and takes over
+    dist = _sibling("i18n").env("DIST")
+    if dist:
+        env["CERA_DIST"] = str(Path(dist).expanduser().absolute())
     return env
 
 
@@ -359,8 +392,8 @@ def _installer(ctx):
 
 
 def program_args(ctx, sid) -> List[str]:
-    """Command the service will run. The plugin root (<ROOT>/bin/tempboard) can disappear when the plugin is upgraded, so this points to the fixed entry point
-    $TEMPBOARD_HOME/bin/tempboard (used by site install — install_agents.write_launcher)."""
+    """Command the service will run. The plugin root (<ROOT>/bin/cera) can disappear when the plugin is upgraded, so this points to the fixed entry point
+    $CERA_HOME/bin/cera (used by site install — install_agents.write_launcher)."""
     py = sys.executable
     if not py or not os.path.isabs(py):
         raise SystemExit(T("파이썬 절대경로를 알 수 없다(sys.executable) — 절대경로의 python3 로 다시 실행하세요", "Cannot determine the absolute path of Python (sys.executable) - run again with python3 by its absolute path"))
@@ -375,7 +408,7 @@ def render_plist(ctx, st: dict, cf: Optional[str]) -> bytes:
         "Label": service_label(sid),
         "ProgramArguments": program_args(ctx, sid),
         "RunAtLoad": True,
-        "KeepAlive": {"SuccessfulExit": False},   # if it ends cleanly (0) via `tempboard stop`, do not start it again
+        "KeepAlive": {"SuccessfulExit": False},   # if it ends cleanly (0) via `cera stop`, do not start it again
         "ThrottleInterval": 10,
         "WorkingDirectory": str(site_dir(ctx, sid).absolute()),
         "StandardOutPath": log,
@@ -395,9 +428,9 @@ def render_systemd(ctx, st: dict, cf: Optional[str]) -> str:
     log = str(site_dir(ctx, sid).absolute() / "log.txt").replace("%", "%%")
     env = "\n".join(f"Environment={_sq(k + '=' + v)}" for k, v in _service_env(ctx, cf).items())
     return f"""\
-# Generated by tempboard — `tempboard site install` rewrites this file.
+# Generated by Cera — `cera site install` rewrites this file.
 [Unit]
-Description=tempboard personal board ({sid})
+Description={service_description(sid)}
 After=network-online.target
 Wants=network-online.target
 
@@ -447,7 +480,7 @@ class RefuseError(StepError):
 
 def default_tunnel_name(host: str) -> str:
     """Put the public address into the default tunnel name — so it does not collide with other machines or other sites on the same account."""
-    return ("tempboard-" + host.replace(".", "-"))[:63].rstrip("-.")
+    return ("cera-" + host.replace(".", "-"))[:63].rstrip("-.")
 
 
 def _existing_tunnel(cf, cert, name) -> Optional[dict]:
@@ -474,7 +507,7 @@ def cmd_init(ctx, a):
         raise SystemExit(T("--no-access 와 --access-team/--access-aud 는 함께 쓸 수 없다", "--no-access cannot be combined with --access-team/--access-aud"))
     if a.access_team or a.access_aud:
         if not (a.access_team and a.access_aud):
-            raise SystemExit(T("--access-team 과 --access-aud 는 함께 준다(순서: tempboard site guide 의 A–E)", "Give --access-team and --access-aud together (steps A-E of tempboard site guide)"))
+            raise SystemExit(T("--access-team 과 --access-aud 는 함께 준다(순서: cera site guide 의 A–E)", "Give --access-team and --access-aud together (steps A-E of cera site guide)"))
         try:
             access_new = {"team": cfm.team_name(a.access_team), "aud": cfm.check_aud(a.access_aud)}
         except ValueError as e:
@@ -515,7 +548,7 @@ def cmd_init(ctx, a):
     if not ours and port_in_use(port):
         alt = free_port(port + 1)
         if a.port is None:
-            port_note = T(f"포트 {port}: 다른 프로그램이 쓰는 중 → 이 사이트는 포트 {alt} 사용(바꾸려면 tempboard site port N{_idflag(sid)})", f"Port {port}: another program is using it -> this site uses port {alt} (to change it: tempboard site port N{_idflag(sid)})")
+            port_note = T(f"포트 {port}: 다른 프로그램이 쓰는 중 → 이 사이트는 포트 {alt} 사용(바꾸려면 cera site port N{_idflag(sid)})", f"Port {port}: another program is using it -> this site uses port {alt} (to change it: cera site port N{_idflag(sid)})")
             port = alt
         else:
             print(T(f"주의: 포트 {port}: 다른 프로그램이 쓰는 중 — 이대로면 site run 이 켜지지 않는다. "
@@ -542,12 +575,12 @@ def cmd_init(ctx, a):
                     raise RefuseError(
                         T(f"Cloudflare 계정에 터널 {name} 이 이미 있다(id {found['id']}). 이 컴퓨터가 몰래 이어받지 않는다:\n"
                         "  두 컴퓨터가 한 터널로 돌면 Cloudflare 가 요청을 둘에 나눠 보내 그림이 갈리고 로그인이 번갈아 끊긴다.\n"
-                        "  → 다른 컴퓨터에서 쓰던 보드를 이 컴퓨터로 옮기는 것이면: 그쪽을 끄고(tempboard site uninstall --load ·\n"
-                        "    tempboard stop) 다시  tempboard site init … --reuse-tunnel\n"
+                        "  → 다른 컴퓨터에서 쓰던 보드를 이 컴퓨터로 옮기는 것이면: 그쪽을 끄고(cera site uninstall --load ·\n"
+                        "    cera stop) 다시  cera site init … --reuse-tunnel\n"
                         "  → 따로 쓰려면 다른 이름:  --tunnel-name <새 이름>  (주소도 다르게 --hostname)", f"A tunnel named {name} already exists in your Cloudflare account (id {found['id']}). This computer will not quietly take it over:\n"
                         "  If two computers run one tunnel, Cloudflare splits requests between them, so drawings diverge and logins drop in turn.\n"
-                        "  -> If you are moving a board from another computer to this one: turn it off there (tempboard site uninstall --load and\n"
-                        "    tempboard stop), then run  tempboard site init ... --reuse-tunnel  again\n"
+                        "  -> If you are moving a board from another computer to this one: turn it off there (cera site uninstall --load and\n"
+                        "    cera stop), then run  cera site init ... --reuse-tunnel  again\n"
                         "  -> To use them separately, pick another name:  --tunnel-name <new name>  (and a different --hostname)"))
                 if found:
                     n = found.get("connections")
@@ -624,28 +657,28 @@ def cmd_init(ctx, a):
         print(T(f"  터널 {name} ({tunnel_id or '?'}) · 설정 {cfg}", f"  Tunnel {name} ({tunnel_id or '?'}) - config {cfg}"))
     if st.get("access"):
         print(T(f"  Cloudflare Access: 팀 {st['access']['team']} — 공개 주소는 Access 로그인 뒤 열린다(초대 키 필요 없음)", f"  Cloudflare Access: team {st['access']['team']} - the public address opens after the Access login (no invite key needed)"))
-        print(T(f"  편집 · 보기 나누기(선택): {d / 'members.json'}  (형식: tempboard site guide 의 F)", f"  Separate editors and viewers (optional): {d / 'members.json'}  (format: step F of tempboard site guide)"))
+        print(T(f"  편집 · 보기 나누기(선택): {d / 'members.json'}  (형식: cera site guide 의 F)", f"  Separate editors and viewers (optional): {d / 'members.json'}  (format: step F of cera site guide)"))
     else:
         if new_keys:   # shown only this one time, when the keys are first created (an exception to the secrets rule — never printed in the log or site run)
             ln = ctx.links({**st, "local_url": f"http://127.0.0.1:{port}"})
-            print(T("  초대 링크(지금 한 번만 보인다 — 다시 보기: tempboard links " + sid + "):", "  Invite links (shown only this once - to see them again: tempboard links " + sid + "):"))
+            print(T("  초대 링크(지금 한 번만 보인다 — 다시 보기: cera links " + sid + "):", "  Invite links (shown only this once - to see them again: cera links " + sid + "):"))
             print(T(f"    같이 그리기   {ln['edit']}", f"    Draw together {ln['edit']}"))
             if ln.get("view"):
                 print(T(f"    보기 전용     {ln['view']}", f"    View only     {ln['view']}"))
             if ln.get("local"):
                 print(T(f"    (이 컴퓨터)   {ln['local']}   ← site run 을 켠 뒤", f"    (this computer) {ln['local']}   <- after starting site run"))
         else:
-            print(T(f"  초대 링크:  tempboard links {sid}", f"  Invite links:  tempboard links {sid}"))
-        print(T("  Access 없이 초대 키로 연다 — 링크가 퍼지면  tempboard keys " + sid + " --rotate all", "  It opens with the invite key, without Access - if the link spreads:  tempboard keys " + sid + " --rotate all"))
+            print(T(f"  초대 링크:  cera links {sid}", f"  Invite links:  cera links {sid}"))
+        print(T("  Access 없이 초대 키로 연다 — 링크가 퍼지면  cera keys " + sid + " --rotate all", "  It opens with the invite key, without Access - if the link spreads:  cera keys " + sid + " --rotate all"))
     if old.get("status") == "running" and ctx.alive(old.get("pid")):
         print(T("  ※ 지금 돌고 있다 — 터널 · 포트 · Access 를 바꿨으면 다시 켜야 먹는다"
-              f"(전경: Ctrl+C 뒤 site run · 서비스: tempboard site install --load)", "  Note: it is running right now - if you changed the tunnel, port or Access, restart it for the change to apply "
-              f"(foreground: Ctrl+C, then site run - service: tempboard site install --load)"))
+              f"(전경: Ctrl+C 뒤 site run · 서비스: cera site install --load)", "  Note: it is running right now - if you changed the tunnel, port or Access, restart it for the change to apply "
+              f"(foreground: Ctrl+C, then site run - service: cera site install --load)"))
     if st.get("access"):
         err = cfm.Members(d / "members.json").check()
         if err:
             print(T(f"주의: members.json 이 틀려 지금은 아무도 못 들어온다 — {err}", f"Warning: members.json is malformed, so nobody can get in right now - {err}"), file=sys.stderr)
-    print(T("다음:  tempboard site run   →   tempboard site doctor   →   tempboard site install --load", "Next:  tempboard site run   ->   tempboard site doctor   ->   tempboard site install --load"))
+    print(T("다음:  cera site run   →   cera site doctor   →   cera site install --load", "Next:  cera site run   ->   cera site doctor   ->   cera site install --load"))
 
 
 # ------------------------------------------------------------------ run
@@ -676,7 +709,7 @@ def _other_running(ctx, st) -> bool:
 
 def _wait_for_other(ctx, sid, st, poll=2.0):
     """Started as a service (launchd, systemd) while another site run (foreground) is already running — if it exited with 1, it would restart every 10 seconds and fill the log.
-    Instead, wait quietly and take over when that one ends. If a human stopped it via `tempboard stop` (stop_requested_at), it ends with exit 0
+    Instead, wait quietly and take over when that one ends. If a human stopped it via `cera stop` (stop_requested_at), it ends with exit 0
     and does not restart (KeepAlive{SuccessfulExit:false})."""
     t0 = time.time()
     print(T(f"다른 site run(pid {st.get('pid')})이 돌고 있다 — 끝나면 이어받는다", f"Another site run (pid {st.get('pid')}) is running - taking over when it ends"), flush=True)
@@ -684,7 +717,7 @@ def _wait_for_other(ctx, sid, st, poll=2.0):
         time.sleep(poll)
         cur = ctx.read_state(sid) or {}
         if (cur.get("stop_requested_at") or 0) >= t0:
-            print(T("tempboard stop 으로 꺼졌다 — 다시 띄우지 않는다", "It was stopped with tempboard stop - not starting it again"), flush=True)
+            print(T("cera stop 으로 꺼졌다 — 다시 띄우지 않는다", "It was stopped with cera stop - not starting it again"), flush=True)
             sys.exit(0)
         if not _other_running(ctx, cur):
             return need_personal(ctx, sid)
@@ -695,8 +728,8 @@ def cmd_run(ctx, a):
     sid = check_id(a.id)
     st = need_personal(ctx, sid)
     if _other_running(ctx, st):
-        if os.environ.get("TEMPBOARD_SERVICE") != "1":
-            raise SystemExit(T(f"{sid} 는 이미 돌고 있다(pid {st['pid']}) — 끝내려면 tempboard stop {sid}", f"{sid} is already running (pid {st['pid']}) - to stop it: tempboard stop {sid}"))
+        if _sibling("i18n").env("SERVICE") != "1":
+            raise SystemExit(T(f"{sid} 는 이미 돌고 있다(pid {st['pid']}) — 끝내려면 cera stop {sid}", f"{sid} is already running (pid {st['pid']}) - to stop it: cera stop {sid}"))
         st = _wait_for_other(ctx, sid, st)
     if st.get("trust_header"):
         raise SystemExit(T("개인 사이트에는 trust_header 를 쓸 수 없다(위조된다) — state.json 에서 지우세요", "trust_header cannot be used on a personal site (it can be forged) - remove it from state.json"))
@@ -735,9 +768,9 @@ def cmd_run(ctx, a):
                     p.kill()
         return cleanup
 
-    # If `tempboard stop` arrived while fetching the web files or building (a few minutes), do not start the supervisor (the service gets exit 0 -> not restarted)
+    # If `cera stop` arrived while fetching the web files or building (a few minutes), do not start the supervisor (the service gets exit 0 -> not restarted)
     if ((ctx.read_state(sid) or {}).get("stop_requested_at") or 0) >= started:
-        print(T("시작하는 동안 tempboard stop 이 왔다 — 띄우지 않는다", "tempboard stop arrived during startup - not starting"), flush=True)
+        print(T("시작하는 동안 cera stop 이 왔다 — 띄우지 않는다", "cera stop arrived during startup - not starting"), flush=True)
         sys.exit(0)
     port = int(st.get("port") or DEFAULT_PORT)
     if port_in_use(port):   # another program holds the port — say which port and give a fix command to paste
@@ -746,8 +779,8 @@ def cmd_run(ctx, a):
         sys.exit(1)
     ctx.update_state(sid, lambda c: c.update(tunnel_starts=[], error=None))
     # Do not print the keys — this line goes into the always-on log.txt
-    how = T("Cloudflare Access 로그인으로 연다", "it opens through the Cloudflare Access login") if st.get("access") else T(f"초대 링크: tempboard links {sid}", f"invite links: tempboard links {sid}")
-    print(f"tempboard site {sid} — https://{st['hostname']}/ · {how}", flush=True)
+    how = T("Cloudflare Access 로그인으로 연다", "it opens through the Cloudflare Access login") if st.get("access") else T(f"초대 링크: cera links {sid}", f"invite links: cera links {sid}")
+    print(f"Cera site {sid} — https://{st['hostname']}/ · {how}", flush=True)
     print(stop_howto(sid), flush=True)
     try:
         reason = sup.run(sid, st, tunnel_cmd, None, retries=None, backoff=sup.exp_backoff, sites=ctx.SITES, dist=ctx.DIST,
@@ -773,7 +806,7 @@ def cmd_port(ctx, a):
     sid = check_id(a.id)
     st = need_personal(ctx, sid)
     if _other_running(ctx, st):
-        raise SystemExit(T(f"{sid} 가 돌고 있다 — 포트를 바꾸려면 먼저 tempboard stop {sid}", f"{sid} is running - to change the port, first run tempboard stop {sid}"))
+        raise SystemExit(T(f"{sid} 가 돌고 있다 — 포트를 바꾸려면 먼저 cera stop {sid}", f"{sid} is running - to change the port, first run cera stop {sid}"))
     old = int(st.get("port") or DEFAULT_PORT)
     if a.port in (None, "auto"):
         new = old if not port_in_use(old) else free_port(old + 1)
@@ -790,11 +823,11 @@ def cmd_port(ctx, a):
             try:
                 _cf([cf, "tunnel", "--config", str(cfg), "ingress", "validate"], "ingress validate", timeout=30)
             except StepError:
-                raise SystemExit(T(f"설정 파일 점검 실패 — tempboard site doctor --verbose{_idflag(sid)} 로 원문을 보세요", f"Config file check failed - see the raw text with tempboard site doctor --verbose{_idflag(sid)}"))
+                raise SystemExit(T(f"설정 파일 점검 실패 — cera site doctor --verbose{_idflag(sid)} 로 원문을 보세요", f"Config file check failed - see the raw text with cera site doctor --verbose{_idflag(sid)}"))
     print(T(f"포트: {old} → {new}", f"Port: {old} -> {new}") if new != old else T(f"포트 {new}: 비어 있음 — 그대로 쓴다", f"Port {new}: free - keeping it"))
     if st.get("token_file"):
         print(T(f"  원격 관리 터널 — 대시보드의 Public Hostname 서비스를 http://127.0.0.1:{new} 로 바꾸세요", f"  Remotely managed tunnel - change the Public Hostname service in the dashboard to http://127.0.0.1:{new}"))
-    print(T(f"다음:  tempboard site run{_idflag(sid)}   (늘 켜 두기로 돌고 있으면 10초 안에 저절로 다시 뜬다)", f"Next:  tempboard site run{_idflag(sid)}   (if the always-on service is running, it comes back up by itself within 10 seconds)"))
+    print(T(f"다음:  cera site run{_idflag(sid)}   (늘 켜 두기로 돌고 있으면 10초 안에 저절로 다시 뜬다)", f"Next:  cera site run{_idflag(sid)}   (if the always-on service is running, it comes back up by itself within 10 seconds)"))
 
 
 # ------------------------------------------------------------------ install · uninstall
@@ -809,10 +842,37 @@ def load_cmds(sid, plat, path: Path) -> List[List[str]]:
     return [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", unit]]
 
 
-def unload_cmds(sid, plat, path: Path) -> List[List[str]]:
+def unload_cmds(sid, plat, path: Path, legacy=False) -> List[List[str]]:
     if plat == "macos":
-        return [["launchctl", "bootout", f"gui/{_uid()}/{service_label(sid)}"]]
+        return [["launchctl", "bootout", f"gui/{_uid()}/{service_label(sid, legacy)}"]]
     return [["systemctl", "--user", "disable", "--now", path.name], ["systemctl", "--user", "daemon-reload"]]
+
+
+def remove_legacy_service(sid, plat, load: bool, dry_run=False) -> None:
+    """Remove the old tempboard-named service for sid (com.tempboard.<id> / tempboard-<id>.service), but only a file this
+    program wrote. With load, it is unloaded first; otherwise the commands to unload it are printed."""
+    path = service_path(sid, plat, legacy=True)
+    if not path.exists():
+        return
+    cmds = unload_cmds(sid, plat, path, legacy=True)
+    if not service_is_ours(path, sid, legacy=True):
+        print(T(f"옛 이름 자리에 파일이 있지만 이 프로그램이 만든 것이 아니다 — 손대지 않았다: {path}",
+                f"A file sits at the old service name but was not made by this program - left untouched: {path}"))
+        return
+    if dry_run:
+        print(T(f"# 옛 이름(tempboard)의 서비스도 지운다: {path}\n# 내리기(--load):\n{_show_cmds(cmds)}",
+                f"# The old-named (tempboard) service is removed too: {path}\n# To unload (--load):\n{_show_cmds(cmds)}"))
+        return
+    if load:
+        for c in cmds:
+            p = subprocess.run(c, capture_output=True, text=True)
+            if p.returncode != 0:
+                print(T(f"주의: {' '.join(c)} → exit {p.returncode} {(p.stderr or p.stdout).strip()}", f"Warning: {' '.join(c)} -> exit {p.returncode} {(p.stderr or p.stdout).strip()}"), file=sys.stderr)
+    path.unlink()
+    print(T(f"옛 이름(tempboard)의 서비스 파일을 지웠다: {path}", f"Deleted the old-named (tempboard) service file: {path}"))
+    if not load:
+        print(T(f"※ 그 서비스가 올라가 있었다면 아직 돌고 있다 — 내리려면:\n{_show_cmds(cmds)}",
+                f"Note: if that service was loaded, it is still running - to unload it:\n{_show_cmds(cmds)}"))
 
 
 def _show_cmds(cmds):
@@ -833,22 +893,24 @@ def cmd_install(ctx, a):
         print(T(f"# {path}  (쓰지 않았다 — --dry-run)", f"# {path}  (not written - --dry-run)"))
         sys.stdout.write(data.decode("utf-8"))
         print(T(f"# 올리기(--load):\n{_show_cmds(cmds)}", f"# To load (--load):\n{_show_cmds(cmds)}"))
+        remove_legacy_service(sid, plat, a.load, dry_run=True)
         return
     if not cf:
         print(T("주의: cloudflared 를 찾지 못했다 — 설치한 뒤 이 명령을 다시 실행하세요(서비스 PATH 에 넣는다)", "Warning: cloudflared was not found - install it, then run this command again (it is added to the service PATH)"), file=sys.stderr)
+    remove_legacy_service(sid, plat, a.load)   # the same site under the old name would otherwise run twice
     launcher = _installer(ctx).write_launcher(ctx.HOME, ctx.ROOT)
     print(T(f"고정 진입점: {launcher} → {ctx.ROOT}(플러그인을 올린 뒤에는 이 명령을 다시 실행하면 새 판을 가리킨다)", f"Fixed entry point: {launcher} -> {ctx.ROOT} (after updating the plugin, run this command again so it points to the new version)"))
     _write_atomic(path, data, 0o644)
     ctx.update_state(sid, lambda cur: cur.update(service={"platform": plat, "path": str(path)}))
     print(T(f"썼다: {path}", f"Wrote: {path}"))
     if not a.load:
-        print(T(f"아직 올리지 않았다 — 올리려면  tempboard site install --load   (또는 직접:\n{_show_cmds(cmds)})", f"Not loaded yet - to load it run  tempboard site install --load   (or by hand:\n{_show_cmds(cmds)})"))
+        print(T(f"아직 올리지 않았다 — 올리려면  cera site install --load   (또는 직접:\n{_show_cmds(cmds)})", f"Not loaded yet - to load it run  cera site install --load   (or by hand:\n{_show_cmds(cmds)})"))
     else:
         for i, c in enumerate(cmds):
             p = subprocess.run(c, capture_output=True, text=True)
             if p.returncode != 0 and not (plat == "macos" and i == 0):   # the first bootout fails if it was not loaded — that is fine
                 raise SystemExit(T(f"{' '.join(c)} 실패(exit {p.returncode}): {(p.stderr or p.stdout).strip()}", f"{' '.join(c)} failed (exit {p.returncode}): {(p.stderr or p.stdout).strip()}"))
-        print(T("올렸다 — 로그인할 때마다 켜지고, 죽으면 다시 띄운다. 끄기:  tempboard site uninstall --load", "Loaded - it starts at every login and restarts if it dies. To remove it:  tempboard site uninstall --load"))
+        print(T("올렸다 — 로그인할 때마다 켜지고, 죽으면 다시 띄운다. 끄기:  cera site uninstall --load", "Loaded - it starts at every login and restarts if it dies. To remove it:  cera site uninstall --load"))
     if plat == "linux":
         print(T("※ 로그아웃 뒤에도 돌게 하려면 한 번:  loginctl enable-linger $USER", "Note: to keep it running after you log out, run once:  loginctl enable-linger $USER"))
     if plat == "macos":
@@ -864,36 +926,38 @@ def cmd_uninstall(ctx, a):
     cmds = unload_cmds(sid, plat, path)
     if a.dry_run:
         print(T(f"# 지울 파일: {path}{'' if path.exists() else ' (없음)'}\n# 내리기(--load):\n{_show_cmds(cmds)}", f"# File to delete: {path}{'' if path.exists() else ' (missing)'}\n# To unload (--load):\n{_show_cmds(cmds)}"))
+        remove_legacy_service(sid, plat, a.load, dry_run=True)
         return
-    if a.load:
+    legacy_only = not path.exists() and service_path(sid, plat, legacy=True).exists()
+    remove_legacy_service(sid, plat, a.load)
+    if a.load and not legacy_only:   # only the old-named service was installed: it was unloaded above
         for c in cmds:
             p = subprocess.run(c, capture_output=True, text=True)
             if p.returncode != 0:
                 print(T(f"주의: {' '.join(c)} → exit {p.returncode} {(p.stderr or p.stdout).strip()}", f"Warning: {' '.join(c)} -> exit {p.returncode} {(p.stderr or p.stdout).strip()}"), file=sys.stderr)
     if path.exists():
-        body = path.read_bytes()
-        if service_label(sid).encode() not in body and f"tempboard personal board ({sid})".encode() not in body:
-            raise SystemExit(T(f"{path} 는 tempboard 가 만든 파일이 아닌 것 같다 — 손대지 않았다", f"{path} does not look like a file made by tempboard - left untouched"))
+        if not service_is_ours(path, sid):
+            raise SystemExit(T(f"{path} 는 Cera 가 만든 파일이 아닌 것 같다 — 손대지 않았다", f"{path} does not look like a file made by Cera - left untouched"))
         path.unlink()
         print(T(f"지웠다: {path}", f"Deleted: {path}"))
-    else:
+    elif not legacy_only:
         print(T(f"서비스 파일이 없다: {path}", f"No service file: {path}"))
     if ctx.read_state(sid):
         ctx.update_state(sid, lambda cur: cur.update(service=None))
-    if not a.load:
+    if not a.load and not legacy_only:
         print(T(f"※ 이미 올라가 있었다면 지금 도는 것은 그대로다 — 내리려면:\n{_show_cmds(cmds)}", f"Note: if it was already loaded, what is running now keeps running - to unload it:\n{_show_cmds(cmds)}"))
     print(T(f"그림 · 설정({site_dir(ctx, sid)})과 Cloudflare 의 터널 · DNS 는 남는다(지우려면 사람이 대시보드 또는 cloudflared tunnel delete).", f"Drawings and settings ({site_dir(ctx, sid)}) and the tunnel and DNS record on Cloudflare stay (to remove them, a person must use the dashboard or cloudflared tunnel delete)."))
 
 
 # ------------------------------------------------------------------ status · links
-def service_loaded(sid, plat) -> Optional[bool]:
+def service_loaded(sid, plat, legacy=False) -> Optional[bool]:
     """Is it loaded? (read-only). None if unknown."""
     try:
         if plat == "macos":
-            p = subprocess.run(["launchctl", "print", f"gui/{_uid()}/{service_label(sid)}"], capture_output=True, text=True, timeout=5)
+            p = subprocess.run(["launchctl", "print", f"gui/{_uid()}/{service_label(sid, legacy)}"], capture_output=True, text=True, timeout=5)
             return p.returncode == 0
         if plat == "linux":
-            p = subprocess.run(["systemctl", "--user", "is-active", f"tempboard-{sid}.service"], capture_output=True, text=True, timeout=5)
+            p = subprocess.run(["systemctl", "--user", "is-active", unit_name(sid, legacy)], capture_output=True, text=True, timeout=5)
             return p.stdout.strip() == "active"
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -901,19 +965,19 @@ def service_loaded(sid, plat) -> Optional[bool]:
 
 
 def personal_links(ctx, st) -> dict:
-    """Links in Access mode (the public address without a key, only this machine's address with the invite key) — links() in bin/tempboard follows the same rule."""
+    """Links in Access mode (the public address without a key, only this machine's address with the invite key) — links() in bin/cera follows the same rule."""
     return ctx.links(st)
 
 
 def show_personal(ctx, st, as_json=False):
-    """The same output as `tempboard links` (show() in bin/tempboard knows about Access mode)."""
+    """The same output as `cera links` (show() in bin/cera knows about Access mode)."""
     return ctx.show(st, as_json)
 
 
 def cmd_links(ctx, a):
     st = need_personal(ctx, check_id(a.id))
     if ctx.live_status(st) != "running" and not a.json:
-        print(T(f"{st['id']} 는 닫혀 있다({ctx.live_status(st)}) — tempboard site run 또는 site install --load", f"{st['id']} is closed ({ctx.live_status(st)}) - run tempboard site run or site install --load"))
+        print(T(f"{st['id']} 는 닫혀 있다({ctx.live_status(st)}) — cera site run 또는 site install --load", f"{st['id']} is closed ({ctx.live_status(st)}) - run cera site run or site install --load"))
         return
     show_personal(ctx, st, a.json)
 
@@ -932,8 +996,8 @@ def cmd_status(ctx, a):
     sid = check_id(a.id)
     st = need_personal(ctx, sid)
     plat = platform_name()
-    sp = service_path(sid, plat) if plat else None
-    loaded = service_loaded(sid, plat) if sp and sp.exists() else None
+    sp, legacy = installed_service(sid, plat) if plat else (None, False)
+    loaded = service_loaded(sid, plat, legacy) if sp and sp.exists() else None
     members = site_dir(ctx, sid) / "members.json"
     info = {"id": sid, "status": ctx.live_status(st), "pid": st.get("pid") if ctx.alive(st.get("pid")) else None,
             "url": st.get("public_url"), "local_url": st.get("local_url"), "port": st.get("port"),
@@ -941,12 +1005,13 @@ def cmd_status(ctx, a):
                        "id": st.get("tunnel_id"), "config": None if st.get("token_file") else str(site_dir(ctx, sid) / "cloudflared.yml")},
             "access": ({"team": st["access"]["team"], "members_file": members.is_file()} if st.get("access") else None),
             "keep_awake": bool(st.get("keep_awake")),
-            "service": {"path": str(sp) if sp else None, "installed": bool(sp and sp.exists()), "loaded": loaded},
+            "service": {"path": str(sp) if sp else None, "installed": bool(sp and sp.exists()), "loaded": loaded,
+                        **({"legacy": True} if legacy else {})},
             "log": str(site_dir(ctx, sid) / "log.txt"), "error": st.get("error")}
     if a.json:
         print(json.dumps(info, ensure_ascii=False))
         return
-    print(f"tempboard site {sid} — {info['status']}" + (f" (pid {info['pid']})" if info["pid"] else "") + f" · {info['url']}")
+    print(f"Cera site {sid} — {info['status']}" + (f" (pid {info['pid']})" if info["pid"] else "") + f" · {info['url']}")
     t = info["tunnel"]
     print(T(f"  터널       {'원격 관리(토큰 파일)' if t['managed'] == 'remote' else '로컬 관리 ' + str(t['name']) + ' (' + str(t['id']) + ')'}", f"  Tunnel          {'remotely managed (token file)' if t['managed'] == 'remote' else 'locally managed ' + str(t['name']) + ' (' + str(t['id']) + ')'}"))
     if info["access"]:
@@ -955,8 +1020,8 @@ def cmd_status(ctx, a):
         print(T("  Access     꺼짐 — 초대 키로 연다", "  Access          off - opens with the invite key"))
     sv = info["service"]
     print(T(f"  늘 켜 두기  {'설치됨' if sv['installed'] else '설치 안 됨'}" +
-          ({True: ' · 올라감', False: ' · 안 올라감', None: ''}[sv['loaded']] if sv["installed"] else " — tempboard site install --load"), f"  Always-on       {'installed' if sv['installed'] else 'not installed'}" +
-          ({True: ' - loaded', False: ' - not loaded', None: ''}[sv['loaded']] if sv["installed"] else " - tempboard site install --load")))
+          ({True: ' · 올라감', False: ' · 안 올라감', None: ''}[sv['loaded']] if sv["installed"] else " — cera site install --load"), f"  Always-on       {'installed' if sv['installed'] else 'not installed'}" +
+          ({True: ' - loaded', False: ' - not loaded', None: ''}[sv['loaded']] if sv["installed"] else " - cera site install --load")))
     print(T(f"  잠자기 막기 {'켜짐(caffeinate -s, 전원 연결 때)' if info['keep_awake'] else '꺼짐'}", f"  Prevent sleep   {'on (caffeinate -s, while on AC power)' if info['keep_awake'] else 'off'}"))
     print(T(f"  로그       {info['log']}", f"  Log             {info['log']}"))
     if info["error"]:
@@ -1018,7 +1083,7 @@ def _net_words(e) -> str:
 
 def probe(url: str, timeout=8.0, host: Optional[str] = None) -> dict:
     """-> {code | None, location, body (first 2 KB), words (human-readable), raw (original), refused}. Redirects are not followed."""
-    req = urllib.request.Request(url, headers={"User-Agent": "tempboard-doctor", **({"Host": host} if host else {})})
+    req = urllib.request.Request(url, headers={"User-Agent": "cera-doctor", **({"Host": host} if host else {})})
     opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as r:
@@ -1048,17 +1113,17 @@ def check_public(rep: Report, url: str, access: bool, timeout=8.0):
         rep.add("OK", T("공개 주소", "public address"), T("Access 로그인으로 보낸다(정상)", "redirects to the Access login (normal)"))
     elif access and code == 401:
         rep.add("FAIL", T("공개 주소", "public address"), T("터널은 닿지만 Access 앱이 이 주소를 감싸지 않는다(서버가 401 로 막는 중)", "the tunnel is reachable, but no Access application covers this address (the server is blocking with 401)"),
-                T("Zero Trust → Access → Applications 에 이 주소의 Self-hosted 앱을 만든다(tempboard site guide 의 C)", "Create a Self-hosted application for this address under Zero Trust -> Access -> Applications (step C of tempboard site guide)"))
+                T("Zero Trust → Access → Applications 에 이 주소의 Self-hosted 앱을 만든다(cera site guide 의 C)", "Create a Self-hosted application for this address under Zero Trust -> Access -> Applications (step C of cera site guide)"))
     elif not access and code == 200:
         rep.add("OK", T("공개 주소", "public address"), T(f"{url} 이 열린다", f"{url} opens"))
     elif code in (502, 503, 504, 530):   # 530 = Cloudflare error 1033 (no tunnel connector), etc.
         rep.add("FAIL", T("공개 주소", "public address"), T(f"HTTP {code} — Cloudflare 까지는 오지만 터널이 이 컴퓨터에 붙어 있지 않다", f"HTTP {code} - requests reach Cloudflare, but the tunnel is not connected to this computer"),
-                T("tempboard site run(또는 site install --load)이 도는지, 로그를 보세요", "Check that tempboard site run (or site install --load) is running, and look at the log"))
+                T("cera site run(또는 site install --load)이 도는지, 로그를 보세요", "Check that cera site run (or site install --load) is running, and look at the log"))
     elif code == 421:
         rep.add("FAIL", T("공개 주소", "public address"), T("421 — 서버가 이 Host 를 모른다(앞단이 Host 를 바꾸는지)", "421 - the server does not know this Host (check whether something in front rewrites Host)"),
                 T("state.json 의 allow_hosts 에 그 이름을 더하거나 cloudflared originRequest.httpHostHeader 를 빼세요", "Add that name to allow_hosts in state.json, or remove cloudflared originRequest.httpHostHeader"))
     else:
-        rep.add("WARN", T("공개 주소", "public address"), T(f"HTTP {code} — 예상하지 못한 응답", f"HTTP {code} - unexpected response"), T("tempboard site doctor --verbose 와 log.txt 를 보세요", "See tempboard site doctor --verbose and log.txt"))
+        rep.add("WARN", T("공개 주소", "public address"), T(f"HTTP {code} — 예상하지 못한 응답", f"HTTP {code} - unexpected response"), T("cera site doctor --verbose 와 log.txt 를 보세요", "See cera site doctor --verbose and log.txt"))
 
 
 def _cert_hint(err: str) -> str:
@@ -1124,11 +1189,11 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
     # 2. site, login, credentials
     cert = cert_path()
     if not st:
-        rep.add("FAIL", T("개인 사이트", "personal site"), T(f"{sid} 가 아직 없다", f"{sid} does not exist yet"), T("tempboard site init --hostname board.<내도메인>  (순서: tempboard site guide)", "tempboard site init --hostname board.<your-domain>  (steps: tempboard site guide)"))
+        rep.add("FAIL", T("개인 사이트", "personal site"), T(f"{sid} 가 아직 없다", f"{sid} does not exist yet"), T("cera site init --hostname board.<내도메인>  (순서: cera site guide)", "cera site init --hostname board.<your-domain>  (steps: cera site guide)"))
         if cert.is_file():
             rep.add("OK", T("Cloudflare 로그인", "Cloudflare login"), str(cert))
         else:
-            rep.add("FAIL", T("Cloudflare 로그인", "Cloudflare login"), T(f"{cert} 없음", f"{cert} is missing"), T("도메인을 Cloudflare 에 올린 뒤  cloudflared tunnel login  (tempboard site guide 의 1–2)", "After putting the domain on Cloudflare, run  cloudflared tunnel login  (steps 1-2 of tempboard site guide)"))
+            rep.add("FAIL", T("Cloudflare 로그인", "Cloudflare login"), T(f"{cert} 없음", f"{cert} is missing"), T("도메인을 Cloudflare 에 올린 뒤  cloudflared tunnel login  (cera site guide 의 1–2)", "After putting the domain on Cloudflare, run  cloudflared tunnel login  (steps 1-2 of cera site guide)"))
         return rep
     rep.add("OK", T("개인 사이트", "personal site"), T(f"{sid} · https://{st['hostname']}/ · 포트 {st['port']}", f"{sid} - https://{st['hostname']}/ - port {st['port']}"))
     if st.get("token_file"):
@@ -1142,7 +1207,7 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
     else:
         creds = Path(st.get("credentials_file") or d / "tunnel.json")
         if not creds.is_file():
-            rep.add("FAIL", T("터널 자격 파일", "tunnel credentials file"), T(f"{creds} 없음", f"{creds} is missing"), T("tempboard site init --hostname " + st["hostname"] + " 을 다시", "Run tempboard site init --hostname " + st["hostname"] + " again"))
+            rep.add("FAIL", T("터널 자격 파일", "tunnel credentials file"), T(f"{creds} 없음", f"{creds} is missing"), T("cera site init --hostname " + st["hostname"] + " 을 다시", "Run cera site init --hostname " + st["hostname"] + " again"))
         elif not mode_ok(creds):
             rep.add("FAIL", T("터널 자격 파일", "tunnel credentials file"), T(f"{creds} 을 남도 읽을 수 있다", f"{creds} is readable by other users"), f"chmod 600 {creds}")
         else:
@@ -1153,7 +1218,7 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
             rep.add("WARN", T("Cloudflare 로그인", "Cloudflare login"), T(f"{cert} 없음 — 실행은 되지만 터널 · DNS 를 바꾸려면 필요하다", f"{cert} is missing - it runs without it, but it is needed to change the tunnel or DNS"),
                     "cloudflared tunnel login")
         else:
-            rep.add("FAIL", T("Cloudflare 로그인", "Cloudflare login"), T(f"{cert} 없음", f"{cert} is missing"), T("cloudflared tunnel login  (tempboard site guide 의 2)", "cloudflared tunnel login  (step 2 of tempboard site guide)"))
+            rep.add("FAIL", T("Cloudflare 로그인", "Cloudflare login"), T(f"{cert} 없음", f"{cert} is missing"), T("cloudflared tunnel login  (cera site guide 의 2)", "cloudflared tunnel login  (step 2 of cera site guide)"))
 
     # 3. ingress
     cfg = d / "cloudflared.yml"
@@ -1161,7 +1226,7 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
         rep.add("WARN", T("경로 설정", "routing config"), T("원격 관리 — 대시보드가 정한다(이 컴퓨터에서 검사할 수 없다)", "remotely managed - the dashboard decides (cannot be checked from this computer)"),
                 T(f"Public Hostname: {st['hostname']} → http://127.0.0.1:{st['port']} 인지 대시보드에서 확인", f"Check in the dashboard that the Public Hostname is {st['hostname']} -> http://127.0.0.1:{st['port']}"))
     elif not cfg.is_file():
-        rep.add("FAIL", T("경로 설정", "routing config"), T(f"{cfg} 없음", f"{cfg} is missing"), T("tempboard site init 을 다시", "Run tempboard site init again"))
+        rep.add("FAIL", T("경로 설정", "routing config"), T(f"{cfg} 없음", f"{cfg} is missing"), T("cera site init 을 다시", "Run cera site init again"))
     elif cf:
         try:
             _cf([cf, "tunnel", "--config", str(cfg), "ingress", "validate"], "ingress validate", timeout=30)
@@ -1169,10 +1234,10 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
             if "#0" in rule:
                 rep.add("OK", T("경로 설정", "routing config"), T(f"ingress validate 통과 · https://{st['hostname']}/ → 규칙 #0", f"ingress validate passed - https://{st['hostname']}/ -> rule #0"))
             else:
-                rep.add("FAIL", T("경로 설정", "routing config"), T(f"https://{st['hostname']}/ 이 첫 규칙에 맞지 않는다", f"https://{st['hostname']}/ does not match the first rule"), T("tempboard site init 을 다시", "Run tempboard site init again"))
+                rep.add("FAIL", T("경로 설정", "routing config"), T(f"https://{st['hostname']}/ 이 첫 규칙에 맞지 않는다", f"https://{st['hostname']}/ does not match the first rule"), T("cera site init 을 다시", "Run cera site init again"))
         except StepError as e:
             rep.add("FAIL", T("경로 설정", "routing config"), T("cloudflared 가 설정 파일을 받아들이지 않는다", "cloudflared does not accept the config file"),
-                    T(f"tempboard site init 을 다시(파일: {cfg}) · 까닭 원문: tempboard site doctor --verbose", f"Run tempboard site init again (file: {cfg}) - raw reason: tempboard site doctor --verbose"), raw=str(e))
+                    T(f"cera site init 을 다시(파일: {cfg}) · 까닭 원문: cera site doctor --verbose", f"Run cera site init again (file: {cfg}) - raw reason: cera site doctor --verbose"), raw=str(e))
 
     # 4. tunnel connection (requires login and network)
     if not offline and cf and not st.get("token_file") and cert.is_file() and st.get("tunnel_name"):
@@ -1183,7 +1248,7 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
             if n:
                 rep.add("OK", T("터널 연결", "tunnel connection"), T(f"연결기 {len(conns)}개 · 연결 {n}개", f"{len(conns)} connector(s) - {n} connection(s)"))
             else:
-                rep.add("WARN", T("터널 연결", "tunnel connection"), T("연결이 없다", "no connections"), T("tempboard site run 또는 site install --load", "Run tempboard site run or site install --load"))
+                rep.add("WARN", T("터널 연결", "tunnel connection"), T("연결이 없다", "no connections"), T("cera site run 또는 site install --load", "Run cera site run or site install --load"))
         except (StepError, ValueError, AttributeError, TypeError) as e:
             rep.add("WARN", T("터널 연결", "tunnel connection"), T("확인하지 못했다 — 로그인(cert.pem) · 네트워크를 확인", "could not check - check the login (cert.pem) and the network"),
                     T("cloudflared tunnel info " + st["tunnel_name"] + "  로 직접 볼 수 있다", "You can look yourself with cloudflared tunnel info " + st["tunnel_name"]), raw=str(e))
@@ -1199,16 +1264,16 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
         alt = free_port(port + 1)
         rep.add("FAIL", T("이 컴퓨터의 서버", "server on this computer"), T(f"포트 {port}: 다른 프로그램이 쓰는 중" + (f"(응답 {code})" if code else ""), f"port {port}: another program is using it" + (f" (response {code})" if code else "")),
                 T(f"{port_fix_cmd(sid, alt)}   ← 이 사이트의 포트를 바꾼다(→ {alt})\n"
-                f"그 뒤 tempboard site run{_idflag(sid)}  · 어떤 프로그램인지: lsof -nP -iTCP:{port} -sTCP:LISTEN", f"{port_fix_cmd(sid, alt)}   <- changes this site's port (-> {alt})\n"
-                f"Then tempboard site run{_idflag(sid)}  - which program it is: lsof -nP -iTCP:{port} -sTCP:LISTEN"), raw=pr["raw"])
+                f"그 뒤 cera site run{_idflag(sid)}  · 어떤 프로그램인지: lsof -nP -iTCP:{port} -sTCP:LISTEN", f"{port_fix_cmd(sid, alt)}   <- changes this site's port (-> {alt})\n"
+                f"Then cera site run{_idflag(sid)}  - which program it is: lsof -nP -iTCP:{port} -sTCP:LISTEN"), raw=pr["raw"])
     elif not ours:
         rep.add("FAIL", T("이 컴퓨터의 서버", "server on this computer"), T("꺼져 있다", "not running"),
-                T(f"tempboard site run{_idflag(sid)}(시험) 또는 tempboard site install --load · 로그: {d / 'log.txt'}", f"tempboard site run{_idflag(sid)} (to try it) or tempboard site install --load - log: {d / 'log.txt'}"), raw=pr["raw"])
+                T(f"cera site run{_idflag(sid)}(시험) 또는 cera site install --load · 로그: {d / 'log.txt'}", f"cera site run{_idflag(sid)} (to try it) or cera site install --load - log: {d / 'log.txt'}"), raw=pr["raw"])
     elif not healthy:
         rep.add("FAIL", T("이 컴퓨터의 서버", "server on this computer"), T(f"site run(pid {st.get('pid')})은 도는데 포트 {port} 가 제대로 답하지 않는다"
                 + (f"(응답 {code})" if code else f"({pr['words']})"), f"site run (pid {st.get('pid')}) is running but port {port} is not answering properly"
                 + (f" (response {code})" if code else f" ({pr['words']})")),
-                T(f"로그를 보세요: {d / 'log.txt'} · 다시 켜기: tempboard stop {sid} 뒤 site run", f"See the log: {d / 'log.txt'} - to restart: tempboard stop {sid}, then site run"), raw=pr["raw"])
+                T(f"로그를 보세요: {d / 'log.txt'} · 다시 켜기: cera stop {sid} 뒤 site run", f"See the log: {d / 'log.txt'} - to restart: cera stop {sid}, then site run"), raw=pr["raw"])
     else:
         rep.add("OK", T("이 컴퓨터의 서버", "server on this computer"), T(f"127.0.0.1:{port} 응답", f"127.0.0.1:{port} answers"))
         code2, _ = http_probe(f"http://127.0.0.1:{port}/healthz", timeout=3, host=st["hostname"])
@@ -1217,7 +1282,7 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
             rep.add("OK", T("공개 Host 규칙", "public Host rule"), T(f"Host: {st['hostname']} → {code2}" + (" (JWT 없으면 막힘 — 정상)" if want == 401 else ""), f"Host: {st['hostname']} -> {code2}" + (" (blocked without a JWT - normal)" if want == 401 else "")))
         else:
             rep.add("FAIL", T("공개 Host 규칙", "public Host rule"), T(f"Host: {st['hostname']} → {code2}(기대 {want}) — 도는 서버가 옛 설정이다", f"Host: {st['hostname']} -> {code2} (expected {want}) - the running server has old settings"),
-                    T("다시 켜세요(전경: Ctrl+C 뒤 site run · 서비스: tempboard site install --load)", "Restart it (foreground: Ctrl+C, then site run - service: tempboard site install --load)"))
+                    T("다시 켜세요(전경: Ctrl+C 뒤 site run · 서비스: cera site install --load)", "Restart it (foreground: Ctrl+C, then site run - service: cera site install --load)"))
 
     # 5b. a tunnel that keeps dying
     n = tunnel_restarts(st, d / "log.txt")
@@ -1271,9 +1336,12 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
     # 8. always-on
     plat = platform_name()
     if plat:
-        sp = service_path(sid, plat)
+        sp, legacy = installed_service(sid, plat)
+        if legacy:
+            rep.add("WARN", T("늘 켜 두기", "always-on service"), T(f"옛 이름(tempboard)의 서비스 {sp.name} 가 깔려 있다", f"the old-named (tempboard) service {sp.name} is in place"),
+                    T("cera site install --load 로 새 이름으로 바꾼다(옛 서비스는 지운다)", "Run cera site install --load to switch to the new name (the old service is removed)"))
         if not sp.exists():
-            rep.add("WARN", T("늘 켜 두기", "always-on service"), T("설치 안 됨", "not installed"), "tempboard site install --load")
+            rep.add("WARN", T("늘 켜 두기", "always-on service"), T("설치 안 됨", "not installed"), "cera site install --load")
         else:
             missing = []
             if plat == "macos":
@@ -1283,14 +1351,14 @@ def run_doctor(ctx, sid, offline=False, out=None, verbose=False) -> Report:
                     args = []
                 missing = [x for x in args[:2] if not Path(x).exists()] if args else [T("(ProgramArguments 를 읽지 못함)", "(could not read ProgramArguments)")]
             if missing:
-                rep.add("FAIL", T("늘 켜 두기", "always-on service"), T(f"서비스가 가리키는 파일이 없다: {', '.join(missing)}(파이썬 · tempboard 가 옮겨졌다)", f"the file(s) the service points to are missing: {', '.join(missing)} (Python or tempboard was moved)"),
-                        T("tempboard site install --load 를 다시", "Run tempboard site install --load again"))
+                rep.add("FAIL", T("늘 켜 두기", "always-on service"), T(f"서비스가 가리키는 파일이 없다: {', '.join(missing)}(파이썬 · Cera 가 옮겨졌다)", f"the file(s) the service points to are missing: {', '.join(missing)} (Python or Cera was moved)"),
+                        T("cera site install --load 를 다시", "Run cera site install --load again"))
             else:
-                loaded = service_loaded(sid, plat)
+                loaded = service_loaded(sid, plat, legacy)
                 if loaded:
                     rep.add("OK", T("늘 켜 두기", "always-on service"), T(f"{sp.name} · 올라감", f"{sp.name} - loaded"))
                 else:
-                    rep.add("WARN", T("늘 켜 두기", "always-on service"), T(f"{sp.name} · 올라가 있지 않다", f"{sp.name} - not loaded"), "tempboard site install --load")
+                    rep.add("WARN", T("늘 켜 두기", "always-on service"), T(f"{sp.name} · 올라가 있지 않다", f"{sp.name} - not loaded"), "cera site install --load")
             if plat == "linux":
                 try:
                     lin = subprocess.run(["loginctl", "show-user", os.environ.get("USER", ""), "--property=Linger"],
@@ -1331,7 +1399,7 @@ def cmd_guide(ctx, a):
 
 # ------------------------------------------------------------------ CLI wiring
 def add_parser(sub, ctx):
-    """Argument definitions for `tempboard site ...` (when wiring directly into bin, calling just this one is enough)."""
+    """Argument definitions for `cera site ...` (when wiring directly into bin, calling just this one is enough)."""
     s = sub.add_parser("site", help=T("개인 보드 웹 — 자기 도메인 · 이름 있는 터널 · (선택) Cloudflare Access · 늘 켜 두기", "personal board on your own domain - named tunnel - (optional) Cloudflare Access - always-on service"),
                        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ss = s.add_subparsers(dest="site_cmd", required=True)
@@ -1344,7 +1412,7 @@ def add_parser(sub, ctx):
     p.add_argument("--hostname", required=True, help=T("공개 주소(예: board.example.com) — 그 도메인이 Cloudflare 에 있어야 한다", "public address (e.g. board.example.com) - the domain must be on Cloudflare"))
     p.add_argument("--port", type=int, default=None,
                    help=T(f"이 컴퓨터의 포트(기본 {DEFAULT_PORT} — 다른 프로그램이 쓰고 있으면 빈 포트를 골라 알린다)", f"port on this computer (default {DEFAULT_PORT} - if another program uses it, a free port is picked and reported)"))
-    p.add_argument("--tunnel-name", default=None, help=T("터널 이름(기본 tempboard-<hostname 의 점을 - 로>)", "tunnel name (default tempboard-<hostname with dots replaced by ->)"))
+    p.add_argument("--tunnel-name", default=None, help=T("터널 이름(기본 cera-<hostname 의 점을 - 로>)", "tunnel name (default cera-<hostname with dots replaced by ->)"))
     p.add_argument("--reuse-tunnel", action="store_true",
                    help=T("같은 이름의 터널이 계정에 이미 있으면 이어받는다(다른 컴퓨터에서 옮길 때만 — 두 곳에서 같이 돌리면 요청이 갈린다)", "take over a tunnel with the same name if it already exists in the account (only when moving from another computer - running it in two places splits requests)"))
     p.add_argument("--token-file", default=None, help=T("원격 관리 터널 토큰 파일(0600) — 주면 create · route 를 건너뛴다", "remotely managed tunnel token file (0600) - if given, create and route are skipped"))
@@ -1390,5 +1458,5 @@ def add_parser(sub, ctx):
 
 
 def register(sub, ctx):
-    """Called by the extension slot (EXT_MODULES) in bin/tempboard."""
+    """Called by the extension slot (EXT_MODULES) in bin/cera."""
     add_parser(sub, ctx)

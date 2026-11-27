@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import importlib.util
 import json

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""tempboard security floor (standard library only) — Host allowlist, Origin check, auth-chain types.
+"""Cera security floor (standard library only) — Host allowlist, Origin check, auth-chain types.
 
 Host allowlist: blocks DNS rebinding. Even if an attacker's domain re-resolves to 127.0.0.1, the request's Host is
 still the attacker's domain, which is not in the list -> 421. Each entry is HostRule(host[:port], public). Only requests
@@ -24,8 +24,8 @@ from typing import Iterable, List, Optional
 
 
 def T(ko, en):
-    """Korean or English text (server/i18n.py: TEMPBOARD_LANG > `tempboard lang` > locale > English)."""
-    key = "tempboard_i18n"
+    """Korean or English text (server/i18n.py: CERA_LANG > `cera lang` > locale > English)."""
+    key = "cera_i18n"
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().parent / "i18n.py")
         mod = importlib.util.module_from_spec(spec)

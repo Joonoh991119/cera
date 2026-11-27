@@ -28,5 +28,5 @@ jobs:
       - run: ${{ matrix.py }} tests/test_server.py
       - run: ${{ matrix.py }} -m unittest discover -s tests -q
       - run: npm test
-        env: { TEMPBOARD_TEST_PYTHON: "${{ matrix.py }}" }
+        env: { CERA_TEST_PYTHON: "${{ matrix.py }}" }
         working-directory: web

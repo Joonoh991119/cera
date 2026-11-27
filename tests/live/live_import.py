@@ -1,13 +1,13 @@
 """Live test (Playwright) of import: drop interception, the sheet, merging, new board, image drop, dragging from the library, the phone menu, and view-only.
 
 usage: TMPDIR=<scratchpad>/tmp python3 tests/live/live_import.py --shots <dir> [--dist <web/dist>]
-Opens a site with no tunnel in a temporary TEMPBOARD_HOME and closes it when done (~/.tempboard is never touched). The name live_* keeps it out of discover.
+Opens a site with no tunnel in a temporary CERA_HOME and closes it when done (~/.cera is never touched). The name live_* keeps it out of discover.
 Covers: the drop bug, new board, image drop, library, phone, Esc/Delete, and the menu at 1024 and 1280."""
 from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import argparse
 import base64
@@ -25,7 +25,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 HERE = Path(__file__).resolve().parents[2]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da63f8cfc0f01f0005000201a5b6d8b10000000049454e44ae426082")
 
 ap = argparse.ArgumentParser()
@@ -39,9 +39,9 @@ shots.mkdir(parents=True, exist_ok=True)
 def doc():
     sys.path.insert(0, str(HERE / "server"))
     import importlib.util
-    spec = importlib.util.spec_from_file_location("tempboard_agentkit", HERE / "server" / "agentkit.py")
+    spec = importlib.util.spec_from_file_location("cera_agentkit", HERE / "server" / "agentkit.py")
     ak = importlib.util.module_from_spec(spec)
-    sys.modules["tempboard_agentkit"] = ak
+    sys.modules["cera_agentkit"] = ak
     spec.loader.exec_module(ak)
     a_ = ak.make_box("rectangle", "가져온 A", 0, 0, id="dropA")
     b_ = ak.make_box("ellipse", "가져온 B", 300, 0, id="dropB")
@@ -62,7 +62,7 @@ LIB = json.dumps({"type": "excalidrawlib", "version": 2, "source": "test", "libr
          "boundElements": None, "updated": 1, "link": None, "locked": False}]}]})
 
 tmp = Path(tempfile.mkdtemp(prefix="tbimp.", dir=os.environ.get("TMPDIR")))
-env = {**os.environ, "TEMPBOARD_HOME": str(tmp / "home"), "TEMPBOARD_DIST": a.dist}
+env = {**os.environ, "CERA_HOME": str(tmp / "home"), "CERA_DIST": a.dist}
 out = subprocess.run([sys.executable, str(CLI), "start", "--tunnel", "none", "--json", "--title", "가져오기 시험", "--view-link"],
                      env=env, capture_output=True, text=True, check=True)
 site = json.loads(out.stdout)
@@ -440,7 +440,7 @@ try:
             b.close()
         report["errors"] += errs
 
-        # -- changing the key shows 'may have changed or ended' on the open page, plus the tempboard links guidance
+        # -- changing the key shows 'may have changed or ended' on the open page, plus the cera links guidance
         br2 = p.chromium.launch()
         R = join(br2.new_context(viewport={"width": 1280, "height": 800}), "회전")
         subprocess.run([sys.executable, str(CLI), "keys", site["id"], "--rotate", "all"], env=env, capture_output=True, check=True)
@@ -450,7 +450,7 @@ try:
             except Exception:   # noqa: BLE001 -- if rejected, the page reloads (the context vanishes meanwhile)
                 return ""
         okr = until(lambda: "바뀌었거나 끝났을 수" in body_text(), 10)
-        C["U8_rotation_wording"] = okr is not None and "tempboard links" in body_text()
+        C["U8_rotation_wording"] = okr is not None and "cera links" in body_text()
         R.screenshot(path=str(shots / "r2-U8-denied.png"))
         br2.close()
 finally:

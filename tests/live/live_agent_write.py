@@ -5,14 +5,14 @@ The name (live_*.py) keeps it out of unittest discover. It needs Playwright (Pyt
     python3 tests/live/live_agent_write.py                    # Chromium, checks 3-5
     python3 tests/live/live_agent_write.py --browser webkit --only-live   # WebKit, check 3
     python3 tests/live/live_agent_write.py --url 'http://127.0.0.1:P/?k=KEY#b=BOARD'   # against an already open board
-Without --url, it opens a board with no tunnel in a temporary TEMPBOARD_HOME (--home, default: a new folder under $TMPDIR) and closes it when done.
-~/.tempboard is never touched. The result goes to stdout as one JSON document; the exit code is 1 if anything failed.
+Without --url, it opens a board with no tunnel in a temporary CERA_HOME (--home, default: a new folder under $TMPDIR) and closes it when done.
+~/.cera is never touched. The result goes to stdout as one JSON document; the exit code is 1 if anything failed.
 """
 from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import argparse
 import importlib.util
@@ -66,8 +66,8 @@ class Board:
 
 
 def open_site(home: Path):
-    env = dict(os.environ, TEMPBOARD_HOME=str(home), TEMPBOARD_DIST=str(ROOT / "web" / "dist"))
-    out = subprocess.run([sys.executable, str(ROOT / "bin" / "tempboard"), "start", "--tunnel", "none", "--ttl", "1h",
+    env = dict(os.environ, CERA_HOME=str(home), CERA_DIST=str(ROOT / "web" / "dist"))
+    out = subprocess.run([sys.executable, str(ROOT / "bin" / "cera"), "start", "--tunnel", "none", "--ttl", "1h",
                           "--title", "에이전트 쓰기 시험", "--json"], env=env, capture_output=True, text=True, timeout=60)
     if out.returncode != 0:
         raise SystemExit("보드를 못 열었다: " + out.stderr[-800:])
@@ -77,7 +77,7 @@ def open_site(home: Path):
 
 
 def close_site(sid, env):
-    subprocess.run([sys.executable, str(ROOT / "bin" / "tempboard"), "stop", sid], env=env, capture_output=True, timeout=60)
+    subprocess.run([sys.executable, str(ROOT / "bin" / "cera"), "stop", sid], env=env, capture_output=True, timeout=60)
 
 
 JS_SCENE = """() => window.__wbapi.getSceneElements().map(e => ({id: e.id, type: e.type, x: e.x, y: e.y, w: e.width,

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Operational fixes that the personal-site review handed off to the bin side.
 
-- `tempboard links/list/keys` show the key-free public address on an Access-mode personal site (bin does it directly, without personal's wrapper).
-- `tempboard stop` does not spend 5 seconds waiting for a child that was never reaped (a zombie); it reads stopped from state.
-- Personal-site `delete`: refused if the always-on service is installed; when deleting, the tunnel credentials are moved to $TEMPBOARD_HOME/kept/.
-- A `site run` started as a service (TEMPBOARD_SERVICE=1) waits and takes over if another supervisor is running, instead of exiting 1 and being relaunched in a loop;
-  exits 0 if it was shut down by `tempboard stop`.
-HOME and TEMPBOARD_HOME are temporary folders. No server or tunnel is started (only state files and fake processes)."""
+- `cera links/list/keys` show the key-free public address on an Access-mode personal site (bin does it directly, without personal's wrapper).
+- `cera stop` does not spend 5 seconds waiting for a child that was never reaped (a zombie); it reads stopped from state.
+- Personal-site `delete`: refused if the always-on service is installed; when deleting, the tunnel credentials are moved to $CERA_HOME/kept/.
+- A `site run` started as a service (CERA_SERVICE=1) waits and takes over if another supervisor is running, instead of exiting 1 and being relaunched in a loop;
+  exits 0 if it was shut down by `cera stop`.
+HOME and CERA_HOME are temporary folders. No server or tunnel is started (only state files and fake processes)."""
 from __future__ import annotations
 
 import json
@@ -19,10 +19,10 @@ import time
 import unittest
 from pathlib import Path
 
-os.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before anything spawns the CLI or imports server code
+os.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before anything spawns the CLI or imports server code
 
 HERE = Path(__file__).resolve().parents[1]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 HOST = "board.example.com"
 
 # On SIGTERM it writes state as stopped and exits, like a supervisor. Its parent (the test) does not reap it, so it stays a zombie.
@@ -47,8 +47,8 @@ class Base(unittest.TestCase):
         self.home = self.t / "home"
         self.home.mkdir()
         self.tbh = self.t / "tb"
-        env = {k: v for k, v in os.environ.items() if k not in ("TEMPBOARD_DIST", "TEMPBOARD_SERVICE")}
-        self.env = {**env, "HOME": str(self.home), "TEMPBOARD_HOME": str(self.tbh)}
+        env = {k: v for k, v in os.environ.items() if k not in ("CERA_DIST", "CERA_SERVICE")}
+        self.env = {**env, "HOME": str(self.home), "CERA_HOME": str(self.tbh)}
         self.procs = []
 
     def tearDown(self):
@@ -73,7 +73,7 @@ class Base(unittest.TestCase):
         st = {"id": sid, "title": "", "board": "b1", "status": "stopped", "created_at": time.time(), "expires_at": 0,
               "edit_key": "EDITKEY", "view_key": None, "tunnel": "named", "host": "127.0.0.1", "port": 8790, "pid": None,
               "public_url": f"https://{HOST}", "local_url": "http://127.0.0.1:8790", "mode": "personal", "hostname": HOST,
-              "tunnel_name": "tempboard-board-example-com", "access": None}
+              "tunnel_name": "cera-board-example-com", "access": None}
         st.update(kw)
         (d / "state.json").write_text(json.dumps(st))
         os.chmod(d / "state.json", 0o600)
@@ -116,11 +116,11 @@ class AccessLinks(Base):
                           {"id": "a2", "name": "D", "sha256": "y", "role": "edit", "expires_at": time.time() - 5}])
         out = self.tb("keys", "t3", "--rotate", "all").stdout
         self.assertIn("에이전트 토큰(지금 1개)은 그대로다", out)
-        self.assertIn("tempboard agent revoke t3 --all", out)
+        self.assertIn("cera agent revoke t3 --all", out)
         j = json.loads(self.tb("keys", "t3", "--rotate", "edit", "--json").stdout)   # --json prints exactly one JSON document
         self.assertIn("links", j)
         self.assertEqual(j["agent_tokens_kept"], 1)
-        self.assertEqual(j["revoke_agents"], "tempboard agent revoke t3 --all")
+        self.assertEqual(j["revoke_agents"], "cera agent revoke t3 --all")
 
     def test_without_access_keeps_invite_links(self):
         self.site(status="running", pid=os.getpid())
@@ -156,7 +156,7 @@ class Delete(Base):
         os.chmod(d / "tunnel.json", 0o600)
         (d / "members.json").write_text('{"edit": ["*"]}')
         svc = self.home / "svc.plist"
-        svc.write_text("com.tempboard.personal")
+        svc.write_text("com.cera.personal")
         st = self.state()
         st["service"] = {"platform": "macos", "path": str(svc)}
         (d / "state.json").write_text(json.dumps(st))
@@ -172,7 +172,7 @@ class Delete(Base):
         self.assertEqual(sorted(x.name for x in kept[0].iterdir()), ["members.json", "tunnel.json"])
         self.assertEqual(kept[0].stat().st_mode & 0o777, 0o700)
         self.assertEqual((kept[0] / "tunnel.json").stat().st_mode & 0o777, 0o600)
-        self.assertIn("cloudflared tunnel delete tempboard-board-example-com", p.stdout)
+        self.assertIn("cloudflared tunnel delete cera-board-example-com", p.stdout)
         self.assertNotIn("TunnelSecret", p.stdout + p.stderr)
 
     def test_temp_site_delete_unchanged(self):
@@ -190,24 +190,24 @@ class ServiceWait(Base):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("이미 돌고 있다", p.stderr)
         # one started as a service waits
-        env = {**self.env, "TEMPBOARD_SERVICE": "1"}
+        env = {**self.env, "CERA_SERVICE": "1"}
         svc = subprocess.Popen([sys.executable, str(CLI), "site", "run"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.procs.append(svc)
         self.assertIn("이어받는다", svc.stdout.readline())
         time.sleep(2.5)
         self.assertIsNone(svc.poll(), "다른 감독이 도는 동안 끝나지 않는다(다시 뜨는 고리 없음)")
-        # tempboard stop personal -> shuts down the other supervisor, and the service side ends with exit 0 (launchd does not relaunch it)
+        # cera stop personal -> shuts down the other supervisor, and the service side ends with exit 0 (launchd does not relaunch it)
         self.tb("stop", "personal")
         other.wait(5)
         self.assertEqual(svc.wait(10), 0, svc.stderr.read())
 
     def test_stop_during_startup_is_honoured(self):
-        """If a `tempboard stop` arrived during the web-files phase (stop_requested_at is after the start), no supervisor is started and it exits 0."""
+        """If a `cera stop` arrived during the web-files phase (stop_requested_at is after the start), no supervisor is started and it exits 0."""
         dist = self.t / "dist"
         dist.mkdir()
         (dist / "index.html").write_text("<!doctype html>")
         self.site(stop_requested_at=time.time() + 3600)
-        env = {**self.env, "TEMPBOARD_SERVICE": "1", "TEMPBOARD_DIST": str(dist)}
+        env = {**self.env, "CERA_SERVICE": "1", "CERA_DIST": str(dist)}
         p = self.tb("site", "run", env=env, timeout=30)
         self.assertIn("띄우지 않는다", p.stdout)
         self.assertEqual(self.state()["status"], "stopped")
@@ -216,8 +216,8 @@ class ServiceWait(Base):
         other = self.sleeper()
         self.site(status="running", pid=other.pid)
         # make it stop at the web-files phase after taking over (no downloading from outside, no npm)
-        env = {**self.env, "TEMPBOARD_SERVICE": "1", "TEMPBOARD_DIST": str(self.t / "nodist"),
-               "TEMPBOARD_RELEASE_URL": "http://127.0.0.1:9/", "PATH": "/usr/bin:/bin"}
+        env = {**self.env, "CERA_SERVICE": "1", "CERA_DIST": str(self.t / "nodist"),
+               "CERA_RELEASE_URL": "http://127.0.0.1:9/", "PATH": "/usr/bin:/bin"}
         svc = subprocess.Popen([sys.executable, str(CLI), "site", "run"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.procs.append(svc)
         self.assertIn("이어받는다", svc.stdout.readline())

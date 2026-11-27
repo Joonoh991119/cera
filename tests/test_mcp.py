@@ -1,15 +1,15 @@
-"""Tests for the stdio MCP server (`bin/tempboard mcp`).
+"""Tests for the stdio MCP server (`bin/cera mcp`).
 
 Basic flow: initialize -> notifications/initialized -> tools/list (12 tools, including board_import, and the naming rules) -> site_open{tunnel:none} -> board_add (2 boxes + an arrow)
         -> the board_read summary shows "A" -> "B". Every stdout line is JSON-RPC. Unknown tool gives -32602, unknown method -32601. Runs on /usr/bin/python3.
 Also covers the server side of conflict handling, board_wait, deletion, remote mode, and token cleanup (revoked at exit). The human-facing page (Chromium, WebKit) is in tests/live/live_mcp_ai.py.
 
-Everything uses a temporary TEMPBOARD_HOME (~/.tempboard is never touched) and no tunnel."""
+Everything uses a temporary CERA_HOME (~/.cera is never touched) and no tunnel."""
 from __future__ import annotations
 
 import os as _os_lang
 
-_os_lang.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
+_os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
 import http.client
 import json
@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 PY39 = Path("/usr/bin/python3")
 
 
@@ -113,8 +113,8 @@ class Base(unittest.TestCase):
         dist.mkdir()
         (dist / "index.html").write_text("<!doctype html><title>tb</title>")
         self.home = t / "home"
-        self.env = {**os.environ, "TEMPBOARD_HOME": str(self.home), "TEMPBOARD_DIST": str(dist)}
-        for k in ("TEMPBOARD_URL", "TEMPBOARD_TOKEN", "TEMPBOARD_AGENT_NAME"):
+        self.env = {**os.environ, "CERA_HOME": str(self.home), "CERA_DIST": str(dist)}
+        for k in ("CERA_URL", "CERA_TOKEN", "CERA_AGENT_NAME"):
             self.env.pop(k, None)
         self.mcps = []
 
@@ -144,7 +144,7 @@ class Handshake(Base):
         r = m.init()
         res = r["result"]
         self.assertEqual(res["protocolVersion"], "2025-06-18")
-        self.assertEqual(res["serverInfo"]["name"], "tempboard")
+        self.assertEqual(res["serverInfo"]["name"], "cera")
         self.assertIn("사용자에게", res["instructions"])
         self.assertEqual(res["capabilities"], {"tools": {"listChanged": False}})
         tools = m.call("tools/list")["result"]["tools"]
@@ -207,20 +207,20 @@ class Handshake(Base):
     def test_system_python_39(self):
         m = self.mcp(py=str(PY39))
         r = m.init("codex-mcp-client")
-        self.assertEqual(r["result"]["serverInfo"]["name"], "tempboard")
+        self.assertEqual(r["result"]["serverInfo"]["name"], "cera")
         self.assertEqual(len(m.call("tools/list")["result"]["tools"]), 12)
         self.assertTrue(m.tool("site_list")["isError"] is False)
 
     def test_agent_names(self):
         sys.path.insert(0, str(HERE / "server"))
         import importlib.util
-        spec = importlib.util.spec_from_file_location("tempboard_tb_mcp", HERE / "server" / "tb_mcp.py")
-        mod = sys.modules.get("tempboard_tb_mcp")
+        spec = importlib.util.spec_from_file_location("cera_tb_mcp", HERE / "server" / "tb_mcp.py")
+        mod = sys.modules.get("cera_tb_mcp")
         if mod is None:
             mod = importlib.util.module_from_spec(spec)
-            sys.modules["tempboard_tb_mcp"] = mod
+            sys.modules["cera_tb_mcp"] = mod
             spec.loader.exec_module(mod)
-        old = os.environ.pop("TEMPBOARD_AGENT_NAME", None)
+        old = os.environ.pop("CERA_AGENT_NAME", None)
         try:
             self.assertEqual(mod.agent_name_for("claude-code"), "Claude")
             self.assertEqual(mod.agent_name_for("codex-mcp-client"), "Codex")
@@ -228,12 +228,12 @@ class Handshake(Base):
             self.assertEqual(mod.agent_name_for("agy"), "Antigravity")
             self.assertEqual(mod.agent_name_for("my-tool"), "my-tool")
             self.assertEqual(mod.agent_name_for(None), "Agent")
-            os.environ["TEMPBOARD_AGENT_NAME"] = "Robo"
+            os.environ["CERA_AGENT_NAME"] = "Robo"
             self.assertEqual(mod.agent_name_for("claude-code"), "Robo")
         finally:
-            os.environ.pop("TEMPBOARD_AGENT_NAME", None)
+            os.environ.pop("CERA_AGENT_NAME", None)
             if old is not None:
-                os.environ["TEMPBOARD_AGENT_NAME"] = old
+                os.environ["CERA_AGENT_NAME"] = old
 
 
 class Flows(Base):
@@ -559,11 +559,11 @@ def _strings(o):
 
 
 class English(Base):
-    """TEMPBOARD_LANG=en: everything the server tells the model is English (board data the test wrote is excepted)."""
+    """CERA_LANG=en: everything the server tells the model is English (board data the test wrote is excepted)."""
 
     def setUp(self):
         super().setUp()
-        self.env["TEMPBOARD_LANG"] = "en"
+        self.env["CERA_LANG"] = "en"
 
     def test_handshake_tools_and_board_read_have_no_korean(self):
         m = self.mcp()
@@ -613,26 +613,26 @@ class English(Base):
 
 class AgentAddUrl(Base):
     def test_agent_add_prints_url_and_token_that_work(self):
-        """The two lines TEMPBOARD_URL and TEMPBOARD_TOKEN from the `agent add` output, put in as-is, start a remote MCP on which board_add works."""
+        """The two lines CERA_URL and CERA_TOKEN from the `agent add` output, put in as-is, start a remote MCP on which board_add works."""
         p = subprocess.run([sys.executable, str(CLI), "start", "--tunnel", "none", "--title", "u9", "--json"], env=self.env,
                            capture_output=True, text=True, timeout=60)
         sid = json.loads(p.stdout)["id"]
         out = subprocess.run([sys.executable, str(CLI), "agent", "add", sid, "--name", "Remote"], env=self.env, capture_output=True,
                              text=True).stdout
-        kv = dict(re.findall(r"^\s*(TEMPBOARD_URL|TEMPBOARD_TOKEN)=(\S+)$", out, re.M))
-        self.assertEqual(kv["TEMPBOARD_URL"], self.state(sid)["local_url"])
-        self.assertTrue(kv["TEMPBOARD_TOKEN"].startswith("tb_ag_"))
+        kv = dict(re.findall(r"^\s*(CERA_URL|CERA_TOKEN)=(\S+)$", out, re.M))
+        self.assertEqual(kv["CERA_URL"], self.state(sid)["local_url"])
+        self.assertTrue(kv["CERA_TOKEN"].startswith("tb_ag_"))
         self.assertIn("이 컴퓨터에서만", out)
         j = json.loads(subprocess.run([sys.executable, str(CLI), "agent", "add", sid, "--name", "J", "--json"], env=self.env,
                                       capture_output=True, text=True).stdout)
         self.assertEqual(j["url"], self.state(sid)["local_url"])
         time.sleep(1.2)
-        m = self.mcp({**self.env, "TEMPBOARD_HOME": str(Path(self.tmp.name) / "elsewhere"), **kv})
+        m = self.mcp({**self.env, "CERA_HOME": str(Path(self.tmp.name) / "elsewhere"), **kv})
         m.init()
         self.assertEqual(len(m.ok("board_add", {"items": [{"kind": "box", "label": "U9"}]})["structuredContent"]["ids"]), 2)
 
     def test_url_for_modes(self):
-        ag = sys.modules.get("tempboard_agents") or _tb_mcp().agents
+        ag = sys.modules.get("cera_agents") or _tb_mcp().agents
         self.assertEqual(ag.url_for({"local_url": "http://127.0.0.1:1", "public_url": "https://x.trycloudflare.com"})[0],
                          "https://x.trycloudflare.com")
         u, note = ag.url_for({"local_url": "http://127.0.0.1:1", "public_url": "https://board.example.com", "mode": "personal"})
@@ -642,7 +642,7 @@ class AgentAddUrl(Base):
 
 class Remote(Base):
     def test_remote_mode_hides_site_tools(self):
-        """An MCP started in a different TEMPBOARD_HOME with TEMPBOARD_URL + TEMPBOARD_TOKEN: no site_* tools, and board_add works."""
+        """An MCP started in a different CERA_HOME with CERA_URL + CERA_TOKEN: no site_* tools, and board_add works."""
         p = subprocess.run([sys.executable, str(CLI), "start", "--tunnel", "none", "--title", "원격", "--json"], env=self.env,
                            capture_output=True, text=True, timeout=60)
         sid = json.loads(p.stdout)["id"]
@@ -650,7 +650,7 @@ class Remote(Base):
                                         capture_output=True, text=True).stdout)["token"]
         st = self.state(sid)
         other = Path(self.tmp.name) / "other-home"
-        env = {**self.env, "TEMPBOARD_HOME": str(other), "TEMPBOARD_URL": st["local_url"], "TEMPBOARD_TOKEN": tok}
+        env = {**self.env, "CERA_HOME": str(other), "CERA_URL": st["local_url"], "CERA_TOKEN": tok}
         time.sleep(1.2)   # time for the supervisor to carry the token
         m = self.mcp(env)
         m.init("some-remote-agent")
@@ -670,11 +670,11 @@ class Remote(Base):
 
 def _tb_mcp():
     import importlib.util
-    mod = sys.modules.get("tempboard_tb_mcp")
+    mod = sys.modules.get("cera_tb_mcp")
     if mod is None:
-        spec = importlib.util.spec_from_file_location("tempboard_tb_mcp", HERE / "server" / "tb_mcp.py")
+        spec = importlib.util.spec_from_file_location("cera_tb_mcp", HERE / "server" / "tb_mcp.py")
         mod = importlib.util.module_from_spec(spec)
-        sys.modules["tempboard_tb_mcp"] = mod
+        sys.modules["cera_tb_mcp"] = mod
         spec.loader.exec_module(mod)
     return mod
 
@@ -688,7 +688,7 @@ class Size(Base):
         o = m.ok("site_open", {"tunnel": "none"}, timeout=120)["structuredContent"]
         sid, bid = o["site"], o["board"]
         port, h = self.human(sid)
-        ak = sys.modules.get("tempboard_agentkit") or _tb_mcp().ak
+        ak = sys.modules.get("cera_agentkit") or _tb_mcp().ak
         els = []
         for i in range(400):
             els += ak.make_box("rectangle", f"상자 {i}", (i % 20) * 200, (i // 20) * 120)
@@ -783,12 +783,12 @@ class _Capture(threading.Thread):
 
 class RemoteAccess(Base):
     def test_service_token_only(self):
-        """With only TEMPBOARD_URL + CF_ACCESS_CLIENT_ID/SECRET (no TEMPBOARD_TOKEN) it is remote mode: no site_* tools,
+        """With only CERA_URL + CF_ACCESS_CLIENT_ID/SECRET (no CERA_TOKEN) it is remote mode: no site_* tools,
         it sends CF-Access-Client-Id/Secret headers and does not send Authorization."""
         cap = _Capture()
         cap.start()
         try:
-            env = {**self.env, "TEMPBOARD_URL": f"http://127.0.0.1:{cap.port}", "CF_ACCESS_CLIENT_ID": "cid.access",
+            env = {**self.env, "CERA_URL": f"http://127.0.0.1:{cap.port}", "CF_ACCESS_CLIENT_ID": "cid.access",
                    "CF_ACCESS_CLIENT_SECRET": "sekret"}
             m = self.mcp(env)
             m.init("codex-mcp-client")
@@ -800,14 +800,14 @@ class RemoteAccess(Base):
             self.assertEqual((h.get("cf-access-client-id"), h.get("cf-access-client-secret")), ("cid.access", "sekret"))
             self.assertNotIn("authorization", h)
             # with only a URL and no credentials: it starts in remote mode (without touching the local site) but tools return a guidance error
-            m2 = self.mcp({**self.env, "TEMPBOARD_URL": f"http://127.0.0.1:{cap.port}"})
+            m2 = self.mcp({**self.env, "CERA_URL": f"http://127.0.0.1:{cap.port}"})
             m2.init()
             self.assertEqual(len(m2.call("tools/list")["result"]["tools"]), 9)
             r = m2.tool("board_list", {})
             self.assertTrue(r["isError"])
             self.assertIn("CF_ACCESS_CLIENT_ID", r["content"][0]["text"])
             m2.close()
-            self.assertIn("TEMPBOARD_URL", b"".join(m2.err).decode())
+            self.assertIn("CERA_URL", b"".join(m2.err).decode())
         finally:
             cap.httpd.shutdown()
             cap.httpd.server_close()

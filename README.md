@@ -1,4 +1,6 @@
-# tempboard
+# Cera
+
+Named after the Roman wax tablet: write, smooth it over, write again.
 
 **Just draw.** A shared whiteboard for rough thinking — with people in a meeting, or with your AI agent.
 
@@ -15,7 +17,7 @@ Making it concrete comes later — that's what your agent is for.
 
 ```mermaid
 flowchart LR
-    P["People in a meeting<br/>(talking on Discord)"] -- "draw by hand" --> B(("tempboard"))
+    P["People in a meeting<br/>(talking on Discord)"] -- "draw by hand" --> B(("Cera"))
     A["Your agent<br/>(Claude Code · Codex · Antigravity)"] -- "puts a background,<br/>adds a diagram" --> B
     B -- "reads the board,<br/>or you save and hand it over" --> A
     A --> C["Something concrete:<br/>code, a doc, a figure"]
@@ -29,15 +31,15 @@ Install it into your agent:
 
 ```
 # Claude Code
-/plugin marketplace add Joonoh991119/tempboard
-/plugin install tempboard@tempboard
+/plugin marketplace add Joonoh991119/cera
+/plugin install cera@cera
 
 # Codex
-codex plugin marketplace add Joonoh991119/tempboard
-codex plugin add tempboard@tempboard
+codex plugin marketplace add Joonoh991119/cera
+codex plugin add cera@cera
 
 # Antigravity
-agy plugin install https://github.com/Joonoh991119/tempboard
+agy plugin install https://github.com/Joonoh991119/cera
 ```
 
 Then just ask:
@@ -56,6 +58,7 @@ Works on phones and tablets too. Korean and English (switch from the menu).
 
 - Needs Python 3.9+, and [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for links that work outside your computer (`brew install cloudflared`).
 - Anyone with the invite link can draw. Share it with the people you mean to.
+- Formerly *tempboard*: your boards move to `~/.cera` on the first run, and the old `tempboard` command still works.
 - Want an always-on board on your own domain, agent tokens, importing files, or the full CLI? See the **[guide](docs/guide.md)**.
 
 ## License

@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 
 # Korean assertions below: pin the language before anything spawns the CLI or imports server code.
-os.environ["TEMPBOARD_LANG"] = "ko"
+os.environ["CERA_LANG"] = "ko"
 
 HERE = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("wb_server_sec", HERE / "server" / "server.py")

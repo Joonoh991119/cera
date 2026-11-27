@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "tempboard",
+  "name": "cera",
   "description": "Temporary shareable whiteboard sites — a plugin for Claude Code, Codex and Antigravity.",
   "owner": {
     "name": "Joonoh Park",
@@ -8,9 +8,9 @@
   },
   "plugins": [
     {
-      "name": "tempboard",
+      "name": "cera",
       "source": "./",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "category": "productivity",
       "description": "One command → a temporary collaborative whiteboard with an invite link (edit / view-only), auto-expiring; or an always-on personal board on your own domain. Excalidraw-based, live cursors, LaTeX math, .excalidraw import, MCP server for agents.",
       "tags": [

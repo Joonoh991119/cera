@@ -12,7 +12,7 @@ from pathlib import Path
 import os
 
 # Korean assertions below: pin the language before anything spawns the CLI or imports server code.
-os.environ["TEMPBOARD_LANG"] = "ko"
+os.environ["CERA_LANG"] = "ko"
 
 HERE = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("wb_server", HERE / "server" / "server.py")
@@ -134,7 +134,7 @@ class Api(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = srv.Store(Path(self.tmp.name))
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(self.store, DIST, "X-Tempboard-User"))
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.make_handler(self.store, DIST, "X-Cera-User"))
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
@@ -146,7 +146,7 @@ class Api(unittest.TestCase):
     def call(self, method, path, body=None, user="홍길동", app=True):
         h = {"Content-Type": "application/json"}
         if user:
-            h["X-Tempboard-User"] = urllib.parse.quote(user) if False else user.encode("utf-8").decode("latin-1")
+            h["X-Cera-User"] = urllib.parse.quote(user) if False else user.encode("utf-8").decode("latin-1")
         if app:
             h["X-Whiteboard"] = "1"
         req = urllib.request.Request(self.base + path, method=method, headers=h, data=json.dumps(body).encode() if body is not None else None)
@@ -236,7 +236,7 @@ class Api(unittest.TestCase):
         s = socket.create_connection((host, port), timeout=5)
         key = base64.b64encode(os.urandom(16)).decode()
         s.sendall((f"GET /api/whiteboard/boards/{b['id']}/ws?client=w1&since=0&epoch= HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                   f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nX-Tempboard-User: tester\r\n\r\n").encode())
+                   f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nX-Cera-User: tester\r\n\r\n").encode())
         f = s.makefile("rb")
         status = f.readline()
         self.assertIn(b"101", status)
@@ -347,15 +347,15 @@ class Invite(unittest.TestCase):
 
 
 class I18nOrder(unittest.TestCase):
-    """i18n.lang(): $TEMPBOARD_LANG > saved config.json > locale (C.UTF-8 counts as none) > English."""
-    KEYS = ("TEMPBOARD_LANG", "TEMPBOARD_HOME", "LC_ALL", "LC_MESSAGES", "LANG")
+    """i18n.lang(): $CERA_LANG > saved config.json > locale (C.UTF-8 counts as none) > English."""
+    KEYS = ("CERA_LANG", "CERA_HOME", "TEMPBOARD_LANG", "TEMPBOARD_HOME", "LC_ALL", "LC_MESSAGES", "LANG")
 
     def setUp(self):
         self.old = {k: os.environ.get(k) for k in self.KEYS}
         self.tmp = tempfile.TemporaryDirectory()
         for k in self.KEYS:
             os.environ.pop(k, None)
-        os.environ["TEMPBOARD_HOME"] = self.tmp.name
+        os.environ["CERA_HOME"] = self.tmp.name
         spec = importlib.util.spec_from_file_location("i18n_under_test", Path(__file__).resolve().parents[1] / "server" / "i18n.py")
         self.i18n = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.i18n)
@@ -379,9 +379,9 @@ class I18nOrder(unittest.TestCase):
         self.assertEqual(i.lang(), "ko")
         i.save("en")
         self.assertEqual(i.lang(), "en")                       # saved beats locale
-        os.environ["TEMPBOARD_LANG"] = "ko"
+        os.environ["CERA_LANG"] = "ko"
         self.assertEqual(i.lang(), "ko")                       # env beats saved
-        os.environ["TEMPBOARD_LANG"] = "xx"
+        os.environ["CERA_LANG"] = "xx"
         self.assertEqual(i.lang(), "en")                       # an invalid env value is ignored
         i.save(None)                                           # auto clears the saved value (other keys stay)
         self.assertIsNone(i.saved())
@@ -398,9 +398,9 @@ class I18nOrder(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("srv_i18n_t", Path(__file__).resolve().parents[1] / "server" / "server.py")
         srv = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(srv)
-        os.environ["TEMPBOARD_LANG"] = "en"
+        os.environ["CERA_LANG"] = "en"
         self.assertIn(b'<html lang="en">', srv.denied_page())
-        os.environ["TEMPBOARD_LANG"] = "ko"
+        os.environ["CERA_LANG"] = "ko"
         self.assertIn(b'<html lang="ko">', srv.denied_page())
 
 

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Personal-board web tests: `tempboard site init/run/install/uninstall/status/doctor/links`.
+"""Personal-board web tests: `cera site init/run/install/uninstall/status/doctor/links`.
 
 No real Cloudflare login, tunnel, or DNS is used. A **fake cloudflared** (a script that records its arguments and, for create / token,
 writes a credentials file) is placed first on PATH, but `ingress ...` is passed through to this Mac's **real cloudflared** so the generated config is genuinely validated.
-HOME and TEMPBOARD_HOME are always temporary folders (~/.cloudflared, ~/Library/LaunchAgents, and ~/.tempboard are never touched).
+HOME and CERA_HOME are always temporary folders (~/.cloudflared, ~/Library/LaunchAgents, and ~/.cera are never touched).
 Fake launchctl and systemctl on PATH only record calls if invoked by accident, and the tests check that they were never called."""
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ import time
 import unittest
 from pathlib import Path
 
-os.environ["TEMPBOARD_LANG"] = "ko"   # existing assertions are Korean; set before anything spawns the CLI or imports server code
+os.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before anything spawns the CLI or imports server code
 
 HERE = Path(__file__).resolve().parents[1]
-CLI = HERE / "bin" / "tempboard"
+CLI = HERE / "bin" / "cera"
 REAL_CF = shutil.which("cloudflared")
 PY39 = Path("/usr/bin/python3")
 HOST = "board.example.com"
@@ -129,9 +129,9 @@ class Base(unittest.TestCase):
             p.write_text(RECORDER.format(py=sys.executable))
             p.chmod(0o755)
         self.cflog, self.runs, self.svclog = self.t / "cf.log", self.t / "runs.txt", self.t / "svc.log"
-        env = {k: v for k, v in os.environ.items() if k not in ("TUNNEL_ORIGIN_CERT", "TEMPBOARD_DIST", "XDG_CONFIG_HOME",
-                                                                "TEMPBOARD_TEST_INSECURE_JWKS")}
-        self.env = {**env, "HOME": str(self.home), "TEMPBOARD_HOME": str(self.tbhome), "TEMPBOARD_DIST": str(self.dist),
+        env = {k: v for k, v in os.environ.items() if k not in ("TUNNEL_ORIGIN_CERT", "CERA_DIST", "XDG_CONFIG_HOME",
+                                                                "CERA_TEST_INSECURE_JWKS")}
+        self.env = {**env, "HOME": str(self.home), "CERA_HOME": str(self.tbhome), "CERA_DIST": str(self.dist),
                     "PATH": f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin{os.pathsep}/usr/sbin{os.pathsep}/sbin",
                     "FAKE_CF_LOG": str(self.cflog), "FAKE_CF_RUNS": str(self.runs), "FAKE_SVC_LOG": str(self.svclog)}
         if REAL_CF:
@@ -162,7 +162,7 @@ class Base(unittest.TestCase):
             raise
         p = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
         if check and p.returncode != 0:
-            raise AssertionError(f"tempboard {args} → {p.returncode}\nstdout:{p.stdout}\nstderr:{p.stderr}")
+            raise AssertionError(f"cera {args} → {p.returncode}\nstdout:{p.stdout}\nstderr:{p.stderr}")
         return p
 
     def cert(self):
@@ -228,8 +228,8 @@ class Init(Base):
         sub = [next((w for w in ("list", "create", "token", "route", "ingress") if w in c), "?") for c in names]
         self.assertEqual(sub[:3], ["list", "create", "route"], names)
         create = names[1]
-        self.assertEqual(create[-1], "tempboard-board-example-com", "기본 이름에 주소가 들어간다")
-        self.assertEqual(names[2][-3:], ["dns", "tempboard-board-example-com", HOST])
+        self.assertEqual(create[-1], "cera-board-example-com", "기본 이름에 주소가 들어간다")
+        self.assertEqual(names[2][-3:], ["dns", "cera-board-example-com", HOST])
         self.assertIn("--origincert", create)
         self.assertNotIn("--overwrite-dns", names[2], "사용자가 줄 때만")
         d = self.tbhome / "sites" / "personal"
@@ -279,7 +279,7 @@ class Init(Base):
     def test_existing_tunnel_refused_unless_reuse(self):
         """If a tunnel with the same name already exists in the account, it is not taken over and init exits 2 (with the reason and what to do); credentials are fetched only with --reuse-tunnel."""
         self.cert()
-        env = {**self.env, "FAKE_CF_LIST": json.dumps([{"id": UUID, "name": "tempboard-board-example-com", "connections": [{"id": "x"}]}])}
+        env = {**self.env, "FAKE_CF_LIST": json.dumps([{"id": UUID, "name": "cera-board-example-com", "connections": [{"id": "x"}]}])}
         p = self.tb("site", "init", "--hostname", HOST, "--port", str(self.port), env=env, check=False)
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("--reuse-tunnel", p.stderr)
@@ -322,14 +322,14 @@ class Install(Base):
         pl = plistlib.loads(body.encode())
         args = pl["ProgramArguments"]
         self.assertTrue(os.path.isabs(args[0]) and Path(args[0]).exists(), args)
-        # The plugin root changes with each version, so point at the fixed entry point $TEMPBOARD_HOME/bin/tempboard (written by site install)
-        self.assertEqual(args[1:], [str(self.tbhome / "bin" / "tempboard"), "site", "run", "--id", "personal"])
-        self.assertEqual(pl["EnvironmentVariables"]["TEMPBOARD_SERVICE"], "1")
+        # The plugin root changes with each version, so point at the fixed entry point $CERA_HOME/bin/cera (written by site install)
+        self.assertEqual(args[1:], [str(self.tbhome / "bin" / "cera"), "site", "run", "--id", "personal"])
+        self.assertEqual(pl["EnvironmentVariables"]["CERA_SERVICE"], "1")
         self.assertEqual(pl["KeepAlive"], {"SuccessfulExit": False})
         self.assertTrue(pl["RunAtLoad"])
         self.assertEqual(pl["StandardOutPath"], str(self.tbhome / "sites" / "personal" / "log.txt"))
         self.assertIn(str(self.bin), pl["EnvironmentVariables"]["PATH"].split(":"), "cloudflared 폴더가 PATH 에")
-        self.assertEqual(pl["EnvironmentVariables"]["TEMPBOARD_HOME"], str(self.tbhome))
+        self.assertEqual(pl["EnvironmentVariables"]["CERA_HOME"], str(self.tbhome))
         for secret in (st["edit_key"], st["view_key"]):
             self.assertNotIn(secret, body)
         # (/usr/bin/python3 writes pycache into ~/Library/Caches/com.apple.python -- only LaunchAgents is checked)
@@ -344,7 +344,7 @@ class Install(Base):
     def test_systemd_unit(self):
         self.init()
         p = self.tb("site", "install", "--dry-run", "--platform", "linux")
-        self.assertIn(f"# {self.home}/.config/systemd/user/tempboard-personal.service", p.stdout)
+        self.assertIn(f"# {self.home}/.config/systemd/user/cera-personal.service", p.stdout)
         unit = p.stdout
         exec_line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
         first = exec_line[len("ExecStart="):].split('" "')[0].strip('"')
@@ -353,15 +353,15 @@ class Install(Base):
         self.assertIn('"site" "run" "--id" "personal"', exec_line)
         self.assertIn("WantedBy=default.target", unit)
         self.assertNotIn(self.state()["edit_key"], unit)
-        self.assertIn("systemctl --user enable --now tempboard-personal.service", unit)
+        self.assertIn("systemctl --user enable --now cera-personal.service", unit)
 
     def test_install_writes_file_without_loading_then_uninstall(self):
         self.init()
         p = self.tb("site", "install", "--platform", "macos")
-        path = self.home / "Library" / "LaunchAgents" / "com.tempboard.personal.plist"
+        path = self.home / "Library" / "LaunchAgents" / "com.cera.personal.plist"
         self.assertTrue(path.is_file())
         self.assertIn("--load", p.stdout)
-        launcher = self.tbhome / "bin" / "tempboard"   # the fixed entry point is written too
+        launcher = self.tbhome / "bin" / "cera"   # the fixed entry point is written too
         self.assertTrue(launcher.is_file() and os.access(launcher, os.X_OK))
         self.assertEqual(plistlib.loads(path.read_bytes())["ProgramArguments"][1], str(launcher))
         if shutil.which("plutil"):
@@ -426,7 +426,7 @@ class Run(Base):
         # a second run is refused
         self.assertNotEqual(self.tb("site", "run", check=False, timeout=20).returncode, 0)
         # stop -> the supervisor ends within 5 seconds, exit 0, state stopped, no tunnel child left.
-        # `tempboard stop` treats a child that has not been reaped (a zombie) as alive and waits the full 5 seconds, so instead of that command
+        # `cera stop` treats a child that has not been reaped (a zombie) as alive and waits the full 5 seconds, so instead of that command
         # we measure when the supervisor (the Popen child) ended -- stop is started in the background and reaped here.
         t0 = time.time()
         stopper = subprocess.Popen([sys.executable, str(CLI), "stop", "personal"], env=self.env,
@@ -445,7 +445,7 @@ class Run(Base):
         self.init("--access-team", "myteam", "--access-aud", "c" * 64, "--keep-awake")
         st = self.state()
         st["access"]["jwks_url"] = "http://127.0.0.1:9/certs"   # keeps the test from reaching the outside (cloudflareaccess.com)
-        self.env["TEMPBOARD_TEST_INSECURE_JWKS"] = "1"           # an http JWKS is allowed only when this environment variable is set
+        self.env["CERA_TEST_INSECURE_JWKS"] = "1"           # an http JWKS is allowed only when this environment variable is set
         (self.tbhome / "sites" / "personal" / "state.json").write_text(json.dumps(st))
         p = self.run_site()
         txt = self.tb("links", "personal").stdout
@@ -478,7 +478,7 @@ class Run(Base):
         p = self.tb("site", "run", check=False, timeout=20)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("https", p.stderr)
-        self.env["TEMPBOARD_TEST_INSECURE_JWKS"] = "1"
+        self.env["CERA_TEST_INSECURE_JWKS"] = "1"
         (self.tbhome / "sites" / "personal" / "members.json").write_text(json.dumps({"agents": {"cid.access": {"name": "a"}}}))
         d = self.tb("site", "doctor", "--offline", check=False)
         self.assertEqual(d.returncode, 1)
@@ -501,7 +501,7 @@ class Run(Base):
 class English(Base):
     def test_guide_and_offline_doctor_in_english(self):
         import re
-        env = {**self.env, "TEMPBOARD_LANG": "en"}
+        env = {**self.env, "CERA_LANG": "en"}
         for args in (("site", "guide"), ("site", "doctor", "--offline"), ("site", "init", "--help"), ("site", "status")):
             p = self.tb(*args, env=env, check=False)
             out = p.stdout + p.stderr
@@ -643,7 +643,7 @@ class R2(Base):
 
     def test_init_picks_free_port_when_default_is_taken(self):
         """Port conflict, part 1: if another program (401) holds the default port, init picks a free port and says so, and run and doctor are OK."""
-        self.env["TEMPBOARD_SITE_PORT"] = str(self.other.port)
+        self.env["CERA_SITE_PORT"] = str(self.other.port)
         self.cert()
         p = self.tb("site", "init", "--hostname", HOST)
         st = self.state()
@@ -669,13 +669,13 @@ class R2(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn(f"포트 {self.other.port}", r.stderr)
         fix = next(l.split(":", 1)[1].strip() for l in r.stderr.splitlines() if "고치기" in l)
-        self.assertRegex(fix, r"^tempboard site port \d+$")
+        self.assertRegex(fix, r"^cera site port \d+$")
         self.assertIn("다른 프로그램이 쓰는 중", self.tb("site", "status").stdout)
         d = self.tb("site", "doctor", "--offline", check=False, timeout=90)
         self.assertEqual(d.returncode, 1)
         self.assertRegex(d.stdout, rf"FAIL\s+이 컴퓨터의 서버 — 포트 {self.other.port}: 다른 프로그램이 쓰는 중\(응답 401\)")
         self.assertIn(fix, d.stdout, "doctor 처방 = run 이 보인 명령")
-        self.assertNotIn("→ tempboard site run(시험)", d.stdout)
+        self.assertNotIn("→ cera site run(시험)", d.stdout)
         n_tunnel_calls = len([c for c in self.calls() if "create" in c or "route" in c or "list" in c])
         out = self.tb(*fix.split()[1:])                              # run it as-is
         self.assertIn("→", out.stdout)
@@ -696,17 +696,17 @@ class R2(Base):
         edit = f"https://{HOST}/?k={st['edit_key']}"
         self.assertIn(edit, p.stdout)
         self.assertIn(f"https://{HOST}/?k={st['view_key']}", p.stdout)
-        self.assertIn("tempboard links personal", p.stdout)
+        self.assertIn("cera links personal", p.stdout)
         again = self.init()
         self.assertNotIn(st["edit_key"], again.stdout, "두 번째 init 은 키를 다시 찍지 않는다")
-        self.assertIn("tempboard links personal", again.stdout)
+        self.assertIn("cera links personal", again.stdout)
         self.run_site()
         code, _ = get(self.port, f"/?k={st['edit_key']}", HOST)
         self.assertEqual(code, 200, "init 이 보인 링크는 '초대 링크가 필요해요'(403)가 아니다")
         self.tb("stop", "personal")
         time.sleep(0.5)
         log = (self.t / "run-personal.log").read_text()
-        self.assertIn("초대 링크: tempboard links personal", log)
+        self.assertIn("초대 링크: cera links personal", log)
         for secret in (st["edit_key"], st["view_key"]):
             self.assertNotIn(secret, log)
         self.assertNotIn("k=", log)
@@ -759,7 +759,7 @@ class Python39(Base):
         self.tb("site", "init", "--hostname", HOST, "--port", str(self.port), py=str(PY39))
         self.assertIn("ProgramArguments", self.tb("site", "install", "--dry-run", "--platform", "macos", py=str(PY39)).stdout)
         code = ("import importlib.util\n"
-                f"s=importlib.util.spec_from_file_location('tempboard_cfaccess',{str(HERE / 'server' / 'cfaccess.py')!r});"
+                f"s=importlib.util.spec_from_file_location('cera_cfaccess',{str(HERE / 'server' / 'cfaccess.py')!r});"
                 "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);print(m.team_name('x'))")
         self.assertEqual(subprocess.run([str(PY39), "-c", code], capture_output=True, text=True).stdout.strip(), "x")
 

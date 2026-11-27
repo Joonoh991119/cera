@@ -38,7 +38,7 @@ function pdfText(s) {
 
 // pages: [{ jpeg: Uint8Array, width?, height? }]. If width/height (px) are missing they are read from the JPEG header.
 // Page size: the long side is longSide pt (default 842 = A4 long side), keeping the image aspect ratio. Returns an array of Uint8Array chunks (pass straight to Blob).
-export function pdfParts(pages, { longSide = 842, title = "", producer = "tempboard" } = {}) {
+export function pdfParts(pages, { longSide = 842, title = "", producer = "Cera" } = {}) {
   if (!pages || !pages.length) throw new Error("쪽이 없어요");
   const parts = [];
   const offsets = [];

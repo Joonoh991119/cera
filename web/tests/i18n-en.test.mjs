@@ -35,7 +35,7 @@ test("export file names and notices in English", () => {
 test("too-big import message in English with size and limit", () => {
   const m = tooBigMessage(13.4 * 1024 * 1024);
   assert.match(m, /13\.4 MB · limit 12 MB/);
-  assert.match(m, /tempboard import/);
+  assert.match(m, /cera import/);
   assert.ok(!HANGUL.test(m), m);
 });
 

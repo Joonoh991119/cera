@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""tempboard whiteboard server (standard library only).
+"""Cera whiteboard server (standard library only).
 
     python3 server/server.py --data ./data --port 8790 [--edit-key K] [--view-key V]
     → http://127.0.0.1:8790/?k=K
 
-Normally you do not start it directly; `bin/tempboard start` does (it also sets up the temporary tunnel, expiry and invite keys).
+Normally you do not start it directly; `bin/cera start` does (it also sets up the temporary tunnel, expiry and invite keys).
 
 Access: with --edit-key, every request requires an invite key. Opening a link with `?k=<key>` for the first time swaps the key for a cookie and
 removes the key from the address. An edit key can draw and create boards; a view key can only read and see cursors. With no key at all the server is local-only (anyone can edit).
@@ -46,9 +46,9 @@ ROOT = HERE.parent
 
 
 def _sibling(name):
-    """Load a sibling module (security, etc.) once under the name `tempboard_<name>`, so that even when this file is loaded as a spec
-    (bin/tempboard, tests) the same classes are shared."""
-    key = "tempboard_" + name
+    """Load a sibling module (security, etc.) once under the name `cera_<name>`, so that even when this file is loaded as a spec
+    (bin/cera, tests) the same classes are shared."""
+    key = "cera_" + name
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
@@ -62,7 +62,7 @@ def _sibling(name):
 
 
 def T(ko, en):
-    """Korean or English text (server/i18n.py: TEMPBOARD_LANG > `tempboard lang` > locale > English)."""
+    """Korean or English text (server/i18n.py: CERA_LANG > `cera lang` > locale > English)."""
     return _sibling("i18n").T(ko, en)
 
 
@@ -844,7 +844,7 @@ class AgentTokens:
 
 
 _DENIED_HEAD = """<!doctype html><html lang="%s"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>tempboard</title><body style="font:16px/1.6 system-ui,sans-serif;max-width:32rem;margin:18vh auto;padding:0 16px;color:#333">"""
+<title>Cera</title><body style="font:16px/1.6 system-ui,sans-serif;max-width:32rem;margin:18vh auto;padding:0 16px;color:#333">"""
 _DENIED_KO = """<h1 style="font-size:20px">초대 링크가 필요해요</h1><p>이 화이트보드는 받은 초대 링크(주소 끝 <code>?k=…</code>)로만 열려요.
 링크가 끝났다면(만료 · 종료) 보드를 연 사람에게 새 링크를 받으세요.</p>"""
 _DENIED_EN = """<h1 style="font-size:20px">An invite link is required</h1><p>This whiteboard opens only from the invite link you were sent
@@ -868,7 +868,7 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
     access = access or Access()
     authn = authn if authn is not None else []
     class H(BaseHTTPRequestHandler):
-        server_version = "tempboard/0.1"
+        server_version = "cera/0.1"
         protocol_version = "HTTP/1.1"   # stream SSE as chunked so a front proxy (cloudflared, etc.) does not buffer it until the end
 
         def log_message(self, fmt, *args):  # silent
@@ -1479,7 +1479,7 @@ def build(data, dist=None, host="127.0.0.1", port=0, trust_header=None, test_use
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default="./tempboard-data")
+    ap.add_argument("--data", default="./cera-data")
     ap.add_argument("--dist", default=str(ROOT / "web" / "dist"))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8790)

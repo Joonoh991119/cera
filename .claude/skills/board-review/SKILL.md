@@ -1,6 +1,6 @@
 ---
 name: board-review
-description: tempboard 변경을 독립 검토하는 점검표 — 정확성, 여러 사람 동기화, 폰 · 터치, IME, 보기 전용, 성능 · 번들, 라이선스, 보안. board-reviewer 에이전트가 쓴다. tempboard 의 diff · PR · WP 를 리뷰하라는 요청이면 이 스킬.
+description: Cera 변경을 독립 검토하는 점검표 — 정확성, 여러 사람 동기화, 폰 · 터치, IME, 보기 전용, 성능 · 번들, 라이선스, 보안. board-reviewer 에이전트가 쓴다. Cera 의 diff · PR · WP 를 리뷰하라는 요청이면 이 스킬.
 ---
 
 # board-review
