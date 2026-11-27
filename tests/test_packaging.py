@@ -169,15 +169,15 @@ class SkillAndCommands(unittest.TestCase):
         self.assertTrue({"open", "list", "stop", "export", "import", "site"} <= names, names)
         tools = ["site_list", "site_open", "site_close", "board_list", "board_create", "board_read", "board_add",
                  "board_update", "board_delete", "board_wait", "board_export", "board_import"]
-        readme = (HERE / "README.md").read_text(encoding="utf-8")
+        readme = (HERE / "docs/guide.md").read_text(encoding="utf-8")
         skill = (HERE / "skills/tempboard/SKILL.md").read_text(encoding="utf-8")
         for t in tools:
             self.assertIn(t, readme, t)
             self.assertIn(t, skill, t)
 
     def test_readme_personal_guide_follows_site_guide_order(self):
-        """The README's order of human to-dos matches the order of `tempboard site guide` (personal.GUIDE_*)."""
-        readme = (HERE / "README.md").read_text(encoding="utf-8")
+        """The guide's order of human to-dos matches the order of `tempboard site guide` (personal.GUIDE_*)."""
+        readme = (HERE / "docs/guide.md").read_text(encoding="utf-8")
         steps = ["Add a domain", "cloudflared tunnel login", "site init --hostname", "site run", "site install --load",
                  "One-time PIN", "Self-hosted", "Application Audience (AUD) Tag", "--access-aud", "members.json", "Service Auth"]
         pos = [readme.find(s) for s in steps]
