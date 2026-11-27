@@ -9,6 +9,8 @@ import { tr } from "../../i18n.js";
 
 const DARK_FILTER = "invert(93%) hue-rotate(180deg)";   // Same as Board: use the color actually drawn on the dark theme
 const norm = (c) => String(c || "").toLowerCase();
+const SHAPE_NAME = { rectangle: ["사각형", "Rectangle"], diamond: ["마름모", "Diamond"], ellipse: ["타원", "Ellipse"], line: ["직선", "Straight"] };
+const shapeName = (k) => tr(...(SHAPE_NAME[k] || SHAPE_NAME.line));
 
 function Seg({ on, onClick, children, label }) {
   return <button type="button" className={`wb-seg wb-ink-seg ${on ? "on" : ""}`} aria-pressed={on} aria-label={label} onClick={onClick}>{children}</button>;
@@ -33,7 +35,7 @@ export default function InkOptions({ x, ink, theme }) {
   return (
     <>
       <button ref={btn} type="button" className={`wb-seg wb-ink-btn ${open ? "on" : ""}`} aria-haspopup="dialog" aria-expanded={open}
-        title={tr("펜 설정 — 형광펜 · 매끄럽게 · 멈추면 직선", "Pen settings — marker · smoothing · hold for a straight line")} onClick={() => setOpen((v) => !v)}>
+        title={tr("펜 설정 — 형광펜 · 매끄럽게 · 멈추면 직선 · 멈추면 도형", "Pen settings — marker · smoothing · hold for a straight line or a shape")} onClick={() => setOpen((v) => !v)}>
         {mode === "hl" ? tr("형광", "Marker") : tr("펜", "Pen")} ▾
       </button>
       {open && root && createPortal(
@@ -71,6 +73,14 @@ export default function InkOptions({ x, ink, theme }) {
             </div>
           </div>
           <p className="wb-ink-note">{tr("선 끝에서 0.5초 멈췄다 떼면 곧은 선이 돼요.", "Pause 0.5 s at the end of a stroke, then lift, to make it straight.")}<span className="wb-ink-shift">{tr(" Shift 를 누르면 15° 단위.", " Hold Shift for 15° steps.")}</span></p>
+          <div className="wb-ink-row">
+            <b>{tr("멈추면 도형", "Hold for a shape")}</b>
+            <div className="wb-ink-segs">
+              <Seg on={x.shapes} label={tr("멈추면 도형 켬", "Hold for a shape on")} onClick={() => x.setShapes(true)}>{tr("켬", "On")}</Seg>
+              <Seg on={!x.shapes} label={tr("멈추면 도형 끔", "Hold for a shape off")} onClick={() => x.setShapes(false)}>{tr("끔", "Off")}</Seg>
+            </div>
+          </div>
+          <p className="wb-ink-note">{tr("네모 · 동그라미 · 마름모를 한 번에 닫아 그리고 멈췄다 떼면 반듯한 도형이 돼요. 방금 쓴 글씨 옆은 그대로지만, 한 줄의 첫 글자나 천천히 쓴 ㅇ · ㅁ 은 도형이 될 수 있어요 — 4초 안에 '손그림으로 두기' 나 Ctrl+Z 로 되돌려요.", "Draw a closed box, circle or diamond in one stroke, pause, then lift to make it a clean shape. Letters right after other writing stay as written, but a single letter like O or ㅇ ㅁ written on its own or slowly can become a shape — undo with 'Keep as drawn' (4 s) or Ctrl+Z.")}</p>
           {x.pen.detected && <>
             <div className="wb-ink-row">
               <b>{tr("펜만 그리기", "Pen-only drawing")}</b>
@@ -82,7 +92,7 @@ export default function InkOptions({ x, ink, theme }) {
             <p className="wb-ink-note">{tr("켜면 손바닥이 닿아도 그려지지 않고, 손가락으로는 화면을 옮겨요.", "When on, your palm won't draw and a finger pans the board.")}</p>
           </>}
         </div>, root)}
-      {x.badge && root && createPortal(<div className="wb-ink-badge" style={{ left: x.badge.x, top: x.badge.y }} aria-live="polite">{tr("직선", "Straight")}</div>, root)}
+      {x.badge && root && createPortal(<div className="wb-ink-badge" style={{ left: x.badge.x, top: x.badge.y }} aria-live="polite">{shapeName(x.badge.kind)}</div>, root)}
     </>
   );
 }
