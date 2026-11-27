@@ -128,7 +128,10 @@ test("R1(실제 서버) — ack 직후 저장 전 강제 종료 · 같은 ID 수
     // 2) turn the long save interval back on -> edit and delete the same ID -> take only the ack and kill the server at once
     srv.kill("SIGKILL"); await sleep(150);
     srv = start(60);
-    assert.ok(await until(() => link.mode() === "ws", 8000), "다시 붙음(서버 재시작 1)");
+    // wait for the server itself first (a slow CI machine can take seconds to start Python); the link may come back
+    // over WebSocket or, after repeated failed upgrades, over long-polling: both count as reconnected
+    assert.ok(await until(async () => { try { return (await fetch(`${base}/api/whiteboard/me`)).ok; } catch { return false; } }, 15000), "서버 재시작 1");
+    assert.ok(await until(() => link.mode() !== "connecting", 15000), "다시 붙음(서버 재시작 1)");
     await sleep(300);
     const a2 = el("keep", 2, { x: 42 }), d2 = el("gone", 2, { isDeleted: true });
     local.set("keep", a2); local.set("gone", d2);
