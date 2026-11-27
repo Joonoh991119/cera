@@ -593,8 +593,39 @@ def _from_image(name: str, data: bytes) -> Tuple[List[dict], Dict[str, dict]]:
     return [el], {fr["id"]: fr}
 
 
+MAX_JSON_DEPTH = 1000   # real Excalidraw files nest a few levels; anything deeper is corrupt or hostile
+
+
+def _too_deep(text, limit: int = MAX_JSON_DEPTH) -> bool:
+    """True if JSON text nests [ / { deeper than limit (brackets inside strings are ignored).
+    Checked before json.loads because Python 3.12+ parses very deep documents without RecursionError,
+    which would only fail later (deepcopy, repr) in a less controlled place."""
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode("utf-8", "replace")
+    depth, in_str, esc = 0, False, False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch in "]}":
+            depth -= 1
+    return False
+
+
 def loads(text):
     """json.loads — a deeply nested document (a bomb) raises ImportFailed instead of RecursionError."""
+    if _too_deep(text):
+        raise ImportFailed(T("문서가 너무 깊게 중첩돼 있다(깨졌거나 이상한 파일)", "The document is nested too deeply (a corrupt or odd file)"))
     try:
         return json.loads(text)
     except RecursionError:
