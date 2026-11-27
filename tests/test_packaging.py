@@ -272,8 +272,8 @@ class License(unittest.TestCase):
     def test_ci_runs_discover_and_gen_check(self):
         """CI runs unittest discover and packaging/gen.py --check."""
         ci = (HERE / ".github/workflows/test.yml").read_text(encoding="utf-8")
-        self.assertIn("python3 -m unittest discover -s tests", ci)
-        self.assertIn("python3 packaging/gen.py --check", ci)
+        self.assertRegex(ci, r"(python3|\$\{\{ matrix\.py \}\}) -m unittest discover -s tests")
+        self.assertRegex(ci, r"(python3|\$\{\{ matrix\.py \}\}) packaging/gen\.py --check")
 
 
 def mcp_handshake(argv, env, timeout=20):
