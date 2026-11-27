@@ -110,6 +110,20 @@ def similar(a, b):
 PRESENCE_MS = 0.1  # presence-list broadcast interval; changes in between are coalesced into the last state (30-60 people in a lecture)
 SUMMON_GAP = 1.0   # minimum interval (seconds) between one connection's 'everyone to me' (summon) actions
 CLIENT_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+JOB_TTL = {"render": 20.0, "math": 86400.0, "mermaid": 20.0}   # tab render queue (agent -> a person's edit tab): job kinds and how long an unfinished job lives (s)
+JOB_LEASE = 5.0          # a claiming tab must post its result or heartbeat (claim again with its lease token) within this many seconds, otherwise the job reopens
+JOB_CLAIM_MAX = 15.0     # heartbeats never extend one claim past this, so a tab stuck on a hung upload cannot hold a job (math lives 24 h)
+JOB_MAX_CLAIMS = 3       # a job whose lease is lost this many times fails (a job that freezes tabs must not walk through every tab)
+JOB_DELAY = {"high": 0.0, "mid": 0.75, "low": 1.5}   # claim delay after (re)open: visible desktop, hidden desktop, phone - enforced here, not only in the tab
+JOB_MAX_OPEN = 8         # unfinished render / mermaid jobs per board
+JOB_MAX_MATH = 64        # unfinished math jobs per board (one per formula element; they may wait 24 h for a tab, so they are counted apart)
+JOB_ARGS_MAX = 64 * 1024  # job args / non-image result data (JSON bytes)
+JOB_PNG_B64_MAX = 6 * 1024 * 1024   # base64 text of the PNG in a render result
+JOB_KEEP = 60.0          # finished jobs (and their PNG) are kept this long for the agent to fetch
+JOB_KEEP_COUNT = 16      # ... but at most this many finished jobs per board
+JOB_KEEP_BYTES = 24 * 1024 * 1024   # ... and at most this many result bytes per board (oldest dropped first)
+JOB_ID = re.compile(r"^[a-f0-9]{12}$")
+SEL_KEEP = 60.0          # how long the last non-empty selection of each connection is remembered (board_selection)
 VIEW_LIMIT = 1e7   # scene-coordinate limit; a view range larger than this is treated as a bad value
 
 
@@ -274,6 +288,8 @@ class Board:
         self._plast = 0.0       # time of the last presence-list broadcast
         self._ptimer = None     # coalesced broadcast (after PRESENCE_MS)
         self._pdirty = set()    # connections that changed or left since the last broadcast; sent to clients that receive only changes (pd=1)
+        self.jobs = {}          # jid -> job dict (tab render queue; memory only, never saved)
+        self.last_sel = {}      # client -> {client, user, ids, at}: last non-empty selection of a person, for SEL_KEEP s
         self.meta, self.elements = {}, {}
         p = root / "board.json"
         if p.is_file():
@@ -458,6 +474,10 @@ class Board:
                 p["summon"], p["_s"] = summon, last
             if agent:
                 p["agent"] = True
+            elif isinstance(data.get("selected"), dict):
+                ids = [k for k, v in data["selected"].items() if v and isinstance(k, str) and 0 < len(k) <= 64][:500]
+                if ids:
+                    self.last_sel[client] = {"client": client, "user": name, "ids": ids, "at": time.time()}
             self.presence[client] = p
             self._pdirty.add(client)
         self.presence_changed()
@@ -511,6 +531,198 @@ class Board:
                 self.presence.pop(k, None)
                 self._pdirty.add(k)
             return [{k: v for k, v in p.items() if k not in ("_t", "_s")} for p in self.presence.values()]
+
+
+    # ---------- last selection (board_selection) ----------
+    def selections(self):
+        """Last non-empty selection of each person (agents excluded) within SEL_KEEP s, newest first. current = still selected right now."""
+        t = time.time()
+        with self.lock:
+            self._sweep_sel(t)
+            out = []
+            for v in self.last_sel.values():
+                sel = (self.presence.get(v["client"]) or {}).get("selected")
+                cur = [k for k, on in sel.items() if on] if isinstance(sel, dict) else []
+                out.append({"client": v["client"], "user": v["user"], "ids": list(v["ids"]), "at": int(v["at"] * 1000),
+                            "age_s": round(t - v["at"], 1), "current": bool(cur) and set(cur) == set(v["ids"])})
+        out.sort(key=lambda r: r["age_s"])
+        return out
+
+    def _sweep_sel(self, t):
+        for k in [k for k, v in self.last_sel.items() if t - v["at"] > SEL_KEEP]:
+            self.last_sel.pop(k, None)
+
+    # ---------- tab render queue ----------
+    @staticmethod
+    def _job_slim(j):
+        return {"jid": j["jid"], "kind": j["kind"], "state": j["state"], "opened": int(j["opened"] * 1000)}
+
+    def _job_public(self, j, full=False):
+        out = {**self._job_slim(j), "by": j["by"], "created": int(j["created"] * 1000), "expires": int(j["expires"] * 1000),
+               "claimer": j["claimer"] and {"client": j["claimer"][0], "user": j["claimer"][1]},
+               "claims": [dict(c) for c in j["claims"]]}
+        if j["state"] in ("done", "failed"):
+            out["ok"] = j["state"] == "done"
+            if full and j["result"] is not None:
+                out["data"] = j["result"]
+        if j["error"] is not None:
+            out["error"] = j["error"]
+        return out
+
+    def _job_finish(self, j, state, t, result=None, error=None):
+        """Under the lock: end a job, wake waiting agents, announce, and keep finished results within the per-board memory budget."""
+        j["state"], j["finished"], j["result"], j["error"], j["args"], j["token"] = state, t, result, error, None, None
+        j["size"] = _result_size(result)
+        self.cond.notify_all()
+        self.publish("job", self._job_slim(j))
+        done = sorted((x for x in self.jobs.values() if x["state"] in ("done", "failed", "expired")), key=lambda x: x["finished"])
+        total = sum(x["size"] for x in done)
+        while done and (len(done) > JOB_KEEP_COUNT or total > JOB_KEEP_BYTES):
+            old = done.pop(0)
+            total -= old["size"]
+            if old["result"] is not None:   # drop the payload, keep a stub so the agent learns why
+                old["state"], old["result"], old["size"] = "failed", None, 0
+                old["error"] = T("결과를 메모리 상한 때문에 버렸다 — 다시 요청하라", "result dropped (memory limit) - ask again")
+            else:
+                self.jobs.pop(old["jid"], None)
+
+    def job_create(self, kind, args, by):
+        """A new job from an agent token. -> (status, body). render / mermaid: at most JOB_MAX_OPEN unfinished; math: JOB_MAX_MATH and one per element
+        (a newer math job for the same element replaces the older one), so long-lived math jobs never block snapshots."""
+        t = time.time()
+        with self.lock:
+            self.sweep_jobs(t)
+            live = [j for j in self.jobs.values() if j["state"] in ("open", "claimed")]
+            if kind == "math":
+                eid = args.get("id")
+                for j in live:
+                    if j["kind"] == "math" and isinstance(eid, str) and (j["args"] or {}).get("id") == eid:
+                        self._job_finish(j, "failed", t, error=T("같은 수식에 새 작업이 들어와 바뀜", "replaced by a newer job for the same formula"))
+                        live.remove(j)
+                        break
+                if sum(1 for j in live if j["kind"] == "math") >= JOB_MAX_MATH:
+                    return 429, {"error": T(f"열린 수식 작업이 많다(최대 {JOB_MAX_MATH})", f"too many open math jobs (max {JOB_MAX_MATH})")}
+            elif sum(1 for j in live if j["kind"] != "math") >= JOB_MAX_OPEN:
+                return 429, {"error": T(f"열린 작업이 많다(최대 {JOB_MAX_OPEN})", f"too many open jobs (max {JOB_MAX_OPEN})")}
+            jid = secrets.token_hex(6)
+            j = {"jid": jid, "kind": kind, "args": args, "by": by, "created": t, "opened": t, "expires": t + JOB_TTL[kind],
+                 "state": "open", "claimer": None, "token": None, "claimed_at": 0.0, "lease": 0.0, "claims": [],
+                 "result": None, "error": None, "finished": 0.0, "size": 0}
+            self.jobs[jid] = j
+            self.publish("job", self._job_slim(j))
+            return 201, {"jid": jid, "kind": kind, "state": "open", "expires": int(j["expires"] * 1000)}
+
+    def job_list(self):
+        with self.lock:
+            self.sweep_jobs(time.time())
+            return [self._job_slim(j) for j in self.jobs.values() if j["state"] == "open"]
+
+    def job_claim(self, jid, client, user, prio, lease=None):
+        """A person's edit tab takes a job; only one gets 200 and a lease token. With `lease` (that token) it is a heartbeat: the lease is extended,
+        but never past JOB_CLAIM_MAX after the claim (a hung tab cannot hold a job). -> (status, body)"""
+        t = time.time()
+        with self.lock:
+            self.sweep_jobs(t)
+            j = self.jobs.get(jid)
+            if j is None:
+                return 404, {"error": "no job"}
+            if lease is not None:
+                if j["state"] != "claimed" or not j["token"] or not hmac.compare_digest(str(lease).encode("utf-8"), j["token"].encode("utf-8")):
+                    return 409, {"error": "lease lost", "state": j["state"]}
+                j["lease"] = min(t + JOB_LEASE, j["claimed_at"] + JOB_CLAIM_MAX)
+                return 200, {"jid": jid, "lease_ms": int((j["lease"] - t) * 1000)}
+            if j["state"] != "open":
+                return 409, {"error": "taken" if j["state"] == "claimed" else j["state"], "state": j["state"]}
+            wait = j["opened"] + JOB_DELAY.get(prio, JOB_DELAY["low"]) - t
+            if wait > 0:
+                return 409, {"error": "wait", "state": "open", "retry_ms": int(wait * 1000) + 20}
+            j["state"], j["claimer"], j["token"], j["claimed_at"], j["lease"] = "claimed", (client, user), secrets.token_urlsafe(18), t, t + JOB_LEASE
+            j["claims"].append({"client": client, "user": user, "prio": prio, "at": int(t * 1000)})
+            return 200, {"jid": jid, "kind": j["kind"], "args": j["args"], "by": j["by"], "lease": j["token"], "lease_ms": int(JOB_LEASE * 1000)}
+
+    def job_result(self, jid, lease, ok, data, error):
+        """Result from the tab holding the live lease (token from claim). A lost / expired lease gets 409 and changes nothing. -> (status, body)"""
+        t = time.time()
+        with self.lock:
+            self.sweep_jobs(t)
+            j = self.jobs.get(jid)
+            if j is None:
+                return 404, {"error": "no job"}
+            if j["state"] != "claimed" or not j["token"] or not hmac.compare_digest(str(lease or "").encode("utf-8"), j["token"].encode("utf-8")):
+                return 409, {"error": "lease lost", "state": j["state"]}
+            self._job_finish(j, "done" if ok else "failed", t, result=data if ok else None, error=None if ok else error)
+            return 200, {"jid": jid, "state": j["state"]}
+
+    def job_get(self, jid, wait=0.0):
+        """Agent: the job, waiting up to `wait` s for it to finish (done / failed / expired). None if unknown."""
+        deadline = time.time() + wait
+        with self.cond:
+            g0 = self.gen
+            while True:
+                self.sweep_jobs(time.time())
+                j = self.jobs.get(jid)
+                if j is None:
+                    return None
+                left = deadline - time.time()
+                if j["state"] in ("done", "failed", "expired") or left <= 0 or self.gen != g0:
+                    return self._job_public(j, full=True)
+                self.cond.wait(min(left, 0.5))   # wake at least every 0.5 s so lease / expiry sweeps run while waiting
+
+    def sweep_jobs(self, t=None):
+        """Expire, reopen after a lost lease (announced again so another tab takes it; after JOB_MAX_CLAIMS lost leases the job fails, so a job
+        that freezes tabs cannot walk through every tab), forget old finished jobs and old selections. Called every 0.5 s and on each job call."""
+        t = time.time() if t is None else t
+        with self.lock:
+            self._sweep_sel(t)
+            for jid in list(self.jobs):
+                j = self.jobs[jid]
+                if j["state"] in ("open", "claimed") and t > j["expires"]:
+                    self._job_finish(j, "expired", t, error=T("열린 사람 탭이 없어 시간이 지났다", "timed out: no person's tab took it"))
+                elif j["state"] == "claimed" and t > j["lease"]:
+                    if len(j["claims"]) >= JOB_MAX_CLAIMS:
+                        self._job_finish(j, "failed", t, error=T(f"탭이 {JOB_MAX_CLAIMS}번 응답 없이 멈췄다", f"tabs stopped responding {JOB_MAX_CLAIMS} times"))
+                    else:
+                        j["state"], j["claimer"], j["token"], j["opened"] = "open", None, None, t
+                        self.publish("job", self._job_slim(j))
+                elif j["state"] in ("done", "failed", "expired") and t > j["finished"] + JOB_KEEP:
+                    del self.jobs[jid]
+
+
+def _result_size(data):
+    """Bytes a finished result holds, measured on the text (the PNG stays base64 in memory)."""
+    if not isinstance(data, dict):
+        return 0
+    png = data.get("png")
+    return (len(png) if isinstance(png, str) else 0) + len(json.dumps({k: v for k, v in data.items() if k != "png"}, ensure_ascii=False).encode("utf-8"))
+
+
+def clean_job_result(kind, body):
+    """Validate a tab's result {ok, data | error}. -> (ok, data, error) or a str (the reason it is rejected).
+    Only render results may carry a PNG (base64 text <= JOB_PNG_B64_MAX, PNG header); everything else <= JOB_ARGS_MAX JSON bytes."""
+    ok = body.get("ok")
+    if not isinstance(ok, bool):
+        return "ok"
+    if not ok:
+        return False, None, str(body.get("error") or "failed")[:500]
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return "data"
+    png = data.get("png")
+    if kind != "render":
+        if png is not None:
+            return "png is only for render"
+    elif not isinstance(png, str) or len(png) > JOB_PNG_B64_MAX:
+        return "png missing or too large"
+    if len(json.dumps({k: v for k, v in data.items() if k != "png"}, ensure_ascii=False).encode("utf-8")) > JOB_ARGS_MAX:
+        return "data too large"
+    if kind == "render":
+        try:
+            raw_png = base64.b64decode(png, validate=True)
+        except (ValueError, TypeError):
+            return "png"
+        if not raw_png.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+    return True, data, None
 
 
 AI_SUFFIX = " · AI"
@@ -678,6 +890,7 @@ class Store:
         for b in boards:
             b.save()
             b.sweep_presence()
+            b.sweep_jobs()
 
     def close_streams(self, predicate=None):
         """Close open WebSocket / SSE streams. Without a predicate, close all of them (on an invite-key change; waiting long-polls are woken too),
@@ -1150,6 +1363,26 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.ws(b, (q.get("client") or [""])[0][:40], since, (q.get("epoch") or [""])[0][:16], (q.get("pd") or [""])[0] == "1")
             if sub == "/events":
                 return self.events(b, (q.get("client") or [""])[0][:40])
+            if sub == "/selection":   # last selections of people (WP-3 board_selection); same data the presence list already shows everyone
+                return self.send(200, {"selections": b.selections()})
+            if sub == "/jobs":   # open tab-render jobs: for a person's edit tab that just opened the board
+                if role != "edit" or self.user().get("agent"):
+                    return self.send(403, {"error": "edit tab only"})
+                return self.send(200, {"jobs": b.job_list()})
+            jm = re.match(r"^/jobs/([a-f0-9]+)$", sub)
+            if jm and JOB_ID.match(jm.group(1)):   # agent: the job and its result (long-poll with ?wait=, up to 20 s)
+                if not self.user().get("agent"):
+                    return self.send(403, {"error": "agent token only"})
+                try:
+                    wait = min(20.0, max(0.0, float((q.get("wait") or ["0"])[0])))
+                except ValueError:
+                    wait = 0.0
+                if not math.isfinite(wait):
+                    wait = 0.0
+                j = b.job_get(jm.group(1), wait)
+                if not self.role():
+                    return self.send(403, {"error": "invite link required"})
+                return self.send(200, j) if j is not None else self.send(404, {"error": "no job"})
             fm = re.match(r"^/files/([A-Za-z0-9_-]+)$", sub)
             if fm and FILE_ID.match(fm.group(1)):
                 p = b.root / "files" / fm.group(1)
@@ -1321,6 +1554,9 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.send(201, b.meta)
             if path == "/api/whiteboard/boards/import":   # import into a new board
                 return self.do_import(None, data, "new", usr, client=str(data.get("client", ""))[:40])
+            jm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/jobs(?:/([a-f0-9]{12})/(claim|result))?$", path)
+            if jm:
+                return self.do_job(jm, data, usr)
             m = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/(elements|presence|files|title|patch|import)$", path)
             b = store.get(m.group(1)) if m else None
             if not b:
@@ -1360,6 +1596,48 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 b.publish("meta", b.meta)
                 return self.send(200, b.meta)
             return self.send(404, {"error": "not found"})
+
+        def do_job(self, jm, data, usr):
+            """Tab render queue (edit permission is already checked). Agents create jobs; a person's edit tab claims one and posts the result."""
+            b = store.get(jm.group(1))
+            if not b:
+                return self.send(404, {"error": "no board"})
+            agent = bool(usr.get("agent"))
+            if jm.group(2) is None:
+                if not agent:
+                    return self.send(403, {"error": "agent token only"})
+                kind, args = data.get("kind"), data.get("args", {})
+                if kind not in JOB_TTL:
+                    return self.send(400, {"error": "kind", "allowed": sorted(JOB_TTL)})
+                if not isinstance(args, dict):
+                    return self.send(400, {"error": "args"})
+                if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > JOB_ARGS_MAX:
+                    return self.send(413, {"error": "args too large", "limit": JOB_ARGS_MAX})
+                code, out = b.job_create(kind, args, re.sub(r"\s*·\s*AI$", "", usr["name"]))
+                return self.send(code, out)
+            if agent:
+                return self.send(403, {"error": "a person's edit tab only"})
+            client = str(data.get("client", ""))[:40]
+            if not CLIENT_ID.match(client):
+                return self.send(400, {"error": "client"})
+            jid = jm.group(2)
+            lease = data.get("lease")
+            if lease is not None and not (isinstance(lease, str) and 0 < len(lease) <= 64 and lease.isascii()):
+                return self.send(400, {"error": "lease"})
+            if jm.group(3) == "claim":
+                prio = data.get("prio") if data.get("prio") in JOB_DELAY else "low"
+                code, out = b.job_claim(jid, client, usr["name"], prio, lease)
+                return self.send(code, out)
+            with b.lock:
+                j = b.jobs.get(jid)
+                kind = j["kind"] if j else None
+            if kind is None:
+                return self.send(404, {"error": "no job"})
+            r = clean_job_result(kind, data)
+            if isinstance(r, str):
+                return self.send(400, {"error": "result: " + r})
+            code, out = b.job_result(jid, lease, *r)
+            return self.send(code, out)
 
         def do_import(self, b, data, mode, usr, client):
             """Import: body {name, content (text or image data URL), title?, at?, client?}. Images are either inside the document (data URL) or

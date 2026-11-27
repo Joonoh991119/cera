@@ -30,6 +30,7 @@ import ImportSheet from "./features/import/ImportLoader.jsx";   // import: drop 
 import useImportDrop from "./features/import/useImportDrop.js";
 import { ACCEPT as IMPORT_ACCEPT, takePendingToast } from "./features/import/importFile.js";
 import { tr, lang, setLang, excalidrawLang } from "./i18n.js";   // screen language (Korean / English)
+import useAgentJobs from "./features/jobs/useAgentJobs.js";   // tab render queue: agents borrow this tab for render / MathJax / mermaid (runners are lazy chunks)
 
 
 const PUSH_MS = 80;        // interval for batching and sending changed elements
@@ -178,6 +179,7 @@ export default function Board({ id, me }) {
   const sync = useRef({ seq: 0, pver: -1, epoch: "" });
   const drawing = useRef(false);
   const holdRef = useRef(null);          // holds a formula that someone else is editing (features/math/hold.js)
+  const agentJobs = useAgentJobs({ excal, id, client, viewOnly: me.role === "view", coarse });
 
 
   // Initial load: if it fails, retry after a moment (never leave the screen blank)
@@ -248,6 +250,7 @@ export default function Board({ id, me }) {
       if (event === "elements") onElements(data.elements);
       else if (event === "file") { uploaded.current.add(data.id); hold.onFile(data.id); fetchMissingFiles(excal, excal.getSceneElements()); }
       else if (event === "meta") setMeta(data);
+      else if (event === "job") agentJobs.notify(data);
     };
     const onReset = async (given) => {   // the server restarted or its log was trimmed: fetch the full state and merge, and resend my elements that the server lacks
       const d = given ? { elements: given } : await api.board(id);
