@@ -1,0 +1,22 @@
+/* Pen settings. Shared .wb-pop, .wb-seg and .wb-swatch live in app.css */
+.wb-ink-btn { min-width: 0; height: 36px; padding: 0 10px; font-size: 14px; font-weight: 700; white-space: nowrap; }
+.wb-ink-pop { min-width: 280px; gap: 10px; }
+.wb-ink-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.wb-ink-row > b { font-size: 14px; white-space: nowrap; }
+.wb-ink-segs { display: flex; gap: 4px; }
+.wb-ink-seg { min-width: 52px; height: 40px; padding: 0 10px; font-size: 14px; white-space: nowrap; }
+.wb-ink-segs .wb-swatch { width: 40px; height: 40px; }
+.wb-ink-note { margin: -4px 0 0; font-size: 12px; line-height: 1.4; color: var(--dk-mut); max-width: 300px; }
+@media (hover: none) { .wb-ink-shift { display: none; } }   /* Hide the Shift hint on devices without a keyboard */
+/* Hold indicator, shown above the pen tip. Does not block pointer presses */
+.wb-ink-badge { position: fixed; z-index: 30; transform: translate(-50%, calc(-100% - 18px)); pointer-events: none;
+  padding: 3px 10px; border-radius: 999px; background: var(--dk-onfg); color: var(--dk-bg); font-size: 13px; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+@media (max-width: 760px) {
+  .wb-ink-btn { height: 32px; padding: 0 8px; font-size: 13px; }
+  .wb-ink-pop { min-width: 0; }
+  .wb-ink-seg { flex: 0 0 auto; min-width: 56px; height: 44px; }
+  .wb-ink-segs .wb-swatch { width: 44px; height: 44px; }
+  .wb-ink-note { max-width: none; }
+}
+/* 761–950px (e.g. iPad portrait): shrink the thickness bar to win back the width the 'Pen ▾' button adds */
+@media (min-width: 761px) and (max-width: 950px) { .wb-dock .wb-slider input[type=range] { width: 84px; } }

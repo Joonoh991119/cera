@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tempboard": {
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/bin/tempboard",
+        "mcp"
+      ]
+    }
+  }
+}

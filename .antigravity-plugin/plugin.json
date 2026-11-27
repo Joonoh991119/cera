@@ -1,0 +1,12 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "tempboard",
+  "displayName": "tempboard",
+  "description": "Temporary, link-shared collaborative whiteboard (Excalidraw-based, live cursors, LaTeX math, Korean fonts). One command gives an invite link via a Cloudflare quick tunnel; also an always-on personal board on your own domain (named tunnel, optional Cloudflare Access), .excalidraw import, and a stdio MCP server so Claude Code, Codex and Antigravity agents can read and draw on boards.",
+  "version": "0.4.0",
+  "author": {
+    "name": "Joonoh Park",
+    "url": "https://github.com/Joonoh991119"
+  },
+  "license": "MIT"
+}

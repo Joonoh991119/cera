@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "tempboard",
+  "version": "0.4.0",
+  "description": "Temporary, link-shared collaborative whiteboard (Excalidraw-based, live cursors, LaTeX math, Korean fonts). One command gives an invite link via a Cloudflare quick tunnel; also an always-on personal board on your own domain (named tunnel, optional Cloudflare Access), .excalidraw import, and a stdio MCP server so Claude Code, Codex and Antigravity agents can read and draw on boards.",
+  "author": {
+    "name": "Joonoh Park",
+    "url": "https://github.com/Joonoh991119"
+  },
+  "license": "MIT",
+  "keywords": [
+    "whiteboard",
+    "excalidraw",
+    "collaboration",
+    "share",
+    "tunnel",
+    "cloudflared",
+    "mcp",
+    "화이트보드"
+  ]
+}

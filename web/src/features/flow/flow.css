@@ -1,0 +1,26 @@
+/* Flowchart: shape popup and '+' connect. The shared .wb-pop and .wb-tool are in app.css */
+.wb-shape-pop { grid-template-columns: repeat(3, auto); gap: 4px; }
+.wb-shape-item { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; min-height: 44px; padding: 6px 10px; border: 0; border-radius: 10px;
+  background: transparent; color: inherit; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; text-align: left; white-space: nowrap; }
+.wb-shape-item.on { background: var(--dk-on); color: var(--dk-onfg); box-shadow: inset 0 0 0 2px var(--dk-onfg); }
+.wb-shape-item kbd { font: 600 11px/1 ui-monospace, Menlo, monospace; color: var(--dk-mut); border: 1px solid var(--dk-line); border-radius: 5px; padding: 3px 5px; }
+.wb-shape-item:focus-visible { outline: 3px solid var(--dk-onfg); outline-offset: 1px; }
+@media (hover: hover) { .wb-shape-item:hover { background: var(--dk-on); color: var(--dk-onfg); } }
+@media (max-width: 760px) {
+  /* phone: 3 x 2 cells, icon on top and name below; floats right above the bar */
+  .wb-shape-pop { grid-template-columns: repeat(3, 1fr); }
+  .wb-shape-item { grid-template-columns: 1fr; justify-items: center; gap: 2px; min-height: 56px; padding: 6px 4px; font-size: 12.5px; }
+}
+
+/* '+': around the selected box. The layer itself lets presses pass through and only the buttons receive them */
+.wb-plus-layer { position: fixed; inset: 0; z-index: 15; pointer-events: none; }
+.wb-plus { position: absolute; display: grid; place-items: center; padding: 0; border-radius: 50%; border: 2px solid var(--dk-onfg); background: var(--dk-bg); color: var(--dk-onfg);
+  box-shadow: 0 2px 8px rgba(20, 24, 40, .18); cursor: pointer; pointer-events: auto; opacity: .85; touch-action: manipulation; }
+.wb-plus svg { width: 60%; height: 60%; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; }
+.wb-plus:hover, .wb-plus:focus-visible { opacity: 1; background: var(--dk-on); }
+.wb-plus:focus-visible { outline: 3px solid var(--dk-onfg); outline-offset: 1px; }
+.wb-plus-touch { opacity: .95; }
+
+/* mermaid dialog input: even a long single line wraps inside the box. Excalidraw's '.excalidraw textarea:not(.excalidraw-wysiwyg) { nowrap }' came
+   later and overrode the dialog's own pre-wrap, so use a more specific selector. The dialog may be rendered outside .wb-board (portal), so start from .excalidraw */
+.excalidraw .ttd-dialog-panel textarea.ttd-dialog-input { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; overflow-x: hidden; }

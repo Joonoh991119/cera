@@ -1,0 +1,22 @@
+/* Import sheet. The shared .wb-modal, .wb-modal-box, .wb-btn and .wb-primary live in app.css */
+.wb-import { width: min(440px, 100%); gap: 10px; }
+.wb-import h2 { font-size: 18px; }
+.wb-import-file { margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-import-info { margin: 0; font-size: 13.5px; color: var(--dk-mut); font-variant-numeric: tabular-nums; }
+/* Error color: on a light screen #b42318 on #fff is 6.5:1, on a dark screen #ffa198 on #1d2026 is 8.6:1 (WCAG AA) */
+.wb-board { --dk-err: #b42318; }
+.wb-board.wb-theme-dark { --dk-err: #ffa198; }
+.wb-import-err { margin: 0; color: var(--dk-err, #b42318); font-size: 14px; font-weight: 600; line-height: 1.5; padding-left: 10px; border-left: 3px solid var(--dk-err, #b42318); }
+/* Initial focus goes to 'Merge into this board', so keep the border visible even after a mouse drop */
+.wb-import .wb-primary:focus, .wb-import .wb-btn:focus { outline: 3px solid var(--dk-onfg); outline-offset: 2px; }
+.wb-import-hint { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--dk-mut); }
+.wb-import-actions { flex-wrap: wrap; }
+.wb-import-actions button:disabled { opacity: .5; cursor: default; }
+@media (max-width: 760px) {
+  /* Phone: a sheet rising from the bottom, buttons within thumb reach, not clipped at 390px */
+  .wb-import-back { align-items: flex-end; padding: 0; }
+  .wb-import { width: 100%; max-height: calc(100dvh - 24px); border-radius: 16px 16px 0 0; padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px)); }
+  .wb-import-actions { display: flex; }
+  .wb-import-actions > button { flex: 1 1 0; min-width: 0; padding: 0 8px; }
+  .wb-import-actions .wb-primary { flex-basis: 100%; order: -1; }
+}

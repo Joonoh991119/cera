@@ -1,0 +1,7 @@
+node_modules/
+web/dist/
+web/*.tar.gz
+__pycache__/
+.DS_Store
+_workspace/
+_workspace_prev/

@@ -1,0 +1,17 @@
+/* Page bar: a small bar floating separately from the tool dock. Color tokens (--dk-*) come from .wb-board */
+.wb-pages { position: fixed; z-index: 21; display: flex; align-items: center; gap: 2px; padding: 4px;
+  border-radius: 14px; background: var(--dk-bg); color: var(--dk-fg); border: 1px solid var(--dk-line); box-shadow: var(--dk-shadow); }
+.wb-pages-top { top: max(12px, env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%); }
+/* Phone: right above the dock (two rows). The color/stroke rows are already full, so there is no room inside the dock */
+.wb-pages-bottom { right: max(8px, env(safe-area-inset-right, 0px)); bottom: calc(max(6px, env(safe-area-inset-bottom, 0px)) + var(--dock-h, 120px) + 8px); }
+.wb-pages-view.wb-pages-bottom { right: auto; left: 50%; transform: translateX(-50%); bottom: max(10px, env(safe-area-inset-bottom, 0px)); }
+.wb-page-btn { width: 44px; height: 40px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 10px; background: transparent; color: inherit; cursor: pointer; }
+.wb-page-btn:disabled { opacity: .3; cursor: default; }
+@media (hover: hover) { .wb-page-btn:not(:disabled):hover, .wb-page-new:hover { background: var(--dk-on); } }
+.wb-page-btn:focus-visible, .wb-page-new:focus-visible { outline: 3px solid var(--dk-onfg); outline-offset: 1px; }
+.wb-page-num { min-width: 48px; text-align: center; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wb-page-num small { font-size: 13px; font-weight: 600; color: var(--dk-mut); }
+.wb-page-new { height: 40px; padding: 0 12px; margin-left: 2px; border: 0; border-radius: 10px; background: transparent; color: var(--dk-onfg);
+  font: inherit; font-size: 14px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.wb-page-btn + .wb-page-new, .wb-page-num ~ .wb-page-new { border-left: 1px solid var(--dk-line); border-radius: 0 10px 10px 0; }
+.wb-sheeting .wb-pages { display: none; }   /* when the phone text-entry sheet is open */

@@ -1,0 +1,57 @@
+/* Follow mode. Color tokens (--dk-*) come from .wb-board. --fc = the followed person's color */
+.wb-chip-btn { font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; line-height: 1.3; }
+.wb-chip-btn:focus-visible { outline: 3px solid var(--dk-onfg); outline-offset: 2px; }
+/* Folding the people-chip row: the measuring layer takes no space and is invisible */
+.wb-board .wb-people { position: relative; }
+.wb-chip-measure { position: absolute; top: 0; right: 0; display: flex; gap: 6px; visibility: hidden; pointer-events: none; white-space: nowrap; }
+.wb-chip-more { border-style: dashed; color: var(--dk-mut); }
+/* Dark theme: a following chip's background is 'person color at 25% over the dark canvas', so use the light text token */
+.wb-board.wb-theme-dark .wb-chip-btn.on { color: var(--dk-fg); }
+.wb-mchip-btn { cursor: pointer; font: inherit; font-size: 12.5px; font-weight: 600; }
+
+/* Screen border while following; presses pass through to what is below */
+.wb-follow-frame { position: fixed; inset: 0; z-index: 20; pointer-events: none; box-shadow: inset 0 0 0 3px var(--fc, #2b45c7); }
+
+/* Banner: centered just below the top bar (desktop page bar / phone top row). Its width shrinks to fit the screen and the text is ellipsized */
+.wb-follow-bar { position: fixed; z-index: 22; top: calc(max(12px, env(safe-area-inset-top, 0px)) + 58px); left: 8px; right: 8px; margin: 0 auto; width: fit-content;
+  display: flex; align-items: center; gap: 8px; max-width: calc(100vw - 16px); box-sizing: border-box; padding: 4px 4px 4px 12px;
+  border-radius: 999px; background: var(--dk-bg); color: var(--dk-fg); border: 2px solid var(--fc, var(--dk-line)); box-shadow: var(--dk-shadow); font-size: 14px; font-weight: 600; }
+.wb-follow-bar > i { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--fc, var(--dk-onfg)); }
+.wb-follow-bar > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-follow-bar button { flex: 0 0 auto; min-height: 36px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--dk-on); color: var(--dk-onfg); font: inherit; font-weight: 700; cursor: pointer; }
+.wb-follow-pill { padding: 3px; border-style: dashed; }
+.wb-follow-pill button { background: transparent; max-width: calc(100vw - 32px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-follow-bar button:focus-visible, .wb-follow-menu button:focus-visible { outline: 3px solid var(--dk-onfg); outline-offset: 1px; }
+.wb-sheeting .wb-follow-bar { display: none; }   /* when the phone text-entry sheet is open */
+
+/* People popover: top right (below the chips on desktop), below the top row on phones */
+.wb-follow-back { position: fixed; inset: 0; z-index: 45; }
+.wb-follow-menu { position: absolute; top: calc(max(12px, env(safe-area-inset-top, 0px)) + 46px); right: max(8px, env(safe-area-inset-right, 0px));
+  width: min(320px, calc(100vw - 16px)); box-sizing: border-box; max-height: calc(100vh - 80px); overflow: auto; display: grid; gap: 2px; padding: 8px;
+  border-radius: 14px; background: var(--dk-bg); color: var(--dk-fg); border: 1px solid var(--dk-line); box-shadow: var(--dk-shadow); }
+.wb-follow-title { margin: 4px 8px 6px; font-size: 12.5px; font-weight: 700; color: var(--dk-mut); }
+.wb-follow-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 44px; padding: 0 4px 0 8px; border-radius: 10px; font-size: 15px; }
+.wb-follow-row > i { width: 10px; height: 10px; border-radius: 50%; }
+.wb-follow-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-follow-row button { min-height: 40px; min-width: 84px; padding: 0 12px; border: 1px solid var(--dk-line); border-radius: 10px; background: transparent; color: var(--dk-fg); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+.wb-follow-row button.on { background: var(--dk-on); color: var(--dk-onfg); border-color: var(--dk-onfg); }
+.wb-follow-self { color: var(--dk-mut); }
+.wb-follow-summon { margin-top: 6px; min-height: 44px; padding: 0 12px; border: 0; border-radius: 10px; background: var(--dk-onfg); color: var(--dk-bg); font: inherit; font-size: 15px; font-weight: 700; cursor: pointer; }
+.wb-follow-summon:disabled { opacity: .4; cursor: default; }
+.wb-follow-note { margin: 4px 8px; font-size: 12.5px; color: var(--dk-mut); }
+@media (hover: hover) { .wb-follow-row button:hover { background: var(--dk-on); } }
+@media (max-width: 760px) {
+  .wb-follow-back { background: rgba(15, 18, 25, .35); }
+  .wb-follow-menu { top: max(60px, calc(env(safe-area-inset-top, 0px) + 56px)); }
+  .wb-follow-row button { min-height: 44px; }
+}
+
+/* Hide Excalidraw's own people circles (UserList). Clicking one turns on Excalidraw's follow mode (English 'Following' banner, and the view does not move),
+      which conflicts with ours, and it duplicates the people chips while pushing the bar toward the page bar at 1024px. Following is handled by the people chips and the people popover only. */
+.wb-board .excalidraw .UserList__wrapper, .wb-board .excalidraw .follow-mode { display: none !important; }
+
+/* 'AI' tag for agents, next to the name in chips and the people popover. Text contrast: white on #2b45c7 (7.6:1) on light, #aebcff on #1d2026 on dark */
+.wb-ai { display: inline-block; margin-left: 4px; padding: 0 4px; border-radius: 5px; background: var(--dk-onfg, #2b45c7); color: var(--dk-bg, #fff);
+  font-size: 10px; font-weight: 800; line-height: 1.45; letter-spacing: .02em; vertical-align: 1px; }
+.wb-follow-row .wb-ai { font-size: 11px; }
+.wb-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

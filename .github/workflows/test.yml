@@ -1,0 +1,22 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]   # 3.9 = /usr/bin/python3 on macOS (GUI agent apps may launch the MCP server with it)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: npm ci --no-audit --no-fund && npm run build
+        working-directory: web
+      - run: python3 packaging/gen.py --check   # generated manifests, web versions, THIRD_PARTY_NOTICES.md (against node_modules)
+      - run: python3 tests/test_server.py
+      - run: python3 -m unittest discover -s tests -q
+      - run: npm test
+        working-directory: web
