@@ -163,7 +163,7 @@ class Handshake(Base):
                                            {"kind": "arrow", "from": "a", "to": "b", "label": "예"}]})
         st = add["structuredContent"]
         self.assertEqual(set(st["created"]), {"a", "b"})
-        self.assertRegex(add["content"][0]["text"], r'\[%s\] 상자 "A"  \(v\d+ · 라벨 v1\)' % re.escape(st["created"]["a"]), "board_add 결과 글에도 판")
+        self.assertRegex(add["content"][0]["text"], r'\[%s\] 상자 "A" @\(-?\d+,-?\d+ \d+×\d+\)  \(v\d+ · 라벨 v1\)' % re.escape(st["created"]["a"]), "board_add 결과 글에도 판")
         summary = m.ok("board_read", {})["content"][0]["text"]
         self.assertIn('"A" → "B" (라벨 "예")', summary)
         # unknown tool / method, and wrong arguments
@@ -423,10 +423,10 @@ class Flows(Base):
         """Edits using a version obtained by reading only the content text (without structuredContent). After a human edits only the label, conflict and
         the human's text is kept. Changing text without a base gives refused and the board is unchanged. Moving works without a base."""
         text = self.m.ok("board_read", {})["content"][0]["text"]
-        m = re.search(r"\[%s\] 상자 \"A\"  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
+        m = re.search(r"\[%s\] 상자 \"A\" @\(-?\d+,-?\d+ \d+×\d+\)  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
         self.assertIsNotNone(m, text)
         bv, lv = int(m.group(1)), int(m.group(2))
-        self.assertRegex(text, r"\[%s\] 연결: \"A\" → \"B\"  \(v\d+\)" % re.escape(self.arrow))
+        self.assertRegex(text, r"\[%s\] 연결: \"A\" → \"B\" @\(-?\d+,-?\d+ \d+×\d+\)  \(v\d+\)" % re.escape(self.arrow))
         lab = self.els()[self.a + "-label"]
         human = dict(lab, text="사람 글", originalText="사람 글", version=lab["version"] + 1, versionNonce=11)
         raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "h", "elements": [human]})
@@ -447,7 +447,7 @@ class Flows(Base):
         self.assertRegex(r["content"][0]["text"], r"고침  \(v\d+ · 라벨 v\d+\)")
         # works with the re-read version
         text = self.m.ok("board_read", {})["content"][0]["text"]
-        m = re.search(r"\[%s\] 상자 \"사람 글\"  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
+        m = re.search(r"\[%s\] 상자 \"사람 글\" @\(-?\d+,-?\d+ \d+×\d+\)  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
         r = self.m.ok("board_update", {"changes": [{"id": self.a, "base_version": int(m.group(1)), "label_base_version": int(m.group(2)),
                                                     "text": "에이전트 글"}]})
         self.assertEqual(r["structuredContent"]["results"][0]["status"], "ok")
@@ -558,6 +558,403 @@ def _strings(o):
             yield from _strings(v)
 
 
+def _ink(i, x, y, version=1, w=60, updated=1):
+    return {"id": "hs%03d" % i, "type": "freedraw", "x": x, "y": y, "width": w, "height": 20, "angle": 0, "isDeleted": False,
+            "points": [[0, 0], [w / 2, 10], [w, 20]], "pressures": [], "simulatePressure": True, "version": version,
+            "versionNonce": 1000 + i * 7 + version, "strokeColor": "#1e1e1e", "index": None, "updated": updated}
+
+
+class Wp1(Base):
+    """09 plan WP-1: positions in the summary, arrow heads / lines, refusing unknown fields, the board_wait settle window,
+    per-client caps + progress, and the agent cursor (placed outside the group, hidden when the MCP process ends)."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "러프"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", self.h, {"client": "hum1", "pointer": {"x": 0, "y": 0}})
+
+    def board(self):
+        return raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]
+
+    def put(self, els):
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": els})[0], 200)
+
+    def agent_pointer(self):
+        st, d = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/poll?since=0&client=watch&pver=-1&wait=0.1", self.h)
+        ag = [p for p in d.get("presence") or [] if p.get("agent")]
+        return next((p["pointer"] for p in ag if p.get("pointer")), None)   # an agent that left stays listed (pointer null) for up to 30 s
+
+    def test_heads_line_and_unknown_fields(self):
+        """Criterion 2: head none → no arrowheads, both → two; an unknown field (heads) is refused with the allowed list and nothing is written."""
+        r = self.m.ok("board_add", {"items": [{"kind": "box", "ref": "a", "label": "A"}, {"kind": "box", "ref": "b", "label": "B", "x": 300},
+                                              {"kind": "arrow", "ref": "n", "from": "a", "to": "b", "head": "none"},
+                                              {"kind": "arrow", "ref": "w", "from": "b", "to": "a", "head": "both"},
+                                              {"kind": "line", "ref": "l", "points": [[0, 200], [100, 260], [300, 200]]}]})
+        c = r["structuredContent"]["created"]
+        els = {e["id"]: e for e in self.board()["elements"]}
+        self.assertIsNone(els[c["n"]]["endArrowhead"])
+        self.assertIsNone(els[c["n"]]["startArrowhead"])
+        self.assertEqual((els[c["w"]]["startArrowhead"], els[c["w"]]["endArrowhead"]), ("arrow", "arrow"))
+        ln = els[c["l"]]
+        self.assertEqual((ln["type"], len(ln["points"]), ln["startBinding"], ln["endArrowhead"]), ("line", 3, None, None))
+        text = self.m.ok("board_read", {})["content"][0]["text"]
+        self.assertRegex(text, r'\[%s\] 연결: "A" — "B" @\(' % re.escape(c["n"]))
+        self.assertRegex(text, r'\[%s\] 연결: "B" ↔ "A" @\(' % re.escape(c["w"]))
+        seq = self.board()["seq"]
+        bad = self.m.tool("board_add", {"items": [{"kind": "box", "ref": "x", "label": "X"},
+                                                  {"kind": "arrow", "from": "x", "to": "x", "heads": "none"}]})
+        self.assertTrue(bad["isError"])
+        msg = bad["content"][0]["text"]
+        self.assertIn("heads", msg)
+        self.assertIn("head", msg.split("쓸 수 있는 칸:")[1])
+        self.assertEqual(self.board()["seq"], seq, "nothing was written")
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "arrow", "from": {"x": 0, "y": 0}, "to": {"x": 9, "y": 9}, "head": "up"}]})["isError"])
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "line", "points": [[0, 0]]}]})["isError"])
+        # r1: head:null is not "none" — refused instead of silently drawing the default arrowhead
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "arrow", "from": {"x": -30, "y": 100}, "to": {"x": 0, "y": 0}, "head": None}]})["isError"])
+        # r1: arrows do not bind to a line (new ref or existing id)
+        r = self.m.tool("board_add", {"items": [{"kind": "line", "ref": "l2", "points": [[0, 0], [50, 0]]}, {"kind": "arrow", "from": "l2", "to": {"x": 90, "y": 90}}]})
+        self.assertTrue(r["isError"])
+        self.assertIn("line", r["content"][0]["text"])
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "arrow", "from": c["l"], "to": {"x": 90, "y": 90}}]})["isError"])
+        self.assertEqual(self.board()["seq"], seq)
+
+    def test_wait_settles_and_folds_smoothing_echo(self):
+        """Criterion 3: 18 strokes at < 1 s intervals, each re-written once by smoothing → idle_ms 3000 returns once,
+        3 s after the last stroke, with one ink line and no resized / edited lines."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        done = []
+
+        def draw():
+            time.sleep(0.5)
+            for i in range(18):
+                self.put([_ink(i, 100 + (i % 6) * 70, 100 + (i // 6) * 60)])
+                time.sleep(0.15)
+                self.put([_ink(i, 100 + (i % 6) * 70, 100 + (i // 6) * 60, version=2, w=62)])   # smoothing re-write
+                last = time.time()
+                time.sleep(0.5)
+            done.append(last)
+        threading.Thread(target=draw, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "idle_ms": 3000, "timeout_s": 60}, timeout=90)
+        back = time.time()
+        self.assertTrue(done, "returned before the drawing ended")
+        self.assertGreaterEqual(back - done[0], 2.8)
+        text = r["content"][0]["text"]
+        self.assertIn("손글씨 획 18개가 늘었다 @(", text)
+        self.assertRegex(text.split("\n")[0], r"^길동 가 획 18 을 더함 @\(100,100 \d+×\d+\)$")
+        self.assertNotIn("크기", text)
+        self.assertNotIn("고침", text)
+        self.assertEqual(r["structuredContent"]["changes"][0]["count"], 18)
+        # idle 0: the first stroke wakes it; the smoothing echo of that stroke within 2 s does not wake the next wait
+        seq = r["structuredContent"]["seq"]
+
+        def one():
+            time.sleep(0.5)
+            self.put([_ink(50, 0, 600)])
+        threading.Thread(target=one, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 10})
+        self.assertIn("손글씨 획 1개가 늘었다", r["content"][0]["text"])
+        self.put([_ink(50, 0, 600, version=2, w=64)])
+        r = self.m.ok("board_wait", {"since_seq": r["structuredContent"]["seq"], "timeout_s": 2})
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+
+    def test_wait_kinds(self):
+        """kinds:["text"] ignores ink and returns on text."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def act():
+            time.sleep(0.4)
+            self.put([_ink(1, 0, 0)])
+            time.sleep(0.6)
+            self.put([{"id": "ht1", "type": "text", "x": 0, "y": 100, "width": 40, "height": 25, "angle": 0, "text": "메모",
+                       "originalText": "메모", "fontSize": 20, "fontFamily": 6, "isDeleted": False, "version": 1, "versionNonce": 5,
+                       "index": None, "containerId": None}])
+        threading.Thread(target=act, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "kinds": ["text"], "timeout_s": 10})
+        text = r["content"][0]["text"]
+        self.assertIn('"메모"', text)
+        self.assertNotIn("손글씨", text)
+        self.assertTrue(self.m.tool("board_wait", {"kinds": ["request"], "timeout_s": 1})["isError"])
+
+    def test_wait_ignores_job_events(self):
+        """WP-2 tab-render jobs publish 'job' events on /poll — they must not wake board_wait nor show up as human changes."""
+        out = subprocess.run([sys.executable, str(CLI), "agent", "add", self.sid, "--name", "Other", "--json"], env=self.env,
+                             capture_output=True, text=True).stdout
+        tok = json.loads(out)["token"]
+        time.sleep(1.2)   # the supervisor re-reads state.json
+        ah = {"Authorization": f"Bearer {tok}", "X-Whiteboard": "1", "Content-Type": "application/json"}
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def jobs():
+            for _ in range(3):
+                time.sleep(0.5)
+                st, _ = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs", ah, {"client": "ag-other", "kind": "render", "args": {}})
+                self.assertEqual(st, 201)
+        th = threading.Thread(target=jobs, daemon=True)
+        th.start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 4})
+        th.join()
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+        self.assertEqual(r["structuredContent"]["changes"], [])
+        # a human edit after the jobs still wakes it, and only that edit is reported
+        threading.Thread(target=lambda: (time.sleep(0.5), self.put([_ink(7, 0, 0)])), daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 10})
+        self.assertEqual([c["action"] for c in r["structuredContent"]["changes"]], ["손글씨"])
+
+    def test_wait_cap_env_and_progress(self):
+        """Criterion 4 (fast form): CERA_WAIT_MAX caps timeout_s; progress notifications every 20 s carry the client's token."""
+        m = self.mcp({**self.env, "CERA_WAIT_MAX": "2"})
+        m.init("codex-mcp-client")
+        t0 = time.time()
+        r = m.ok("board_wait", {"timeout_s": 600})
+        self.assertTrue(r["structuredContent"]["timeout"])
+        self.assertLess(time.time() - t0, 6)
+        m = self.m   # claude-code, no override
+        t0 = time.time()
+        m.n += 1
+        mid = m.n
+        m.send({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                "params": {"name": "board_wait", "arguments": {"timeout_s": 23}, "_meta": {"progressToken": "pt-1"}}})
+        got, deadline = [], time.time() + 60
+        while True:
+            msg = m.q.get(timeout=max(0.1, deadline - time.time()))
+            if msg.get("method") == "notifications/progress":
+                got.append((time.time() - t0, msg["params"]))
+            if msg.get("id") == mid:
+                break
+        self.assertTrue(msg["result"]["structuredContent"]["timeout"])
+        self.assertEqual(len(got), 1, got)
+        self.assertEqual(got[0][1]["progressToken"], "pt-1")
+        self.assertEqual(got[0][1]["total"], 23)
+
+    # ---- review r1 regressions (04_review_WP-1_neon_r1 · opus_r1)
+    def presence(self, client, name):
+        h = dict(self.h, **{"X-Tb-Name": urllib.parse.quote(name)})
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", h, {"client": client, "pointer": {"x": 0, "y": 0}})
+
+    def test_r1_replay_old_seq_uses_board_as_seen(self):
+        """neon: since_seq older than now compared with the current board → an added stroke showed as 'edited', a delete vanished."""
+        seq0 = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([_ink(1, 0, 0)])
+        r = self.m.ok("board_wait", {"since_seq": seq0, "timeout_s": 5})
+        self.assertIn("손글씨 획 1개가 늘었다", r["content"][0]["text"])
+        self.assertNotIn("고침", r["content"][0]["text"])
+        seq1 = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([dict(_ink(1, 0, 0), version=5, versionNonce=9, isDeleted=True)])
+        r = self.m.ok("board_wait", {"since_seq": seq1, "timeout_s": 5})
+        self.assertIn("를 지움", r["content"][0]["text"])
+        self.assertFalse(r["structuredContent"].get("timeout"))
+
+    def test_r2_human_moves_or_deletes_agent_box_after_replay_seq(self):
+        """opus r2: board_read → board_add → board_wait(since_seq=read's seq): a person moving the agent's box is 'moved'
+        (not 'added'), and deleting it is reported (not dropped). Same for board_update / board_delete writes."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        add = self.m.ok("board_add", {"items": [{"kind": "box", "ref": "a", "label": "A"}, {"kind": "box", "ref": "b", "label": "B", "x": 300}]})
+        a, b = add["structuredContent"]["created"]["a"], add["structuredContent"]["created"]["b"]
+        els = {e["id"]: e for e in self.board()["elements"]}
+        self.put([dict(els[a], x=els[a]["x"] + 200, version=els[a]["version"] + 1, versionNonce=77)])
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 5})
+        text = r["content"][0]["text"]
+        self.assertIn(f"[{a}] 상자 를 옮김", text)
+        self.assertNotIn("넣음", text)
+        self.assertNotIn("더함", text)
+        seq2 = r["structuredContent"]["seq"]
+        self.m.ok("board_update", {"changes": [{"id": b, "dx": 40}]})   # the agent's own patch
+        els = {e["id"]: e for e in self.board()["elements"]}
+        self.put([dict(els[b], isDeleted=True, version=els[b]["version"] + 1, versionNonce=78)])
+        r = self.m.ok("board_wait", {"since_seq": seq2, "timeout_s": 5})
+        self.assertFalse(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+        self.assertIn(f"[{b}] 상자 를 지움", r["content"][0]["text"])
+        self.assertNotIn("옮김", r["content"][0]["text"], "the agent's own dx is not reported as a person's move")
+
+    def test_r1_cap_while_drawing_is_flagged(self):
+        """neon: reaching the cap while the person is still drawing must not look like a settled sketch."""
+        m = self.mcp({**self.env, "CERA_WAIT_MAX": "3"})
+        m.init("codex-mcp-client")
+        seq = m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def draw():
+            for i in range(10):
+                self.put([_ink(300 + i, i * 40, 0)])
+                time.sleep(0.5)
+        th = threading.Thread(target=draw, daemon=True)
+        th.start()
+        t0 = time.time()
+        r = m.ok("board_wait", {"since_seq": seq, "idle_ms": 3000, "timeout_s": 600})
+        self.assertLess(time.time() - t0, 4.5)
+        th.join()
+        self.assertIs(r["structuredContent"].get("settled"), False)
+        self.assertIn("아직 그리는 중", r["content"][0]["text"])
+        self.assertIn(f"since_seq={r['structuredContent']['seq']}", r["content"][0]["text"])   # r2: says which seq to use
+
+    def test_r1_echo_by_element_clock_not_read_time(self):
+        """opus: stroke → 100 ms smoothing echo → reported → the agent thinks 3 s → next wait must not wake on the echo."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([_ink(60, 0, 600, updated=50_000)])
+        time.sleep(0.1)
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 5})
+        self.assertIn("손글씨 획 1개가 늘었다", r["content"][0]["text"])
+        self.put([_ink(60, 0, 600, version=2, w=64, updated=50_100)])
+        time.sleep(3)
+        r = self.m.ok("board_wait", {"since_seq": r["structuredContent"]["seq"], "timeout_s": 2})
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+
+    def test_r1_echo_needs_same_connection_and_place(self):
+        """neon: another connection with the same display name moving the stroke is a real change, not an echo."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([_ink(61, 0, 0, updated=70_000)])
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 5})
+        self.presence("hum2", "길동")
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum2", "elements": [_ink(61, 500, 0, version=2, updated=70_500)]})[0], 200)
+        r = self.m.ok("board_wait", {"since_seq": r["structuredContent"]["seq"], "timeout_s": 5})
+        self.assertIn("옮김", r["content"][0]["text"])
+
+    def test_r1_window_keeps_first_author_and_names_later_editor(self):
+        """neon: in the settle window the last editor replaced the author ('수진 added …'). Now 길동 added, 수진 edited after."""
+        self.presence("hum3", "수진")
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def act():
+            time.sleep(0.3)
+            self.put([_ink(62, 0, 0)])
+            time.sleep(0.5)
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                {"client": "hum3", "elements": [_ink(62, 300, 0, version=2, updated=99_000)]})
+        threading.Thread(target=act, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "idle_ms": 1500, "timeout_s": 10})
+        text = r["content"][0]["text"]
+        self.assertTrue(text.startswith("길동 가 획 1 을 더함"), text)
+        self.assertIn("뒤에 수진 가 고침", text)
+
+    def test_r1_other_agents_do_not_wake(self):
+        """neon: another agent's write (presence agent:true) is not a person's edit."""
+        out = subprocess.run([sys.executable, str(CLI), "agent", "add", self.sid, "--name", "Other", "--json"], env=self.env,
+                             capture_output=True, text=True).stdout
+        ah = {"Authorization": f"Bearer {json.loads(out)['token']}", "X-Whiteboard": "1", "Content-Type": "application/json"}
+        time.sleep(1.2)
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def act():
+            time.sleep(0.4)
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", ah, {"client": "otherbot1", "pointer": {"x": 1, "y": 1}})
+            time.sleep(0.3)
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", ah, {"client": "otherbot1", "elements": [_ink(63, 0, 0)]})
+        threading.Thread(target=act, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 3})
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+
+    def test_r1_cursor_cleared_on_close_during_wait_and_on_kill(self):
+        """opus: stdin closed while two board_waits run → cursor gone within 2 s (not after the joins). neon: SIGKILL → watchdog clears it."""
+        self.m.ok("board_add", {"items": [{"kind": "text", "text": "a"}], "at": {"x": 0, "y": 0}})
+        for k in (1, 2):
+            self.m.send({"jsonrpc": "2.0", "id": 900 + k, "method": "tools/call", "params": {"name": "board_wait", "arguments": {"timeout_s": 30}}})
+        time.sleep(1.0)
+        self.assertIsNotNone(self.agent_pointer())
+        self.m.p.stdin.close()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 6:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+        m = self.mcp()
+        m.init()
+        m.ok("board_add", {"items": [{"kind": "text", "text": "b"}], "at": {"x": 0, "y": 900}})
+        self.assertIsNotNone(self.agent_pointer())
+        m.p.kill()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 6:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_cursor_outside_group_and_cleared_on_exit(self):
+        """Criterion 5: after board_add the agent cursor sits 24 px outside the top-left of the group; it is gone within 2 s of the MCP process ending."""
+        r = self.m.ok("board_add", {"items": [{"kind": "box", "label": "A", "x": 0, "y": 0}], "at": {"x": 500, "y": 400}})
+        self.assertEqual(self.agent_pointer()["x"], 476)
+        self.assertEqual(self.agent_pointer()["y"], 376)
+        self.m.p.stdin.close()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 5:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+        # SIGTERM path
+        m = self.mcp()
+        m.init()
+        m.ok("board_add", {"items": [{"kind": "text", "text": "x"}], "at": {"x": 0, "y": 900}})
+        self.assertIsNotNone(self.agent_pointer())
+        m.p.terminate()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 5:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+
+
+class SlowPoll(Base):
+    """neon r1: a board server that answers /poll late must not push board_wait past the client's cap (HTTP timeout bounded by the deadline)."""
+
+    def test_stuck_poll_respects_cap(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if "/poll" in self.path:
+                    time.sleep(8)
+                body = json.dumps({"elements": [], "seq": 0, "epoch": "e1", "meta": {"title": "x"}, "events": []}).encode()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            m = self.mcp({**self.env, "CERA_URL": f"http://127.0.0.1:{srv.server_address[1]}", "CERA_TOKEN": "tb_ag_fake", "CERA_WAIT_MAX": "3"})
+            m.init("codex-mcp-client")
+            t0 = time.time()
+            r = m.ok("board_wait", {"board": "abcdefgh12", "timeout_s": 600}, timeout=30)
+            self.assertLess(time.time() - t0, 5.0)
+            self.assertTrue(r["structuredContent"]["timeout"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class WaitCap(unittest.TestCase):
+    """B7: per-client cap on one board_wait (criterion 4 runs live in the WP-1 report; 50 / 55 s is too slow for the suite)."""
+
+    def test_caps(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cera_tb_mcp_cap", HERE / "server" / "tb_mcp.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        old = os.environ.pop("CERA_WAIT_MAX", None)
+        try:
+            self.assertEqual(mod.wait_cap("claude-code"), 600)
+            self.assertEqual(mod.wait_cap("codex-mcp-client"), 50)
+            self.assertEqual(mod.wait_cap("antigravity"), 55)
+            self.assertEqual(mod.wait_cap(None), 55)
+            self.assertEqual(mod.wait_cap("claude-code-preview"), 55)   # r1: exact names only
+            self.assertEqual(mod.wait_cap("codex-other"), 55)
+            os.environ["CERA_WAIT_MAX"] = "90"
+            self.assertEqual(mod.wait_cap("codex-mcp-client"), 90)
+            os.environ["CERA_WAIT_MAX"] = "abc"
+            self.assertEqual(mod.wait_cap("codex-mcp-client"), 50)
+        finally:
+            os.environ.pop("CERA_WAIT_MAX", None)
+            if old is not None:
+                os.environ["CERA_WAIT_MAX"] = old
+
+
 class English(Base):
     """CERA_LANG=en: everything the server tells the model is English (board data the test wrote is excepted)."""
 
@@ -587,7 +984,7 @@ class English(Base):
         created = add["structuredContent"]["created"]
         add_text = add["content"][0]["text"]
         self.assertIn("Added 7 item(s)", add_text)
-        self.assertRegex(add_text, r'\[%s\] box "A"  \(v\d+ · label v1\)' % re.escape(created["a"]))
+        self.assertRegex(add_text, r'\[%s\] box "A" @\(-?\d+,-?\d+ \d+×\d+\)  \(v\d+ · label v1\)' % re.escape(created["a"]))
         summary = m.ok("board_read", {})["content"][0]["text"]
         self.assertIn("Board summary", summary)
         self.assertIn('"A" → "B" (label "yes")', summary)

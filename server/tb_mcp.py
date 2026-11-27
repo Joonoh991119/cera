@@ -43,7 +43,20 @@ from typing import Dict, List, Optional, Tuple
 HERE = Path(__file__).resolve().parent
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26")
 LATEST = PROTOCOLS[0]
-WAIT_MAX = 60
+WAIT_DEFAULT = 60             # board_wait timeout_s when omitted (still capped per client below)
+WAIT_SCHEMA_MAX = 600
+WAIT_CAPS = {"claude-code": 600, "codex-mcp-client": 50}   # exact clientInfo.name → most seconds one board_wait may block (Codex tool_timeout_sec default 60)
+WAIT_CAP_OTHER = 55          # anything else (Antigravity etc., names unconfirmed) — under a 60 s tool timeout
+WAIT_PROGRESS_S = 20         # notifications/progress interval while waiting, when the request carried a progressToken
+ECHO_S = 2.0                 # a stroke re-written by the same person this soon after it was reported is the smoothing echo, not news
+ITEM_FIELDS = {              # board_add: fields each kind accepts — anything else is refused (nothing is added)
+    "text": ("kind", "ref", "text", "x", "y", "size", "color", "width"),
+    "box": ("kind", "ref", "shape", "label", "text", "x", "y", "w", "h", "fill", "color"),
+    "arrow": ("kind", "ref", "from", "to", "label", "dashed", "color", "head"),
+    "line": ("kind", "ref", "points", "dashed", "color"),
+    "frame_page": ("kind", "title", "x", "y"),
+    "image": ("kind", "ref", "path", "w", "x", "y"),
+}
 IMAGE_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
              ".svg": "image/svg+xml"}
 MAX_FILE = 10 * 1024 * 1024   # server /files cap (data URL length)
@@ -110,6 +123,17 @@ class ToolError(Exception):
     """Tool execution error — returned as an isError:true result (so the model can fix it and call again)."""
 
 
+def wait_cap(client_name: Optional[str]) -> int:
+    """Most seconds one board_wait may block for this client (B7). CERA_WAIT_MAX overrides (1-3600)."""
+    env = _sibling("i18n").env("WAIT_MAX")
+    if env and env.strip():
+        try:
+            return int(min(3600, max(1, float(env))))
+        except ValueError:
+            log("CERA_WAIT_MAX is not a number:", env[:20])
+    return WAIT_CAPS.get((client_name or "").strip().lower(), WAIT_CAP_OTHER)   # exact names only: an unknown 'claude-code-x' gets 55
+
+
 def agent_name_for(client_name: Optional[str]) -> str:
     env = _sibling("i18n").env("AGENT_NAME")
     if env and env.strip():
@@ -122,6 +146,34 @@ def agent_name_for(client_name: Optional[str]) -> str:
     if n.startswith("antigravity") or n in ("agy",) or n.startswith("agy-") or n.startswith("agy "):
         return "Antigravity"
     return agents.clean_name(client_name) if client_name else "Agent"
+
+
+# Hides the agent cursor if this process dies without cleaning up (SIGKILL, crash): a tiny separate process reads one line per
+# board the cursor was shown on; when the pipe hits EOF without a "done" line, it posts pointer:null for each. Standard library only.
+_WATCHDOG = r"""
+import json, sys, urllib.parse, urllib.request
+boards = {}
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("done"):
+        sys.exit(0)
+    boards[(d["base"], d["bid"])] = d
+for d in boards.values():
+    h = {"X-Whiteboard": "1", "Content-Type": "application/json"}
+    h.update(d.get("extra") or {})
+    if d.get("token"):
+        h["Authorization"] = "Bearer " + d["token"]
+    local = (urllib.parse.urlsplit(d["base"]).hostname or "") in ("127.0.0.1", "localhost", "::1")
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({})) if local else urllib.request.build_opener()
+    body = json.dumps({"client": d["client"], "pointer": None, "button": "up"}).encode()
+    try:
+        op.open(urllib.request.Request(d["base"] + "/api/whiteboard/boards/" + d["bid"] + "/presence", data=body, headers=h, method="POST"), timeout=2).read()
+    except Exception:
+        pass
+"""
 
 
 # ------------------------------------------------------------------ HTTP
@@ -187,6 +239,11 @@ class Session:
         self.tokens: Dict[str, dict] = {}         # sid → the token entry I created (id, expires_at)
         self.remote = None
         self.remote_error = None
+        self.pointed: Dict[Tuple[str, str], "Conn"] = {}   # (server, board) → Conn where this agent's cursor is shown
+        self.recent_ink: Dict[str, tuple] = {}   # stroke id → (connection id, element as reported added, when)
+        self.seen: Dict[Tuple[str, str], List[tuple]] = {}   # (server, board) → [(epoch, seq, {id: element})] — the board as last seen at a seq
+        self.closed = False
+        self.watchdog = None
         env = _sibling("i18n").env   # CERA_* first, then the old TEMPBOARD_* names
         url, tok = env("URL"), env("TOKEN") or None
         cid = os.environ.get("CF_ACCESS_CLIENT_ID") or env("CF_CLIENT_ID")
@@ -265,7 +322,77 @@ class Session:
             except Exception as e:   # noqa: BLE001
                 log("revoke failed", sid, e)
 
+    def remember(self, base_url: str, bid: str, epoch: str, seq, els):
+        """Keep the board as seen at seq (board_read / board_wait results) so a later board_wait since_seq=seq compares correctly."""
+        if not isinstance(seq, int):
+            return
+        snap = dict(els) if isinstance(els, dict) else {e["id"]: e for e in els or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        with self.lock:
+            lst = [x for x in self.seen.get((base_url, bid), []) if x[1] != seq][-3:]
+            lst.append((epoch, seq, snap))
+            self.seen[(base_url, bid)] = lst
+
+    def note_own(self, base_url: str, bid: str, els):
+        """This agent's own writes never come back from /poll — put them into every remembered snapshot of the board,
+        so a later board_wait(since_seq) sees a person moving / deleting them as a move / delete, not as 'added' / nothing."""
+        with self.lock:
+            for _, _, snap in self.seen.get((base_url, bid), []):
+                for e in els:
+                    if isinstance(e, dict) and isinstance(e.get("id"), str):
+                        snap[e["id"]] = copy.deepcopy(e)
+
+    def forget(self, base_url: str, bid: str):
+        with self.lock:
+            self.seen.pop((base_url, bid), None)
+
+    def seen_at(self, base_url: str, bid: str, epoch: str, seq: int) -> Optional[dict]:
+        with self.lock:
+            for ep, sq, snap in self.seen.get((base_url, bid), []):
+                if sq == seq and ep == epoch:
+                    return dict(snap)
+        return None
+
+    def pointed_at(self, c: "Conn", bid: str):
+        """Record a board where this agent's cursor is shown, and tell the watchdog (started on first use)."""
+        with self.lock:
+            first = (c.base, bid) not in self.pointed
+            self.pointed[(c.base, bid)] = c
+            if not first or self.closed:
+                return
+            try:
+                if self.watchdog is None:
+                    self.watchdog = subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG], stdin=subprocess.PIPE,
+                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                line = json.dumps({"base": c.base, "bid": bid, "client": c.client, "token": c.token, "extra": c.extra})
+                self.watchdog.stdin.write((line + "\n").encode())
+                self.watchdog.stdin.flush()
+            except (OSError, ValueError) as e:
+                log("cursor watchdog unavailable:", e)
+
+    def clear_pointers(self):
+        """Hide this agent's cursor on every board it pointed at (before the token is revoked) — so it does not cover the drawing."""
+        with self.lock:
+            items = list(self.pointed.items())
+            self.pointed.clear()
+        for (_, bid), c in items:
+            try:
+                c.req("POST", f"/api/whiteboard/boards/{bid}/presence", {"client": c.client, "pointer": None, "button": "up"}, timeout=1.5)
+            except Exception as e:   # noqa: BLE001 — leaving anyway
+                log("pointer clear failed", bid, e)
+
     def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        self.clear_pointers()
+        wd, self.watchdog = self.watchdog, None
+        if wd is not None:   # cleaned up normally — the watchdog leaves without doing anything
+            try:
+                wd.stdin.write(b'{"done": true}\n')
+                wd.stdin.close()
+            except (OSError, ValueError):
+                pass
         for sid in list(self.tokens):
             self.drop(sid)
 
@@ -346,6 +473,8 @@ def _kind_word(e) -> str:
         return T("라벨", "label") if e.get("containerId") else T("글", "text")
     if t == "arrow":
         return T("연결", "arrow")
+    if t == "line":
+        return T("선", "line")
     if t == "freedraw":
         return T("손글씨 획", "ink stroke")
     if t == "image":
@@ -353,6 +482,26 @@ def _kind_word(e) -> str:
     if t == "frame":
         return T("장", "page") if cd.get("tbPage") is not None else T("틀", "frame")
     return str(t)
+
+
+WAIT_KINDS = ("ink", "text", "shape", "any")
+
+
+def _wait_kind(e) -> str:
+    t = e.get("type")
+    return "ink" if t == "freedraw" else ("text" if t == "text" else "shape")
+
+
+def _is_echo(prev: dict, el: dict) -> bool:
+    """el re-writes stroke prev without moving it, within ECHO_S by the element's own 'updated' clock (the app's smoothing pass)."""
+    if not (isinstance(prev, dict) and el.get("type") == "freedraw" and not el.get("isDeleted")):
+        return False
+    if el.get("x") != prev.get("x") or el.get("y") != prev.get("y"):
+        return False
+    u0, u1 = prev.get("updated"), el.get("updated")
+    if not all(isinstance(u, (int, float)) and not isinstance(u, bool) for u in (u0, u1)):
+        return False
+    return 0 <= u1 - u0 <= ECHO_S * 1000
 
 
 def _txt(e) -> str:
@@ -576,6 +725,7 @@ class Tools:
         if ids is not None and (not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or len(ids) > 2000):
             raise ToolError(T("ids 는 글 목록(2000개까지)", "ids must be a list of strings (up to 2000)"))
         meta = {"board": bid, "title": (d.get("meta") or {}).get("title"), "seq": d.get("seq"), "epoch": d.get("epoch")}
+        self.s.remember(c.base, bid, d.get("epoch") or "", d.get("seq"), els)
         by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
         if fmt == "elements" or ids:
             text, st = ak.describe(els, page)
@@ -639,14 +789,31 @@ class Tools:
         return head + "\n" + "\n".join(lines), st
 
     # ---- Writing
+    def _own(self, c: Conn, bid: str, ids, written=()):
+        """Record what this agent just wrote (see Session.note_own). written: elements sent as is; ids: patched — read back their state."""
+        if not self.s.seen.get((c.base, bid)):
+            return
+        els = list(written)
+        ids = [i for i in ids if i not in {e.get("id") for e in els}]
+        if ids:
+            try:
+                cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
+                els += [cur[i] for i in ids if i in cur]
+            except ToolError:
+                self.s.forget(c.base, bid)   # unknown state → board_wait falls back to comparing with the current board (and says so)
+                return
+        self.s.note_own(c.base, bid, els)
+
     def _pointer(self, c: Conn, bid: str, items):
+        """Show where the agent worked — just outside the top-left of the group (24 px), not over the drawing."""
         bb = ak.scene_bbox(items)
         if not bb:
             return
         try:
             c.req("POST", f"/api/whiteboard/boards/{bid}/presence",
-                  {"client": c.client, "pointer": {"x": (bb[0] + bb[2]) / 2, "y": (bb[1] + bb[3]) / 2, "tool": "pointer"},
+                  {"client": c.client, "pointer": {"x": bb[0] - 24, "y": bb[1] - 24, "tool": "pointer"},
                    "button": "up", "selected": {}}, timeout=5)
+            self.s.pointed_at(c, bid)
         except ToolError:
             pass
 
@@ -654,7 +821,16 @@ class Tools:
         items_in = a.get("items")
         if not isinstance(items_in, list) or not items_in or len(items_in) > 300:
             raise ToolError(T("items 는 1–300개 목록", "items must be a list of 1-300"))
-        for it in items_in:
+        for n, it in enumerate(items_in):
+            if isinstance(it, dict) and it.get("kind") in ITEM_FIELDS:
+                extra = sorted(str(k) for k in it if k not in ITEM_FIELDS[it["kind"]])
+                if extra:   # a wrong field name must not be silently ignored (e.g. heads:"none" drew an arrowhead)
+                    raise ToolError(T(f"items[{n}] ({it['kind']}) 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: "
+                                      f"{', '.join(ITEM_FIELDS[it['kind']])}. 아무것도 넣지 않았다.",
+                                      f"items[{n}] ({it['kind']}) has unknown field(s): {', '.join(extra)} — allowed: "
+                                      f"{', '.join(ITEM_FIELDS[it['kind']])}. Nothing was added."))
+                if it["kind"] == "arrow" and "head" in it and it["head"] not in ak.ARROW_HEADS:   # head:null is refused too (it is not "none")
+                    raise ToolError(T(f'items[{n}].head 는 "end" · "start" · "both" · "none"', f'items[{n}].head must be "end", "start", "both" or "none"'))
             if isinstance(it, dict) and it.get("kind") in ("math", "mermaid"):
                 raise ToolError(T("수식(math) · mermaid 흐름도는 아직 MCP 로 넣을 수 없다 — 사람에게 화면의 수식 · 흐름도 도구"
                                   "(메뉴 '글로 흐름도 만들기')를 쓰라고 안내하거나, 상자 · 화살표로 그린다.",
@@ -721,17 +897,28 @@ class Tools:
                     v = it.get(side)
                     if isinstance(v, dict):
                         ends.append((_num(v.get("x"), side + ".x"), _num(v.get("y"), side + ".y")))
-                    elif isinstance(v, str) and v in refs:
-                        ends.append(refs[v])
-                    elif isinstance(v, str) and v in live:
-                        ends.append(_copy(live[v]))   # existing element — use a copy only to compute the route; the connection is made via patch(add_bound)
+                    elif isinstance(v, str) and (v in refs or v in live):
+                        tgt = refs[v] if v in refs else live[v]
+                        if tgt.get("type") in ("arrow", "line", "freedraw"):   # arrows bind only to shapes, text, images, frames
+                            raise ToolError(T(f"items[{n}].{side} = {v!r} 는 {tgt.get('type')} — 화살표는 선 · 화살표 · 손글씨에 붙지 않는다. {{x, y}} 로 준다",
+                                              f"items[{n}].{side} = {v!r} is a {tgt.get('type')} — arrows do not attach to lines, arrows or ink; give {{x, y}}"))
+                        ends.append(tgt if v in refs else _copy(tgt))   # existing element — use a copy only to compute the route; the connection is made via patch(add_bound)
                     else:
                         raise ToolError(T(f"items[{n}].{side} = {v!r} — 이번 items 의 ref 나 보드의 요소 id, 또는 {{x, y}}",
                                       f"items[{n}].{side} = {v!r} — must be a ref from this items list, an element id on the board, or {{x, y}}"))
-                made = ak.make_arrow(ends[0], ends[1], it.get("label"), color=color, dashed=bool(it.get("dashed")), by=by, frame_id=fid)
+                sh, eh = ak.ARROW_HEADS[it.get("head") or "end"]
+                made = ak.make_arrow(ends[0], ends[1], it.get("label"), color=color, dashed=bool(it.get("dashed")), by=by, frame_id=fid,
+                                     start_head=sh, end_head=eh)
                 for e in ends:
                     if isinstance(e, dict) and e["id"] in live:
                         touched_existing.setdefault(e["id"], []).append(made[0]["id"])
+            elif kind == "line":
+                pts = it.get("points")
+                if not isinstance(pts, list) or not 2 <= len(pts) <= 500 or \
+                        not all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts):
+                    raise ToolError(T(f"items[{n}].points 는 [x, y] 점 2–500개(묶음 안 자리)", f"items[{n}].points must be 2-500 [x, y] points (positions within the group)"))
+                made = ak.make_line([(_num(p[0], f"items[{n}].points"), _num(p[1], f"items[{n}].points")) for p in pts],
+                                    color=color, dashed=bool(it.get("dashed")), by=by, frame_id=fid)
             elif kind == "image":
                 if not it.get("path"):
                     raise ToolError(T("image 는 path(이 컴퓨터의 그림 파일)", "image needs path (an image file on this computer)"))
@@ -741,12 +928,12 @@ class Tools:
                 files.append({"id": file_id, "dataURL": url, "mimeType": mime})
                 made = [ak.make_image(file_id, w, h, x, y, by=by, frame_id=fid)]
             else:
-                raise ToolError(T(f"items[{n}].kind = {kind!r} — text · box · arrow · frame_page · image",
-                                  f"items[{n}].kind = {kind!r} — must be text, box, arrow, frame_page or image"))
+                raise ToolError(T(f"items[{n}].kind = {kind!r} — text · box · arrow · line · frame_page · image",
+                                  f"items[{n}].kind = {kind!r} — must be text, box, arrow, line, frame_page or image"))
             if it.get("ref"):
                 refs[str(it["ref"])] = made[0]
             new.extend(made)
-            if not has_xy and kind != "arrow":
+            if not has_xy and kind not in ("arrow", "line"):
                 bb = ak.scene_bbox(made)
                 if bb:
                     cx = bb[2] + 80
@@ -785,6 +972,7 @@ class Tools:
                         fix.append({"id": e["id"], "set": sets})
                 if fix:
                     c.ok("POST", f"/api/whiteboard/boards/{bid}/patch", {"client": c.client, "changes": fix})
+        self._own(c, bid, list(touched_existing) + [e["id"] for e in new if e.get("type") == "arrow"] if touched_existing else [], new)
         self._pointer(c, bid, new)
         text, st = ak.describe(new + [live[i] for i in touched_existing])
         created = {k: v["id"] for k, v in refs.items()}
@@ -838,6 +1026,7 @@ class Tools:
         by_id = {e["id"]: e for e in _live(els) if isinstance(e.get("id"), str)}
         labels = _labels(els)
         results, touched = [], []
+        own_ids: List[str] = []
         for n, ch in enumerate(changes):
             if not isinstance(ch, dict) or not isinstance(ch.get("id"), str):
                 raise ToolError(T(f"changes[{n}] 에 id 가 없다", f"changes[{n}] has no id"))
@@ -963,10 +1152,13 @@ class Tools:
                 continue
             if new_label is not None:
                 c.ok("POST", f"/api/whiteboard/boards/{bid}/elements", {"client": c.client, "elements": [new_label]})
+            own_ids += list(sets) + ([new_label["id"]] if new_label is not None else [])
             vers = {x["id"]: x["version"] for x in r.get("applied", [])}   # entries not changed (check only) keep their version
             results.append({"id": eid, "status": "ok", "version": vers.get(target["id"], target.get("version")),
                             "label_version": vers.get(lab["id"], lab.get("version")) if lab is not None else (new_label or {}).get("version")})
             touched.append(cur)
+        if own_ids:
+            self._own(c, bid, own_ids)
         if touched:
             self._pointer(c, bid, touched)
         lines = []
@@ -1031,6 +1223,7 @@ class Tools:
         labels = _labels(els)
         results = []
         n_del = n_clean = 0
+        own_del: List[str] = []
         for n, it in enumerate(ids):
             if isinstance(it, str):
                 it = {"id": it}
@@ -1088,6 +1281,7 @@ class Tools:
                 results.append(res)
                 continue
             dels = sorted(i for i, v in changes.items() if v["set"].get("isDeleted"))
+            own_del += list(changes)
             n_del += len(dels)
             n_clean += len(changes) - len(dels)
             results.append({"id": eid, "status": "ok", "deleted": dels,
@@ -1114,102 +1308,253 @@ class Tools:
                                f'[{r["id"]}] not deleted — the label is deleted with it, so also pass label_base_version (the M of "label vM" at the end of the line).'))
             else:
                 lines.append(T(f'[{r["id"]}] 실패: {r.get("rejected") or r.get("missing")}', f'[{r["id"]}] failed: {r.get("rejected") or r.get("missing")}'))
+        if own_del:
+            self._own(c, bid, own_del)
         if n_clean:
             lines.append(T(f"이어진 {n_clean}개의 바인딩 · 장 연결을 정리했다.", f"Cleaned up {n_clean} connected binding(s) / page link(s)."))
         deleted = [i for r in results if r["status"] == "ok" for i in r["deleted"]]
         return "\n".join(lines), {"board": bid, "results": results, "deleted": deleted,
                                   "missing": [r["id"] for r in results if r["status"] == "missing"]}
 
-    def board_wait(self, a, cancelled=lambda: False):
+    def board_wait(self, a, cancelled=lambda: False, progress=None):
+        """Wait for people's edits. idle_ms > 0: after the first change keep collecting until nobody changed anything for idle_ms
+        (a person drawing 18 strokes wakes the agent once). kinds filters what counts (ink · text · shape · any).
+        Other agents' writes and non-board events (tab-render jobs) never count.
+        progress(done, total, message): called every WAIT_PROGRESS_S from a ticker thread (when the client sent a progressToken)."""
+        t0 = time.time()   # the cap counts from the call, not from after the connection is set up (the client's timer started already)
+        cap = wait_cap(self.s.client_name)
+        timeout = min(float(cap), _num(a.get("timeout_s", min(WAIT_DEFAULT, cap)), "timeout_s", 1, 3600))
+        idle = _num(a.get("idle_ms", 0), "idle_ms", 0, 30000) / 1000.0
+        kinds = a.get("kinds", ["any"])
+        if isinstance(kinds, str):
+            kinds = [kinds]
+        if not isinstance(kinds, list) or not kinds or any(k not in WAIT_KINDS for k in kinds):
+            raise ToolError(T(f"kinds 는 {' · '.join(WAIT_KINDS)} 중에서 고른 목록", f"kinds must be a list chosen from {', '.join(WAIT_KINDS)}"))
+        kinds = set(kinds)
+        deadline = t0 + timeout
+        stop = threading.Event()
+        if progress is not None:
+            def tick():
+                n = 1
+                while not stop.wait(max(0.0, t0 + n * WAIT_PROGRESS_S - time.time())):
+                    if time.time() >= deadline:
+                        return
+                    try:
+                        progress(n * WAIT_PROGRESS_S, int(timeout), T("보드를 지켜보는 중", "watching the board"))
+                    except Exception:   # noqa: BLE001 — progress is best effort
+                        return
+                    n += 1
+            threading.Thread(target=tick, daemon=True).start()
+        try:
+            return self._wait(a, kinds, idle, timeout, deadline, cancelled)
+        finally:
+            stop.set()
+
+    def _wait(self, a, kinds, idle, timeout, deadline, cancelled):
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
-        timeout = min(float(WAIT_MAX), _num(a.get("timeout_s", WAIT_MAX), "timeout_s", 1, 3600))
-        d = _fetch(c, bid)
-        base = {e["id"]: e for e in d.get("elements") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        d = c.ok("GET", f"/api/whiteboard/boards/{bid}", timeout=max(1.0, min(30.0, deadline - time.time())))   # bounded by the cap too
+        if not isinstance(d, dict):
+            raise ToolError(T("보드를 읽지 못했다", "Could not read the board"))
+        now_seq = int(d.get("seq") or 0)
         epoch = d.get("epoch") or ""
         since = a.get("since_seq")
-        since = int(_num(since, "since_seq", 0, 1e15)) if since is not None else int(d.get("seq") or 0)
-        from_old = since < int(d.get("seq") or 0)
-        pver, names = -1, {}
-        deadline = time.time() + timeout
+        since = int(_num(since, "since_seq", 0, 1e15)) if since is not None else now_seq
+        base = None
+        from_old = False
+        if since < now_seq:   # replaying from an older seq: compare with the board as this session saw it at that seq
+            base = self.s.seen_at(c.base, bid, epoch, since)
+            from_old = base is None
+        if base is None:
+            base = {e["id"]: e for e in d.get("elements") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        pver, names, agents_ = -1, {}, set()
+        acc: Dict[str, list] = {}   # id → [latest element, first who, other editors]
+        other: List[str] = []
+        last_change = 0.0
         while True:
-            left = deadline - time.time()
-            if left <= 0 or cancelled():
-                return T(f"{int(timeout)}초 동안 바뀐 것이 없다.", f"Nothing changed for {int(timeout)} seconds."), {"board": bid, "seq": since, "epoch": epoch, "changes": [], "timeout": True}
-            q = urllib.parse.urlencode({"since": since, "client": c.client, "pver": pver, "epoch": epoch, "wait": round(min(left, 20), 2)})
-            r = c.ok("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=min(left, 20) + 10)
+            now = time.time()
+            left = deadline - now
+            if cancelled():
+                left = 0
+            if acc or other:
+                if idle <= 0 or now - last_change >= idle or left <= 0:
+                    res = self._wait_result(c, bid, since, epoch, base, acc, other, from_old, unsettled=idle > 0 and now - last_change < idle)
+                    if res is not None:
+                        return res
+                    acc, other = {}, []   # only things that cancel out (added then deleted) — keep waiting
+                    continue
+                span = min(left, idle - (now - last_change))
+            elif left <= 0:
+                self.s.remember(c.base, bid, epoch, since, base)
+                return T(f"{int(timeout)}초 동안 바뀐 것이 없다.", f"Nothing changed for {int(timeout)} seconds."), \
+                    {"board": bid, "seq": since, "epoch": epoch, "changes": [], "timeout": True}
+            else:
+                span = left
+            span = max(0.05, min(span, 20))
+            q = urllib.parse.urlencode({"since": since, "client": c.client, "pver": pver, "epoch": epoch, "wait": round(span, 2)})
+            try:   # the HTTP timeout never runs past the deadline by more than a moment (a stuck server must not break the client's tool timeout)
+                r = c.ok("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=max(0.5, min(span + 10, deadline - time.time() + 1.0)))
+            except ToolError:
+                if time.time() < deadline - 0.5:
+                    raise
+                r = {}
             for p in r.get("presence") or []:
                 names[p.get("client")] = p.get("user")
+                if p.get("agent"):
+                    agents_.add(p.get("client"))
             pver = r.get("pver", pver)
             if r.get("reset"):
                 d2 = _fetch(c, bid)
                 text, st = ak.describe(d2.get("elements") or [])
                 return T("보드를 처음부터 다시 받았다(서버가 다시 켜졌거나 기록이 밀렸다).\n", "Re-fetched the board from scratch (the server restarted or the log was pushed out).\n") + text, \
                     {"board": bid, "seq": d2.get("seq"), "epoch": d2.get("epoch"), "reset": True, "changes": []}
-            evs = [e for e in r.get("events") or [] if e.get("event") in ("elements", "meta", "file")]
             since = int(r.get("seq", since))
-            if not evs:
-                continue
-            last: Dict[str, Tuple[dict, str]] = {}
-            other = []
-            for ev in evs:
-                if ev["event"] == "elements":
+            now = time.time()
+            for ev in r.get("events") or []:   # only board events: elements / meta. 'job' (tab render queue) and anything else is ignored
+                if ev.get("event") == "elements":
                     data = ev.get("data") or {}
-                    who = names.get(data.get("from")) or T("누군가", "someone")
+                    frm = data.get("from")
+                    who = names.get(frm) or T("누군가", "someone")
                     for el in data.get("elements") or []:
-                        if isinstance(el, dict) and isinstance(el.get("id"), str):
-                            last[el["id"]] = (el, who)
-                elif ev["event"] == "meta":
+                        if not isinstance(el, dict) or not isinstance(el.get("id"), str):
+                            continue
+                        eid = el["id"]
+                        if frm in agents_ or (isinstance(frm, str) and frm.startswith("ag-")):
+                            if eid not in acc:
+                                base[eid] = el   # another agent's write — not a person's edit
+                            elif not el.get("isDeleted"):
+                                acc[eid][0] = el
+                            continue
+                        if eid not in acc and self._echo(eid, el, frm):
+                            base[eid] = el   # smoothing re-write of a stroke already reported — not news
+                            continue
+                        if "any" not in kinds and _wait_kind(el) not in kinds:
+                            if eid not in acc:
+                                base[eid] = el
+                            continue
+                        ent = acc.get(eid)
+                        if ent is None:
+                            acc[eid] = [el, who, frm, []]
+                        else:
+                            prev = ent[0]
+                            if frm != ent[2] and who not in ent[3] and who != ent[1]:
+                                ent[3].append(who)
+                            ent[0] = el
+                            if frm == ent[2] and _is_echo(prev, el):
+                                continue   # the smoothing pass inside the window does not extend it
+                        last_change = now
+                elif ev.get("event") == "meta" and "any" in kinds:
                     other.append(T(f'보드 이름이 "{(ev.get("data") or {}).get("title")}" 로 바뀌었다',
                                    f'The board title changed to "{(ev.get("data") or {}).get("title")}"'))
-            out, lines = [], []
-            for eid, (el, who) in last.items():
-                old = base.get(eid)
-                kind = _kind_word(el)
-                if el.get("isDeleted"):
-                    if old is None or old.get("isDeleted"):
-                        continue
-                    act = "지움"
-                    line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""} 를 지움',
-                             f'{who} deleted [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""}')
-                elif old is None or old.get("isDeleted"):
-                    act = "추가"
-                    line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""} 를 넣음',
-                             f'{who} added [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""}')
-                elif el.get("type") == "text" and _txt(el) != _txt(old):
-                    act = "글 고침"
-                    tgt = T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])') if el.get("containerId") else ""
-                    line = T(f'{who} 가 [{eid}] {kind}{tgt} 를 "{_txt(old)}" → "{_txt(el)}" 로 고침',
-                             f'{who} changed [{eid}] {kind}{tgt} from "{_txt(old)}" to "{_txt(el)}"')
-                elif any(el.get(k) != old.get(k) for k in ("x", "y")):
-                    act = "옮김"
-                    line = T(f'{who} 가 [{eid}] {kind} 를 옮김', f'{who} moved [{eid}] {kind}')
-                elif any(el.get(k) != old.get(k) for k in ("width", "height")):
-                    act = "크기"
-                    line = T(f'{who} 가 [{eid}] {kind} 크기를 바꿈', f'{who} resized [{eid}] {kind}')
-                else:
-                    act = "고침"
-                    line = T(f'{who} 가 [{eid}] {kind} 를 고침', f'{who} edited [{eid}] {kind}')
-                    if from_old and _txt(el):   # if since_seq is old, it is already in the comparison baseline (the current board) — show the current text
-                        line += T(f' — 지금 "{_txt(el)}"', f' — now "{_txt(el)}"')
-                        if el.get("containerId"):
-                            line += T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])')
-                if el.get("type") == "freedraw" and act == "추가":
-                    continue   # handwriting strokes are counted together below
-                lines.append(line)
-                out.append({"id": eid, "type": el.get("type"), "action": ACT_WORD(act), "by": who,
-                            "text": _txt(el) if el.get("type") == "text" else None})
-            strokes = [eid for eid, (el, _) in last.items() if el.get("type") == "freedraw" and not el.get("isDeleted") and eid not in base]
-            if strokes:
-                lines.append(T(f"손글씨 획 {len(strokes)}개가 늘었다(글로 읽을 수 없음)", f"{len(strokes)} ink stroke(s) were added (not readable as text)"))
-                out.append({"action": ACT_WORD("손글씨"), "count": len(strokes), "ids": strokes})
-            lines += other
-            if not lines:   # only my own changes or things already known — keep waiting
-                for eid, (el, _) in last.items():
-                    base[eid] = el
-                continue
-            return "\n".join(lines) + T(f"\n(seq {since} — 이어서 기다리려면 since_seq 로 준다)", f"\n(seq {since} — to keep waiting, pass it as since_seq)"), \
-                {"board": bid, "seq": since, "epoch": epoch, "changes": out}
+                    last_change = now
+
+    def _echo(self, eid: str, el: dict, frm) -> bool:
+        """The stroke was reported as added (same connection), and this re-write is the app's smoothing pass:
+        same position, at most ECHO_S later by the element's own clock (not when we happen to read it)."""
+        rec = self.s.recent_ink.get(eid)
+        return bool(rec and rec[0] == frm and _is_echo(rec[1], el))
+
+    def _wait_result(self, c, bid, since, epoch, base, acc, other, from_old, unsettled=False):
+        """Lines for the collected changes, or None when nothing is left to report (base is then updated)."""
+        out, lines = [], []
+        per: Dict[str, Dict[str, int]] = {}   # who → counts for the first line
+        boxes = []
+        strokes: List[str] = []
+        stroke_els: List[dict] = []
+        for eid, (el, who, frm, others) in acc.items():
+            old = base.get(eid)
+            kind = _kind_word(el)
+            cnt = per.setdefault(who, {})
+            also = T(f" (뒤에 {', '.join(others)} 가 고침)", f" (then edited by {', '.join(others)})") if others else ""
+            if el.get("isDeleted"):
+                if old is None or old.get("isDeleted"):
+                    continue
+                act = "지움"
+                line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""} 를 지움',
+                         f'{who} deleted [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""}')
+                boxes.append(old)
+            elif old is None or old.get("isDeleted"):
+                act = "추가"
+                line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""} 를 넣음',
+                         f'{who} added [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""}') + also
+                boxes.append(el)
+            elif el.get("type") == "text" and _txt(el) != _txt(old):
+                act = "글 고침"
+                tgt = T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])') if el.get("containerId") else ""
+                line = T(f'{who} 가 [{eid}] {kind}{tgt} 를 "{_txt(old)}" → "{_txt(el)}" 로 고침',
+                         f'{who} changed [{eid}] {kind}{tgt} from "{_txt(old)}" to "{_txt(el)}"') + also
+                boxes.append(el)
+            elif any(el.get(k) != old.get(k) for k in ("x", "y")):
+                act = "옮김"
+                line = T(f'{who} 가 [{eid}] {kind} 를 옮김', f'{who} moved [{eid}] {kind}') + also
+                boxes.append(el)
+            elif any(el.get(k) != old.get(k) for k in ("width", "height")):
+                act = "크기"
+                line = T(f'{who} 가 [{eid}] {kind} 크기를 바꿈', f'{who} resized [{eid}] {kind}') + also
+                boxes.append(el)
+            else:
+                act = "고침"
+                line = T(f'{who} 가 [{eid}] {kind} 를 고침', f'{who} edited [{eid}] {kind}') + also
+                if from_old and _txt(el):   # no record of the board at since_seq: compared with the current board — show the current text
+                    line += T(f' — 지금 "{_txt(el)}"', f' — now "{_txt(el)}"')
+                    if el.get("containerId"):
+                        line += T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])')
+                boxes.append(el)
+            if act == "추가":
+                k = _wait_kind(el)
+                cnt[k] = cnt.get(k, 0) + 1
+            else:
+                cnt[act] = cnt.get(act, 0) + 1
+            if el.get("type") == "freedraw" and act == "추가" and not others:
+                strokes.append(eid)
+                stroke_els.append(el)
+                continue   # handwriting strokes are counted together below
+            lines.append(line)
+            out.append({"id": eid, "type": el.get("type"), "action": ACT_WORD(act), "by": who,
+                        "text": _txt(el) if el.get("type") == "text" else None})
+        for eid, ent in acc.items():
+            base[eid] = ent[0]
+        if strokes:
+            bb = ak.scene_bbox(stroke_els)
+            lines.append(T(f"손글씨 획 {len(strokes)}개가 늘었다 {ak.at_text(bb)} — 글로 읽을 수 없음, board_snapshot 으로 본다",
+                           f"{len(strokes)} ink stroke(s) were added {ak.at_text(bb)} — not readable as text, look with board_snapshot"))
+            out.append({"action": ACT_WORD("손글씨"), "count": len(strokes), "ids": strokes, "bbox": ak._fmt_box(bb) if bb else None})
+            now = time.time()
+            for eid in strokes:
+                self.s.recent_ink[eid] = (acc[eid][2], acc[eid][0], now)
+            self.s.recent_ink = {k: v for k, v in self.s.recent_ink.items() if now - v[2] <= 600}
+        lines += other
+        if not lines:
+            return None
+        if from_old:
+            lines.insert(0, T("(since_seq 때의 보드를 이 세션이 모른다 — 지금 보드와 비교했다. 그사이 바뀐 것은 '고침' 으로 보일 수 있다)",
+                              "(this session has no record of the board at since_seq — compared with the current board; changes in between may show as 'edited')"))
+        heads = []
+        for who, cnt in per.items():
+            add = [(T("획", "ink"), cnt.get("ink", 0)), (T("글", "text"), cnt.get("text", 0)), (T("도형", "shape"), cnt.get("shape", 0))]
+            add_s = " · ".join(f"{w} {n}" for w, n in add if n)
+            edit_n = sum(v for k, v in cnt.items() if k not in ("ink", "text", "shape", "지움"))
+            parts = []
+            if add_s:
+                parts.append(T(f"{add_s} 을 더함", f"added {add_s}"))
+            if edit_n:
+                parts.append(T(f"{edit_n}개 고침", f"edited {edit_n}"))
+            if cnt.get("지움"):
+                parts.append(T(f"{cnt['지움']}개 지움", f"deleted {cnt['지움']}"))
+            if parts:
+                heads.append(T(f"{who} 가 ", f"{who}: ") + ", ".join(parts))
+        bb = ak.scene_bbox(boxes)
+        summary = " / ".join(heads) + (" " + ak.at_text(bb) if bb else "")
+        tail = T(f"\n(seq {since} — 이어서 기다리려면 since_seq 로 준다)", f"\n(seq {since} — to keep waiting, pass it as since_seq)")
+        if unsettled:
+            tail = T(f"\n(시간 상한에 닿았다 — 아직 그리는 중일 수 있다. 이어서 기다리려면 since_seq={since} 로 — 위 변경은 다시 알리지 않는다)",
+                     f"\n(the time cap was reached — the person may still be drawing; to keep waiting pass since_seq={since} — the changes above are not repeated)") + tail
+        self.s.remember(c.base, bid, epoch, since, base)
+        st = {"board": bid, "seq": since, "epoch": epoch, "changes": out, "summary": summary or None,
+              "bbox": ak._fmt_box(bb) if bb else None}
+        if unsettled:
+            st["settled"] = False
+        return (summary + "\n" if heads else "") + "\n".join(lines) + tail, st
 
     def board_export(self, a):
         c, sid = self.s.conn(a.get("site"))
@@ -1262,6 +1607,8 @@ class Tools:
         if res.get("bbox") and mode == "merge":
             b = res["bbox"]
             self._pointer(c, res["board"], [{"type": "rectangle", "x": b[0], "y": b[1], "width": b[2] - b[0], "height": b[3] - b[1]}])
+        if res.get("board"):
+            self.s.forget(c.base, res["board"])   # imported ids are not listed here — fall back to comparing with the current board
         st = {k: res.get(k) for k in ("board", "added", "skipped", "files", "missing_files", "bbox", "kind")}
         st["mode"] = mode
         return importers.summary(res) + ".", st
@@ -1274,14 +1621,19 @@ def _schemas():
     board = {"type": "string", "description": T("보드 id(board_list). 사이트의 첫 보드면 생략", "Board id (board_list). Omit for the site's first board")}
     item = {
         "type": "object",
-        "description": T("kind 별 칸 — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(또는 text),x?,y?,w?,h?,"
-                         "fill?,color?} · arrow{from,to(ref|요소 id|{x,y}),label?,dashed?,color?} · frame_page{title?}(새 장 — 뒤 항목은 그 안) · "
+        "description": T("kind 별 칸(그 밖의 칸은 거절) — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(또는 text),x?,y?,w?,h?,"
+                         "fill?,color?} · arrow{from,to(ref|요소 id|{x,y}),label?,dashed?,color?,head?(end 기본|start|both|none — none 은 방향 없는 선)} · "
+                         "line{points:[[x,y],…],dashed?,color?}(붙지 않는 꺾은선) · frame_page{title?}(새 장 — 뒤 항목은 그 안) · "
                          "image{path,w?,x?,y?}. x/y 는 묶음 안 자리(생략하면 왼→오로 늘어놓음). math · mermaid 는 아직 안 된다",
-                         "Fields by kind — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(or text),x?,y?,w?,h?,"
-                         "fill?,color?} · arrow{from,to(ref|element id|{x,y}),label?,dashed?,color?} · frame_page{title?} (a new page — the items after it go inside) · "
+                         "Fields by kind (other fields are refused) — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(or text),x?,y?,w?,h?,"
+                         "fill?,color?} · arrow{from,to(ref|element id|{x,y}),label?,dashed?,color?,head?(end default|start|both|none — none is an undirected edge)} · "
+                         "line{points:[[x,y],…],dashed?,color?} (an unbound polyline) · frame_page{title?} (a new page — the items after it go inside) · "
                          "image{path,w?,x?,y?}. x/y is the position within the group (if omitted, laid out left to right). math and mermaid are not supported yet"),
         "properties": {
-            "kind": {"type": "string", "enum": ["text", "box", "arrow", "frame_page", "image", "math", "mermaid"]},
+            "kind": {"type": "string", "enum": ["text", "box", "arrow", "line", "frame_page", "image", "math", "mermaid"]},
+            "head": {"type": "string", "enum": list(ak.ARROW_HEADS), "description": T("arrow 화살촉(기본 end)", "arrow heads (default end)")},
+            "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                       "minItems": 2, "maxItems": 500, "description": T("line 의 점(묶음 안 자리)", "line points (positions within the group)")},
             "ref": {"type": "string", "description": T("이번 호출 안에서 화살표가 가리킬 이름", "A name arrows can point to within this call")},
             "text": {"type": "string"}, "label": {"type": "string"}, "title": {"type": "string"},
             "shape": {"type": "string", "enum": ["rectangle", "ellipse", "diamond"]},
@@ -1393,12 +1745,18 @@ def tool_defs(remote: bool) -> List[dict]:
                             "label_base_version": {"type": "integer", "description": T("라벨이 있으면 줄 끝 (라벨 vM) 의 M", "If there is a label, the M of (label vM) at the end of the line")}}}}}, ["ids"]),
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
         {"name": "board_wait", "title": T("사람이 고칠 때까지 기다리기", "Wait until a person edits"),
-         "description": T("사람이 보드를 고칠 때까지 기다렸다가(최대 60초) 무엇이 바뀌었는지 한 줄씩 돌려준다. since_seq 는 board_read · "
-                          "앞 board_wait 의 seq(없으면 지금부터).",
-                          "Waits (up to 60 seconds) until a person edits the board, then returns what changed, one line each. since_seq is the seq from board_read or "
-                          "the previous board_wait (if omitted, from now)."),
+         "description": T("사람이 보드를 고칠 때까지 기다렸다가 무엇이 바뀌었는지 돌려준다 — 첫 줄은 요약(누가 무엇을 더함 @(x,y w×h)), 이어서 한 줄씩. "
+                          "since_seq 는 board_read · 앞 board_wait 의 seq(없으면 지금부터). idle_ms: 첫 변경 뒤 이만큼 아무도 안 고칠 때까지 모아서 "
+                          "한 번에 돌려준다(사람이 다 그릴 때까지 — 3000 권장). kinds: 셀 변경(ink · text · shape · any). "
+                          "timeout_s 상한은 클라이언트마다: Claude Code 600 · Codex 50 · 그 밖 55(CERA_WAIT_MAX 로 바꿈). 시간이 다 되면 timeout:true.",
+                          "Waits until a person edits the board, then returns what changed — the first line is a summary (who added what @(x,y w×h)), then one line each. "
+                          "since_seq is the seq from board_read or the previous board_wait (if omitted, from now). idle_ms: after the first change, keep collecting until "
+                          "nobody edits for this long, then return once (until the person finishes drawing — 3000 recommended). kinds: which changes count (ink, text, shape, any). "
+                          "The timeout_s cap depends on the client: Claude Code 600, Codex 50, others 55 (override with CERA_WAIT_MAX). When time runs out: timeout:true."),
          "inputSchema": obj({"site": SITE, "board": BOARD, "since_seq": {"type": "integer"},
-                             "timeout_s": {"type": "integer", "default": 60, "maximum": 60}}), "annotations": ro},
+                             "timeout_s": {"type": "integer", "default": WAIT_DEFAULT, "minimum": 1, "maximum": WAIT_SCHEMA_MAX},
+                             "idle_ms": {"type": "integer", "default": 0, "minimum": 0, "maximum": 30000},
+                             "kinds": {"type": "array", "items": {"type": "string", "enum": list(WAIT_KINDS)}, "minItems": 1}}), "annotations": ro},
         {"name": "board_import", "title": T("파일 가져오기", "Import a file"),
          "description": T("이 컴퓨터의 .excalidraw · .excalidrawlib · 그림(png · jpg · gif · webp · svg) 파일을 보드에 넣는다(50 MB 까지, "
                           "URL 은 안 된다). mode:\"merge\"(기본)는 지금 보드에 합친다 — id 를 새로 매기고 기존 그림 오른쪽(at)에 놓는다. "
@@ -1492,7 +1850,13 @@ class Server:
                 raise ToolError(T(f"모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: {', '.join(schema['properties']) or '없음'}",
                                   f"Unknown field(s): {', '.join(extra)} — allowed fields: {', '.join(schema['properties']) or 'none'}"))
             if name == "board_wait":
-                text, st = fn(args, cancelled=lambda: mid in self.cancelled)
+                tok = (params.get("_meta") or {}).get("progressToken") if isinstance(params.get("_meta"), dict) else None
+                prog = None
+                if isinstance(tok, (str, int)) and not isinstance(tok, bool):
+                    def prog(done, total, message, tok=tok):
+                        self.send({"jsonrpc": "2.0", "method": "notifications/progress",
+                                   "params": {"progressToken": tok, "progress": done, "total": total, "message": message}})
+                text, st = fn(args, cancelled=lambda: mid in self.cancelled, progress=prog)
             else:
                 text, st = fn(args)
             res = cap_result(text, st)
@@ -1558,7 +1922,8 @@ class Server:
                     self.handle(m)
                 continue
             self.handle(msg)
-        for t in self.threads:   # stdin closed — briefly wait for calls in progress
+        self.s.clear_pointers()   # stdin closed = the client is leaving: hide the cursor now, not after the joins below
+        for t in self.threads:   # briefly wait for calls in progress
             t.join(timeout=2)
 
 
