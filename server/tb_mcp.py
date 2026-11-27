@@ -25,6 +25,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import signal
@@ -63,6 +64,24 @@ MAX_FILE = 10 * 1024 * 1024   # server /files cap (data URL length)
 ELEMENTS_BYTES = 45_000        # cap on element JSON per board_read(elements) call — beyond it, continue reading with offset
 READ_LIMIT = 120              # board_read default line / element count — so summary text + structured fit within MAX_RESPONSE
 MAX_RESPONSE = 60_000          # cap in bytes on a tool response (text + structured) — stays within the Claude Code default MCP output cap (25k tokens) even when filled with Korean (3 bytes · about 1 token per character)
+SNAP_EDGE = 1024               # board_snapshot default longest side (256-1568)
+SNAP_LETTER_PX = 56           # scale so a typical letter is about this tall (B4), within max_edge
+SNAP_TAB_WAIT = 6.0           # render:"auto" waits this long for a person's tab before the server raster
+SNAP_TAB_WAIT_FORCED = 15.0   # render:"tab" (the job itself expires after 20 s)
+SNAP_KEEP = 50                # snapshots kept per site in $CERA_HOME/snapshots
+SNAP_LINES = 80               # summary lines in a snapshot / selection result
+SNAP_RASTER_S = 4.0           # time budget of one server raster (pure Python holds the GIL)
+IMAGE_MAX_BYTES = 2_600_000   # PNG bytes in one image block (base64 ≈ 3.5 MB, under Claude's 5 MB per-image limit)
+_SNAP_LOCK = threading.Lock()
+
+
+class ImageResult:
+    """A tool's second return value when the result carries a PNG: content = [text, image], **no structuredContent** (Codex drops
+    content[] when structuredContent is present — openai/codex#10334) and the 60 KB text cap is not applied to the image block."""
+
+    def __init__(self, png: bytes):
+        self.png = png
+
 _INSTRUCTIONS_KO = (
     "Cera 는 여러 사람이 같이 보는 화이트보드다. 보드는 지금 다른 사람이 보고 있을 수 있다.\n"
     "- 지우기(board_delete) · 공개 터널 열기(site_open tunnel:\"cloudflared\") 전에는 사용자에게 먼저 묻는다.\n"
@@ -113,6 +132,7 @@ def T(ko, en):
 ak = _sibling("agentkit")
 agents = _sibling("agents")
 importers = _sibling("importers")   # board_import
+rs = _sibling("raster")   # board_snapshot (server raster)
 
 
 def log(*a):
@@ -433,6 +453,10 @@ def _num(v, name, lo=-1e7, hi=1e7):
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= v <= hi):
         raise ToolError(T(f"{name} 는 {lo}..{hi} 사이의 수", f"{name} must be a number between {lo} and {hi}"))
     return float(v)
+
+
+def _clip(v, n: int) -> str:
+    return ak._clip(str(v), n)
 
 
 def _str(v, name, n=4000, allow_empty=False):
@@ -1556,6 +1580,307 @@ class Tools:
             st["settled"] = False
         return (summary + "\n" if heads else "") + "\n".join(lines) + tail, st
 
+    # ---- Seeing (WP-3): snapshot · selection
+    def _selections(self, c: Conn, bid: str, who) -> List[dict]:
+        """People's last selections, newest first. who: an exact name (or connection id) wins; only without one, a part of a name."""
+        rows = (c.ok("GET", f"/api/whiteboard/boards/{bid}/selection") or {}).get("selections") or []
+        rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("ids"), list) and isinstance(r.get("user"), str)]
+        if who is not None:
+            w = _str(who, "who", 80).strip()
+            exact = [r for r in rows if r["user"].lower() == w.lower() or r.get("client") == w]
+            rows = exact or [r for r in rows if w.lower() in r["user"].lower()]
+        return rows
+
+    def _humans(self, c: Conn, bid: str, d: dict) -> List[dict]:
+        """People's edit tabs on the board now (agents and view-only excluded) — a render job is only worth sending if one is there."""
+        q = urllib.parse.urlencode({"since": d.get("seq") or 0, "epoch": d.get("epoch") or "", "client": c.client, "pver": -1, "wait": 0.1})
+        try:
+            code, r = c.req("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=3)
+        except ToolError:
+            return []
+        if code != 200 or not isinstance(r, dict):
+            return []
+        return [p for p in r.get("presence") or [] if isinstance(p, dict) and not p.get("agent") and p.get("role") == "edit"]
+
+    def _tab_render(self, c: Conn, bid: str, args: dict, deadline: float, cancelled) -> Tuple[Optional[dict], str]:
+        """Render job for a person's tab (WP-2). Every request is bounded by `deadline` (a read timeout is a miss, not an error).
+        -> (data with png bytes, "") or (None, why). The PNG must be complete (CRC-checked IHDR), within max_edge and IMAGE_MAX_BYTES."""
+        def left():
+            return deadline - time.time()
+        try:
+            code, r = c.req("POST", f"/api/whiteboard/boards/{bid}/jobs", {"kind": "render", "args": args}, timeout=max(0.5, min(5.0, left())))
+            if code not in (200, 201) or not isinstance(r, dict) or not r.get("jid"):
+                msg = (r or {}).get("error") if isinstance(r, dict) else r
+                return None, T(f"작업을 만들지 못함(HTTP {code}: {str(msg)[:120]})", f"could not create the job (HTTP {code}: {str(msg)[:120]})")
+            jid, j = r["jid"], None
+            while left() > 0.2 and not cancelled():
+                w = max(0.0, min(left() - 0.3, 20.0))
+                code, j = c.req("GET", f"/api/whiteboard/boards/{bid}/jobs/{jid}?wait={w:.2f}", timeout=max(0.5, left() + 0.5))
+                if code != 200 or not isinstance(j, dict) or j.get("state") in ("done", "failed", "expired"):
+                    break
+        except ToolError as e:
+            return None, T(f"탭 렌더 요청이 끊김({str(e)[:120]})", f"the tab render request failed ({str(e)[:120]})")
+        if not isinstance(j, dict) or j.get("state") != "done":
+            st = j.get("state") if isinstance(j, dict) else "-"
+            err = j.get("error") if isinstance(j, dict) else None
+            return None, T(f"탭이 제시간에 그리지 못함({st}{': ' + str(err)[:160] if err else ''})",
+                           f"no tab drew it in time ({st}{': ' + str(err)[:160] if err else ''})")
+        data = j.get("data") or {}
+        try:
+            png = base64.b64decode(data.get("png") or "", validate=True)
+        except (ValueError, TypeError):
+            png = b""
+        size = rs.png_size(png)
+        if not size:
+            return None, T("탭 결과가 온전한 PNG 가 아님", "the tab's result is not a complete PNG")
+        if max(size) > args["max_edge"] or len(png) > IMAGE_MAX_BYTES:
+            return None, T(f"탭 그림이 상한을 넘음({size[0]}×{size[1]} px · {len(png) // 1024} KB)",
+                           f"the tab's picture is over the cap ({size[0]}×{size[1]} px · {len(png) // 1024} KB)")
+        try:
+            s, x0, y0 = float(data.get("scale")), float(data.get("x0")), float(data.get("y0"))
+        except (TypeError, ValueError):
+            return None, T("탭 결과에 좌표가 없음", "the tab's result has no coordinates")
+        if not all(math.isfinite(v) for v in (s, x0, y0)) or s <= 0:
+            return None, T("탭 결과의 좌표가 틀림", "the tab's result has bad coordinates")
+        return {"png": png, "width": size[0], "height": size[1], "scale": s, "x0": x0, "y0": y0, "tag": data.get("tag"),
+                "missing_files": data.get("missing_files") or [], "by": ((j.get("claimer") or {}).get("user"))}, ""
+
+    def _save_snapshot(self, sid: Optional[str], c: Conn, bid: str, png: bytes) -> Path:
+        """$CERA_HOME/snapshots/<site>-<board>-<n>.png, 0600, created with O_EXCL (another MCP process cannot get the same name);
+        only the newest SNAP_KEEP per site are kept (by n)."""
+        d = self.s.ctx.HOME / "snapshots"
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+        site = sid or ("remote-" + hashlib.sha256(c.base.encode()).hexdigest()[:8])
+        board = bid if re.fullmatch(r"[A-Za-z0-9_]{1,64}", bid) else "b" + hashlib.sha256(bid.encode()).hexdigest()[:12]
+        pat = re.compile(re.escape(site) + r"-[A-Za-z0-9_]{1,64}-(\d+)\.png$")
+
+        def numbered():
+            return sorted(((int(m.group(1)), q) for q in d.glob(f"{site}-*.png") for m in [pat.match(q.name)] if m), key=lambda t: t[0])
+        with _SNAP_LOCK:
+            n = 1 + max([k for k, _ in numbered()] or [0])
+            for _ in range(1000):
+                p = d / f"{site}-{board}-{n}.png"
+                try:
+                    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    break
+                except FileExistsError:
+                    n += 1
+            else:
+                raise ToolError(T("스냅샷 파일 이름을 정하지 못했다", "Could not choose a snapshot file name"))
+            with os.fdopen(fd, "wb") as f:
+                f.write(png)
+            os.chmod(p, 0o600)
+            for _, old in numbered()[:-SNAP_KEEP]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        return p
+
+    def _raster(self, picked, frame, region, max_edge, want, pad, mono, cancelled) -> Tuple[dict, str]:
+        """Server raster within the time budget and the byte cap: on a timeout one retry at a smaller size, then an error. -> (out, note)."""
+        note, edge, budget = "", max_edge, SNAP_RASTER_S
+        for attempt in range(6):
+            try:
+                out = rs.render(picked, max_edge=edge, scale=want, pad=pad, mono=mono, frame=frame, crop=region, budget_s=budget,
+                                cancelled=cancelled)
+            except rs.RasterTimeout as e:
+                if cancelled() or attempt or edge <= 256:
+                    raise ToolError(T(f"서버 래스터가 너무 오래 걸린다({e}) — ids · region 으로 좁힌다",
+                                      f"The server raster takes too long ({e}) — narrow with ids / region"))
+                edge, want, budget = max(256, min(512, edge // 2)), None, SNAP_RASTER_S * 0.75
+                note = T(f"시간이 걸려 {edge}px 로 다시 그림", f"redrawn at {edge} px (took too long)")
+                continue
+            except ValueError as e:
+                raise ToolError(T(f"그리지 못했다: {e}", f"Could not draw: {e}"))
+            if len(out["png"]) <= IMAGE_MAX_BYTES:
+                return out, note
+            if edge <= 256:
+                raise ToolError(T("그림이 너무 크다 — ids · region 으로 좁힌다", "The picture is too large — narrow with ids / region"))
+            edge = max(256, int(edge * 0.7))
+            note = T(f"용량 상한 때문에 {edge}px 로 줄임", f"reduced to {edge} px for the size cap")
+        raise ToolError(T("그림을 상한 안에 넣지 못했다", "Could not fit the picture under the cap"))
+
+    def board_snapshot(self, a, cancelled=lambda: False):
+        c, sid = self.s.conn(a.get("site"))
+        bid = self.s.board_id(c, sid, a.get("board"))
+        chosen = [k for k in ("ids", "selection", "region", "page") if a.get(k) not in (None, False)]
+        if len(chosen) > 1:
+            raise ToolError(T("ids · selection · region · page 중 하나만 준다", "Give only one of ids, selection, region, page"))
+        if a.get("who") is not None and not a.get("selection"):
+            raise ToolError(T("who 는 selection:true 와 함께 쓴다", "who goes with selection:true"))
+        max_edge = int(_num(a.get("max_edge", SNAP_EDGE), "max_edge", 256, 1568))
+        pad = _num(a.get("pad", 16), "pad", 0, 200)
+        mono = a.get("mono", True)
+        if not isinstance(mono, bool):
+            raise ToolError(T("mono 는 true/false", "mono must be true/false"))
+        mode = a.get("render", "auto")
+        if mode not in ("auto", "tab", "server"):
+            raise ToolError(T('render 는 "auto" · "tab" · "server"', 'render must be "auto", "tab" or "server"'))
+        ids, region, page_k, who_line = None, None, None, ""
+        if a.get("ids") is not None:
+            ids = a["ids"]
+            if not isinstance(ids, list) or not ids or len(ids) > 2000 or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in ids):
+                raise ToolError(T("ids 는 글 목록(1–2000개, 각 200자까지)", "ids must be a list of strings (1-2000, each up to 200 characters)"))
+        elif a.get("selection"):
+            rows = self._selections(c, bid, a.get("who"))
+            users = sorted({r["user"] for r in rows})
+            if a.get("who") is not None and len(users) > 1:
+                raise ToolError(T("who 가 여러 사람과 맞는다: ", "who matches several people: ") + ", ".join(_clip(u, 40) for u in users[:10]))
+            ids = [i for i in (rows[0]["ids"] if rows else []) if isinstance(i, str) and 0 < len(i) <= 200][:2000]
+            if not ids:
+                raise ToolError(T("최근 60초 안에 고른 것이 없다" + (f"(who={_clip(str(a.get('who')), 40)})" if a.get("who") else "") +
+                                  " — 사람에게 고르게 하거나 ids · region 을 준다",
+                                  "Nothing was selected in the last 60 s" + (f" (who={_clip(str(a.get('who')), 40)})" if a.get("who") else "") +
+                                  " — ask the person to select, or give ids / region"))
+            who_line = T(f'{_clip(rows[0]["user"], 40)} 가 고른 것({len(ids)}개, {rows[0].get("age_s")}초 전)',
+                         f'selected by {_clip(rows[0]["user"], 40)} ({len(ids)}, {rows[0].get("age_s")} s ago)')
+        elif a.get("region") is not None:
+            r = a["region"]
+            if not isinstance(r, dict):
+                raise ToolError(T("region 은 {x,y,w,h}", "region must be {x,y,w,h}"))
+            region = (_num(r.get("x"), "region.x"), _num(r.get("y"), "region.y"), _num(r.get("w"), "region.w", 1e-6), _num(r.get("h"), "region.h", 1e-6))
+        elif a.get("page") is not None:
+            page_k = _num(a["page"], "page", 1, 10000)
+
+        def scene(d):
+            els = d.get("elements") or []
+            frame = None
+            if page_k is not None:
+                frame = next((e for e in _live(els) if rs.is_page(e) and float(e["customData"]["tbPage"]) == page_k), None)
+                if frame is None:
+                    raise ToolError(T(f"장 {int(page_k)} 이 없다(board_read 의 [장 n])", f"There is no page {int(page_k)} (see [page n] in board_read)"))
+            picked, missing = rs.pick(els, ids=ids, region=region, frame=frame)
+            return els, frame, picked, missing
+        d = _fetch(c, bid)
+        els, frame, picked, missing = scene(d)
+        if not picked:
+            raise ToolError(T("그릴 것이 없다" + (f" — 보드에 없는 id {len(missing)}개" if missing else ""),
+                              "Nothing to draw" + (f" — {len(missing)} id(s) not on the board" if missing else "")))
+        ch = rs.char_height(picked)
+        want = min(4.0, max(0.25, SNAP_LETTER_PX / ch)) if ch else None
+        out, why, renderer, notes = None, "", "server", []
+        if mode != "server":
+            humans = self._humans(c, bid, d)
+            if humans:
+                deadline = time.time() + (SNAP_TAB_WAIT if mode == "auto" else SNAP_TAB_WAIT_FORCED)
+                job = {"max_edge": max_edge, "mono": mono, "pad": pad}
+                if want:
+                    job["scale"] = want
+                if ids is not None:
+                    job["ids"] = ids
+                elif region is not None:
+                    job["region"] = {"x": region[0], "y": region[1], "w": region[2], "h": region[3]}
+                elif frame is not None:
+                    job["page"] = frame["id"]
+                out, why = self._tab_render(c, bid, job, deadline, cancelled)
+                if out is None and why.startswith(("탭 그림이 상한", "the tab's picture is over")):   # too big: once more, smaller
+                    if deadline - time.time() > 1.0:
+                        job["max_edge"] = max(256, int(max_edge * 0.6))
+                        job.pop("scale", None)
+                        out, why2 = self._tab_render(c, bid, job, deadline, cancelled)
+                        why = why2 or why
+                if out is not None and out.get("tag") != rs.scene_tag(picked):
+                    # the tab drew a different scene (someone edited in between, or the tab is behind): read the board again once
+                    try:
+                        d2 = _fetch(c, bid)
+                        els2, frame2, picked2, missing2 = scene(d2)
+                    except ToolError:
+                        picked2 = []
+                    if picked2 and out.get("tag") == rs.scene_tag(picked2):
+                        els, frame, picked, missing = els2, frame2, picked2, missing2
+                    else:
+                        out, why = None, T("탭이 그린 장면이 보드와 달랐다(그 사이 고침)", "the tab drew a different scene than the board (edited meanwhile)")
+                if out is not None:
+                    renderer = "tab"
+            else:
+                why = T("열린 사람 편집 탭이 없음", "no person's edit tab is open")
+            if out is None and mode == "tab":
+                raise ToolError(T(f"탭 렌더 실패: {why} — render:\"server\" 로 서버 래스터를 쓸 수 있다",
+                                  f"Tab render failed: {why} — render:\"server\" uses the server raster"))
+        if cancelled():
+            raise ToolError(T("취소됨", "Cancelled"))
+        if out is None:
+            out, note = self._raster(picked, frame, region, max_edge, want, pad, mono, cancelled)
+            if note:
+                notes.append(note)
+        path = self._save_snapshot(sid, c, bid, out["png"])
+        s, x0, y0 = out["scale"], out["x0"], out["y0"]
+        view = (x0, y0, out["width"] / s, out["height"] / s)   # the board rectangle the picture shows
+        shown = [e for e in picked if (lambda b: b is not None and rs._overlaps(b, view))(rs.element_box(e))]
+        lines = [T(f"스냅샷 renderer: {renderer}", f"Snapshot renderer: {renderer}") +
+                 (T(" (사람 화면과 같은 그림" + (f", {_clip(out['by'], 40)} 의 탭" if out.get("by") else "") + ")",
+                    " (same picture as people see" + (f", {_clip(out['by'], 40)}'s tab" if out.get("by") else "") + ")") if renderer == "tab"
+                  else T(" (표준 라이브러리 래스터 — 글은 회색 막대, 글 내용은 아래 줄의 \"…\" 를 위치로 짝짓는다)",
+                         " (standard-library raster — text is drawn as gray bars; pair the \"…\" lines below by position)")),
+                 T(f"파일: {path}  — 그림이 안 보이면 이 경로를 그림 보기 도구로 연다(Claude Read · Codex view_image)",
+                   f"File: {path}  — if no image is shown, open this path with an image viewing tool (Claude Read, Codex view_image)"),
+                 T(f"그림 {out['width']}×{out['height']} px · 보이는 보드 범위 {ak.at_text((view[0], view[1], view[0] + view[2], view[1] + view[3]))} · "
+                   f"보드 = (x0 + px/s, y0 + py/s) = ({x0:.1f} + px/{s:.4g}, {y0:.1f} + py/{s:.4g})",
+                   f"Image {out['width']}×{out['height']} px · board area shown {ak.at_text((view[0], view[1], view[0] + view[2], view[1] + view[3]))} · "
+                   f"board = (x0 + px/s, y0 + py/s) = ({x0:.1f} + px/{s:.4g}, {y0:.1f} + py/{s:.4g})"),
+                 T(f"담긴 요소 {len(shown)}개", f"{len(shown)} element(s) in it") + (f" · {who_line}" if who_line else "") +
+                 (T(f" · 보드에 없는 id {len(missing)}개: ", f" · {len(missing)} id(s) not on the board: ") +
+                  ", ".join(_clip(i, 40) for i in missing[:5]) + (" …" if len(missing) > 5 else "") if missing else "")]
+        if why and renderer == "server":
+            lines.append(T(f"탭 대신 서버로 그림: {why}", f"Drawn by the server instead of a tab: {why}"))
+        lines += notes
+        if out.get("missing_files"):
+            lines.append(T(f"탭에 아직 없는 그림 파일 {len(out['missing_files'])}개는 빠졌다", f"{len(out['missing_files'])} image file(s) not yet in the tab were left out"))
+        text, _ = ak.describe(shown)
+        by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
+        body = annotate(text.split("\n"), by_id, _labels(els))
+        if len(body) > SNAP_LINES:
+            body = body[:SNAP_LINES] + [T(f"… {len(body) - SNAP_LINES}줄 더(board_read ids 로)", f"… {len(body) - SNAP_LINES} more line(s) (board_read with ids)")]
+        lines.append(T("담긴 것(보드 좌표 @(x,y w×h), 그림 밖으로 걸친 것은 일부만 보임):", "What it holds (board coordinates @(x,y w×h); items crossing the edge are partly shown):"))
+        lines.extend(body)
+        return "\n".join(lines), ImageResult(out["png"])
+
+    def board_selection(self, a):
+        c, sid = self.s.conn(a.get("site"))
+        bid = self.s.board_id(c, sid, a.get("board"))
+        rows = self._selections(c, bid, a.get("who"))
+        if not rows:
+            return (T("고른 것 없음(최근 60초)", "Nothing selected (last 60 s)") + (f" — who={_clip(str(a.get('who')), 40)}" if a.get("who") else ""),
+                    {"board": bid, "selections": []})
+        els = (_fetch(c, bid).get("elements") or [])
+        live = {e["id"]: e for e in _live(els) if isinstance(e.get("id"), str)}
+        by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
+        pages = sorted((e for e in live.values() if rs.is_page(e)), key=lambda e: float(e["customData"]["tbPage"]))
+        out, lines = [], []
+        for r in rows:
+            want = [i for i in r["ids"] if isinstance(i, str)]
+            picked, _ = rs.pick(els, ids=want)
+            gone = [i for i in want if i not in live]
+            bb = ak.scene_bbox(picked)
+            page = None
+            if bb:
+                cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+                for p in pages:
+                    pb = ak.element_bbox(p)
+                    if pb and pb[0] <= cx <= pb[2] and pb[1] <= cy <= pb[3]:
+                        k = float(p["customData"]["tbPage"])
+                        page = int(k) if k.is_integer() else k
+                        break
+            row = {"user": r["user"], "ids": [i for i in want if i in live], "bbox": list(ak._fmt_box(bb)) if bb else None,
+                   "page": page, "age_s": r.get("age_s"), "current": bool(r.get("current"))}
+            out.append(row)
+            head = T(f'{_clip(row["user"], 40)}: {len(row["ids"])}개 {ak.at_text(bb)}', f'{_clip(row["user"], 40)}: {len(row["ids"])} element(s) {ak.at_text(bb)}') + \
+                (T(f" · 장 {page}", f" · page {page}") if page is not None else "") + \
+                T(f" · {row['age_s']}초 전" + (" (지금도 고른 상태)" if row["current"] else ""),
+                  f" · {row['age_s']} s ago" + (" (still selected)" if row["current"] else ""))
+            if gone:
+                head += T(f" · 그 뒤 지워진 것 {len(gone)}개", f" · {len(gone)} deleted since")
+            lines.append(head)
+            text, _ = ak.describe(picked)
+            body = [ln for ln in annotate(text.split("\n"), by_id, _labels(els))[1:] if ln.strip()]
+            lines.extend("  " + ln for ln in body[:SNAP_LINES])
+        return "\n".join(lines), {"board": bid, "selections": out}
+
     def board_export(self, a):
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
@@ -1744,6 +2069,35 @@ def tool_defs(remote: bool) -> List[dict]:
                             "base_version": {"type": "integer", "description": T("board_read 줄 끝 (vN) 의 N", "The N of (vN) at the end of the board_read line")},
                             "label_base_version": {"type": "integer", "description": T("라벨이 있으면 줄 끝 (라벨 vM) 의 M", "If there is a label, the M of (label vM) at the end of the line")}}}}}, ["ids"]),
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
+        {"name": "board_snapshot", "title": T("보드 그림으로 보기", "See the board as an image"),
+         "description": T("보드(또는 고른 것 · 영역 · 장)를 PNG 그림으로 돌려준다 — 손글씨 · 손그림을 읽을 때 쓴다. "
+                          "결과: 글(렌더러 · 그림 픽셀 → 보드 좌표 변환식 · 담긴 글과 위치 · PNG 파일 경로) + image. "
+                          "render:\"auto\"(기본)는 사람 편집 탭이 있으면 그 탭이 그린다(사람 화면과 같음, 6초까지), 없으면 서버 래스터"
+                          "(획 · 도형 · 화살표, 글은 회색 막대 — 글 내용은 결과 글에). 그림이 안 보이는 클라이언트는 글의 파일 경로를 그림 보기 도구로 연다. "
+                          "고르기: ids · selection:true(사람이 최근 고른 것, who 로 사람 지정) · region{x,y,w,h} · page 중 하나, 없으면 보드 전체.",
+                          "Returns the board (or a selection / region / page) as a PNG image — use it to read handwriting and hand drawings. "
+                          "Result: text (renderer, pixel → board coordinate formula, the text it holds with positions, the PNG file path) + image. "
+                          "render:\"auto\" (default) has a person's edit tab draw it when one is open (same as people see, up to 6 s), otherwise the server raster "
+                          "(strokes, shapes, arrows; text as gray bars — the words are in the result text). A client that shows no image opens the file path with an image tool. "
+                          "Choose one of ids · selection:true (what a person selected lately; who picks the person) · region{x,y,w,h} · page; none = the whole board."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 2000},
+                             "selection": {"type": "boolean", "description": T("사람이 최근(60초) 고른 것", "What a person selected in the last 60 s")},
+                             "who": {"type": "string", "description": T("selection 의 사람 이름(기본: 가장 최근에 고른 사람)", "Person for selection (default: whoever selected last)")},
+                             "region": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"}},
+                                        "required": ["x", "y", "w", "h"], "description": T("보드 좌표 영역", "A region in board coordinates")},
+                             "page": {"type": "integer", "minimum": 1, "description": T("장 번호", "Page number")},
+                             "max_edge": {"type": "integer", "default": SNAP_EDGE, "minimum": 256, "maximum": 1568, "description": T("그림 긴 변 상한(px)", "Longest image side (px)")},
+                             "render": {"type": "string", "enum": ["auto", "tab", "server"], "default": "auto"},
+                             "mono": {"type": "boolean", "default": True, "description": T("한 가지 진한 잉크(인식용, 기본)", "One dark ink (for recognition, default)")},
+                             "pad": {"type": "number", "default": 16, "minimum": 0, "maximum": 200}}),
+         "annotations": ro},
+        {"name": "board_selection", "title": T("사람이 고른 것", "What people selected"),
+         "description": T("사람마다 최근(60초) 고른 요소 — '이거' 가 무엇인지. {user, ids, bbox, page, age_s} 와 고른 요소의 요약 줄. 에이전트는 빠진다. "
+                          "그림으로 보려면 board_snapshot selection:true.",
+                          "What each person selected lately (60 s) — what 'this' means. {user, ids, bbox, page, age_s} and summary lines of the selected elements. "
+                          "Agents are left out. To see it as an image: board_snapshot selection:true."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "who": {"type": "string", "description": T("사람 이름(일부도 됨)", "Person's name (part is fine)")}}),
+         "annotations": ro},
         {"name": "board_wait", "title": T("사람이 고칠 때까지 기다리기", "Wait until a person edits"),
          "description": T("사람이 보드를 고칠 때까지 기다렸다가 무엇이 바뀌었는지 돌려준다 — 첫 줄은 요약(누가 무엇을 더함 @(x,y w×h)), 이어서 한 줄씩. "
                           "since_seq 는 board_read · 앞 board_wait 의 seq(없으면 지금부터). idle_ms: 첫 변경 뒤 이만큼 아무도 안 고칠 때까지 모아서 "
@@ -1857,9 +2211,15 @@ class Server:
                         self.send({"jsonrpc": "2.0", "method": "notifications/progress",
                                    "params": {"progressToken": tok, "progress": done, "total": total, "message": message}})
                 text, st = fn(args, cancelled=lambda: mid in self.cancelled, progress=prog)
+            elif name == "board_snapshot":
+                text, st = fn(args, cancelled=lambda: mid in self.cancelled)
             else:
                 text, st = fn(args)
-            res = cap_result(text, st)
+            if isinstance(st, ImageResult):
+                res = cap_result(text, None)
+                res["content"].append({"type": "image", "mimeType": "image/png", "data": base64.b64encode(st.png).decode("ascii")})
+            else:
+                res = cap_result(text, st)
         except ToolError as e:
             res = {"content": [{"type": "text", "text": str(e)}], "isError": True}
         except Exception as e:   # noqa: BLE001 — so one tool's mistake does not kill the server

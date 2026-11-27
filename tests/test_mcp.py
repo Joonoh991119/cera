@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -149,7 +150,7 @@ class Handshake(Base):
         self.assertEqual(res["capabilities"], {"tools": {"listChanged": False}})
         tools = m.call("tools/list")["result"]["tools"]
         names = [t["name"] for t in tools]
-        self.assertEqual(len(tools), 12, names)
+        self.assertEqual(len(tools), 14, names)
         self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", n) for n in names))
         self.assertTrue(all(t["inputSchema"]["type"] == "object" for t in tools))
         self.assertTrue(next(t for t in tools if t["name"] == "board_delete")["annotations"]["destructiveHint"])
@@ -208,7 +209,7 @@ class Handshake(Base):
         m = self.mcp(py=str(PY39))
         r = m.init("codex-mcp-client")
         self.assertEqual(r["result"]["serverInfo"]["name"], "cera")
-        self.assertEqual(len(m.call("tools/list")["result"]["tools"]), 12)
+        self.assertEqual(len(m.call("tools/list")["result"]["tools"]), 14)
         self.assertTrue(m.tool("site_list")["isError"] is False)
 
     def test_agent_names(self):
@@ -969,7 +970,7 @@ class English(Base):
         self.assertIsNone(HANGUL.search(res["instructions"]), res["instructions"])
         self.assertIsNone(HANGUL.search(res["serverInfo"]["title"]))
         tools = m.call("tools/list")["result"]["tools"]
-        self.assertEqual(len(tools), 12)
+        self.assertEqual(len(tools), 14)
         for t in tools:
             for s in _strings(t):
                 self.assertIsNone(HANGUL.search(s), (t["name"], s))
@@ -1053,7 +1054,7 @@ class Remote(Base):
         m.init("some-remote-agent")
         names = [t["name"] for t in m.call("tools/list")["result"]["tools"]]
         self.assertFalse([n for n in names if n.startswith("site_")])
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 11)
         self.assertNotIn("site", json.dumps([t["inputSchema"] for t in m.call("tools/list")["result"]["tools"]]))
         self.assertEqual(m.call("tools/call", {"name": "site_open", "arguments": {}})["error"]["code"], -32602)
         r = m.ok("board_add", {"items": [{"kind": "box", "label": "원격 상자"}]})
@@ -1190,7 +1191,7 @@ class RemoteAccess(Base):
             m = self.mcp(env)
             m.init("codex-mcp-client")
             names = [t["name"] for t in m.call("tools/list")["result"]["tools"]]
-            self.assertEqual(len(names), 9)
+            self.assertEqual(len(names), 11)
             self.assertFalse([n for n in names if n.startswith("site_")])
             self.assertIn("보드가 없다", m.ok("board_list", {})["content"][0]["text"])
             h = {k.lower(): v for k, v in cap.seen[-1].items()}
@@ -1199,7 +1200,7 @@ class RemoteAccess(Base):
             # with only a URL and no credentials: it starts in remote mode (without touching the local site) but tools return a guidance error
             m2 = self.mcp({**self.env, "CERA_URL": f"http://127.0.0.1:{cap.port}"})
             m2.init()
-            self.assertEqual(len(m2.call("tools/list")["result"]["tools"]), 9)
+            self.assertEqual(len(m2.call("tools/list")["result"]["tools"]), 11)
             r = m2.tool("board_list", {})
             self.assertTrue(r["isError"])
             self.assertIn("CF_ACCESS_CLIENT_ID", r["content"][0]["text"])
@@ -1208,6 +1209,366 @@ class RemoteAccess(Base):
         finally:
             cap.httpd.shutdown()
             cap.httpd.server_close()
+
+
+class Wp3(Base):
+    """09 plan WP-3: board_snapshot (tab render first, server raster otherwise; text + image, no structuredContent, PNG file 0600)
+    and board_selection (each person's last selection, 60 s)."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "보기"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+        fix = json.loads((HERE / "tests" / "fixtures" / "rough07.json").read_text(encoding="utf-8"))
+        self.regions = fix["regions"]
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": fix["elements"]})[0], 200)
+
+    def presence(self, client, **data):
+        self.assertIn(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", self.h, {"client": client, **data})[0], (200, 204))
+
+    def snap(self, args, timeout=60):
+        res = self.m.tool("board_snapshot", args, timeout)
+        return res
+
+    def check_image(self, res, edge=1024):
+        self.assertFalse(res.get("isError"), res["content"][0]["text"])
+        self.assertNotIn("structuredContent", res)
+        self.assertEqual([c["type"] for c in res["content"]], ["text", "image"])
+        img = res["content"][1]
+        self.assertEqual(img["mimeType"], "image/png")
+        png = __import__("base64").b64decode(img["data"])
+        w, h = __import__("struct").unpack(">II", png[16:24])
+        self.assertLessEqual(max(w, h), edge)
+        text = res["content"][0]["text"]
+        path = Path(re.search(r"파일: (\S+\.png)", text).group(1))
+        self.assertEqual(path.read_bytes(), png)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent, self.home / "snapshots")
+        return text, png, path
+
+    def test_server_raster_when_no_tab(self):
+        """Criteria 2, 3, 6: no person's tab → renderer: server; text + image only; file 0600; the text alone gives positions."""
+        t = time.time()
+        res = self.snap({"ids": self.regions["flow"]})
+        self.assertLess(time.time() - t, 3)
+        text, png, path = self.check_image(res)
+        self.assertIn("renderer: server", text)
+        self.assertIn("열린 사람 편집 탭이 없음", text)
+        m = re.search(r"보드 = \(x0 \+ px/s, y0 \+ py/s\) = \((-?[\d.]+) \+ px/([\d.e-]+), (-?[\d.]+) \+ py/([\d.e-]+)\)", text)
+        self.assertTrue(m, text)
+        self.assertIn("담긴 요소 26개", text)
+        # a text-only client: label lines and stroke groups carry board boxes
+        self.assertRegex(text, r'"[^"]+" @\(-?\d+,-?\d+ \d+×\d+\)')
+        self.assertRegex(text, r"손글씨 획 \d+개 @\(")
+        whole = self.check_image(self.snap({"render": "server", "max_edge": 1568}), 1568)[0]
+        self.assertIn("담긴 요소 124개", whole)
+        self.assertTrue(self.snap({"render": "tab"})["isError"])   # forced tab with no tab: an error that names render:"server"
+
+    def test_region_page_and_bad_args(self):
+        text = self.check_image(self.snap({"region": {"x": -10000, "y": -10000, "w": 20000, "h": 20000}, "max_edge": 256}), 256)[0]
+        self.assertIn("담긴 요소 124개", text)
+        r = self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "p"}, {"kind": "box", "label": "안"}]})
+        text = self.check_image(self.snap({"page": 1}))[0]
+        self.assertIn('"안"', text)
+        for bad in ({"ids": ["a"], "region": {"x": 0, "y": 0, "w": 1, "h": 1}}, {"page": 99}, {"ids": ["nope"]}, {"max_edge": 100},
+                    {"render": "gpu"}, {"who": "길동"}, {"selection": True}, {"ids": []}, {"pad": -1}):
+            res = self.snap(bad)
+            self.assertTrue(res["isError"], bad)
+            self.assertNotIn("structuredContent", res)
+
+    def fake_tab(self, mode="ok"):
+        """A person's edit tab that claims render jobs. ok: draws the requested scene with the raster (real PNG, coordinates and scene tag);
+        oversize: a valid PNG larger than max_edge; badtag: right picture, tag of another scene; silent: claims nothing."""
+        self.presence("tab1", pointer={"x": 0, "y": 0})
+        seen, stop = [], threading.Event()
+
+        def run():
+            try:
+                loop()
+            except OSError:   # the board server stopped at tearDown
+                pass
+
+        def loop():
+            while not stop.is_set():
+                st, d = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/jobs", self.h)
+                for j in (d or {}).get("jobs") or []:
+                    if mode == "silent":
+                        continue
+                    st, c = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/claim", self.h, {"client": "tab1", "prio": "high"})
+                    if st != 200:
+                        continue
+                    a = c["args"]
+                    seen.append(a)
+                    els = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+                    region = a.get("region")
+                    picked = RS.pick(els, ids=a.get("ids"), region=region and (region["x"], region["y"], region["w"], region["h"]))[0]
+                    out = RS.render(picked, max_edge=a["max_edge"], scale=a.get("scale"), pad=a["pad"],
+                                    crop=region and (region["x"], region["y"], region["w"], region["h"]))
+                    png = out["png"] if mode != "oversize" else RS.png_bytes(a["max_edge"] + 44, 10, bytes([255]) * ((a["max_edge"] + 44) * 10))
+                    tag = RS.scene_tag(picked) if mode != "badtag" else "1-00000000"
+                    raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/result", self.h,
+                        {"client": "tab1", "lease": c["lease"], "ok": True,
+                         "data": {"png": __import__("base64").b64encode(png).decode(), "width": out["width"], "height": out["height"],
+                                  "scale": out["scale"], "x0": out["x0"], "y0": out["y0"], "count": len(picked), "tag": tag, "renderer": "tab"}})
+                time.sleep(0.05)
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+
+        def done():
+            stop.set()
+            th.join(2)
+        self.addCleanup(done)
+        return seen, done
+
+    def test_tab_render_first(self):
+        """Criterion 1 (server side): with a person's edit tab attached the tab draws it (renderer: tab), the job carries the ids and a scale;
+        the words describe the same scene the tab drew (scene tag)."""
+        seen, done = self.fake_tab()
+        t = time.time()
+        res = self.snap({"ids": self.regions["flow"]})
+        self.assertLess(time.time() - t, 3)
+        text, png, _ = self.check_image(res)
+        self.assertIn("renderer: tab", text)
+        self.assertIn("담긴 요소 26개", text)
+        self.assertEqual(seen[0]["ids"], self.regions["flow"])
+        self.assertTrue(0.25 <= seen[0]["scale"] <= 4 and seen[0]["mono"] is True and seen[0]["max_edge"] == 1024)
+        self.assertIn("renderer: server", self.check_image(self.snap({"render": "server", "ids": self.regions["F1"]}))[0])
+        done()
+        # a tab that is present but never answers: auto falls back to the server raster after 6 s
+        t = time.time()
+        text = self.check_image(self.snap({"ids": self.regions["F1"]}))[0]
+        self.assertTrue(5.5 < time.time() - t < 8, time.time() - t)
+        self.assertIn("renderer: server", text)
+        self.assertIn("탭 대신 서버로 그림", text)
+
+    def test_r1_tab_picture_over_max_edge_is_refused(self):
+        """r1: a valid PNG wider than max_edge from a tab is not passed on (retry smaller, then the server raster)."""
+        seen, _ = self.fake_tab("oversize")
+        text, png, _ = self.check_image(self.snap({"ids": self.regions["F1"], "max_edge": 256}), 256)
+        self.assertIn("renderer: server", text)
+        self.assertIn("상한", text)
+        self.assertEqual(len(seen), 2)   # once at 256, once smaller
+
+    def test_r1_tab_scene_differs(self):
+        """r1: the tab drew another scene than the board (tag) -> server raster, which is described with the same elements."""
+        self.fake_tab("badtag")
+        text = self.check_image(self.snap({"ids": self.regions["F1"]}))[0]
+        self.assertIn("renderer: server", text)
+        self.assertIn("탭이 그린 장면이 보드와 달랐다", text)
+        self.assertIn("담긴 요소 13개", text)
+
+    def test_r1_region_in_page_crops_tab_and_raster(self):
+        """r1 (Opus): a small region inside a page is pictured as the region (letters stay readable), by the tab and by the raster."""
+        self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "p", "x": -2000, "y": -2000}]})
+        els = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+        fr = next(e for e in els if e["type"] == "frame")
+        big = {**fr, "x": -3000, "y": -3000, "width": 9000, "height": 9000, "version": fr["version"] + 1}
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": [big]})[0], 200)
+        f1 = [e for e in els if e["id"] in self.regions["F1"]]
+        x0 = min(RS.element_box(e)[0] for e in f1)
+        y0 = min(RS.element_box(e)[1] for e in f1)
+        reg = {"x": x0 - 5, "y": y0 - 5, "w": 200, "h": 120}
+        for mode in ("server", "auto"):
+            if mode == "auto":
+                self.fake_tab()
+            text, png, _ = self.check_image(self.snap({"region": reg, "render": mode}))
+            self.assertIn("renderer: " + ("server" if mode == "server" else "tab"), text)
+            w, h = struct.unpack(">II", png[16:24])
+            s = float(re.search(r"py/([\d.]+)\)", text).group(1))
+            self.assertLessEqual(w / s, 200 + 1e-3)
+            self.assertGreater(s, 1.0, text)   # not shrunk to the 9000-unit page
+
+    def test_selection(self):
+        """Criterion 5: last non-empty selection survives deselecting, per person (who), agents excluded; snapshot selection:true uses it."""
+        three = self.regions["note"][:3]
+        self.assertIn("고른 것 없음", self.m.ok("board_selection", {})["content"][0]["text"])
+        self.presence("hum1", selected={i: True for i in three})
+        time.sleep(1.1)
+        self.presence("hum1", selected={})
+        h2 = {**self.h, "X-Tb-Name": urllib.parse.quote("민수")}
+        self.assertIn(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", h2,
+                      {"client": "hum2", "selected": {self.regions["F1"][0]: True}})[0], (200, 204))
+        r = self.m.ok("board_selection", {})
+        rows = r["structuredContent"]["selections"]
+        self.assertEqual([x["user"] for x in rows], ["민수", "길동"])
+        gd = rows[1]
+        self.assertEqual(sorted(gd["ids"]), sorted(three))
+        self.assertGreaterEqual(gd["age_s"], 1.0)
+        self.assertFalse(gd["current"])
+        self.assertEqual(len(gd["bbox"]), 4)
+        self.assertIn("길동: 3개 @(", r["content"][0]["text"])
+        only = self.m.ok("board_selection", {"who": "길동"})["structuredContent"]["selections"]
+        self.assertEqual([x["user"] for x in only], ["길동"])
+        self.assertIn("고른 것 없음", self.m.ok("board_selection", {"who": "nobody"})["content"][0]["text"])
+        text = self.check_image(self.snap({"selection": True, "who": "길동"}))[0]
+        self.assertIn("담긴 요소 3개", text)
+        self.assertIn("길동 가 고른 것(3개", text)
+
+    def test_keep_50_and_delete_with_site(self):
+        for _ in range(53):
+            self.check_image(self.snap({"ids": self.regions["F2"], "render": "server", "max_edge": 256}), 256)
+        snaps = sorted((self.home / "snapshots").glob(f"{self.sid}-*.png"))
+        self.assertEqual(len(snaps), 50)
+        self.assertFalse((self.home / "snapshots" / f"{self.sid}-{self.bid}-1.png").exists())
+        self.assertTrue((self.home / "snapshots" / f"{self.sid}-{self.bid}-53.png").exists())
+        other = self.home / "snapshots" / "zzother-abcdefgh-1.png"
+        other.write_bytes(b"x")
+        self.m.close()
+        subprocess.run([sys.executable, str(CLI), "stop", self.sid], env=self.env, capture_output=True, timeout=60)
+        p = subprocess.run([sys.executable, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(list((self.home / "snapshots").glob(f"{self.sid}-*.png")), [])
+        self.assertTrue(other.exists())
+
+    def test_r1_selection_who_exact_and_deleted(self):
+        """r1: an exact who wins over a longer name containing it; a part matching several people is refused for a snapshot;
+        selected-then-deleted elements are not listed as ids."""
+        def sel(name, client, ids):
+            h = {**self.h, "X-Tb-Name": urllib.parse.quote(name)}
+            self.assertIn(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", h,
+                              {"client": client, "selected": {i: True for i in ids}})[0], (200, 204))
+        sel("Ann", "c_ann", self.regions["F2"][:2])
+        time.sleep(0.05)
+        sel("Anna", "c_anna", self.regions["F3"][:3])
+        text = self.check_image(self.snap({"selection": True, "who": "Ann"}))[0]
+        self.assertIn("Ann 가 고른 것(2개", text)
+        self.assertTrue(self.snap({"selection": True, "who": "An"})["isError"])
+        gone = self.regions["F2"][0]
+        el = next(e for e in raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"] if e["id"] == gone)
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": [{**el, "isDeleted": True, "version": el["version"] + 1}]})[0], 200)
+        r = self.m.ok("board_selection", {"who": "Ann"})
+        row = r["structuredContent"]["selections"][0]
+        self.assertEqual(row["ids"], [self.regions["F2"][1]])
+        self.assertIn("그 뒤 지워진 것 1개", r["content"][0]["text"])
+
+    def test_r1_long_missing_ids_keep_path_and_box(self):
+        """r1: many / long missing ids cannot push the file path and the picture box out of the 60 KB text."""
+        self.assertTrue(self.snap({"ids": self.regions["F1"] + ["x" * 60000]})["isError"])
+        text = self.check_image(self.snap({"ids": self.regions["F1"] + ["m%0199d" % i for i in range(1980)]}))[0]
+        head = text.split("\n")[:4]
+        self.assertTrue(head[1].startswith("파일: "), head)
+        self.assertIn("보이는 보드 범위 @(", head[2])
+        self.assertIn("보드에 없는 id 1980개", head[3])
+        self.assertLess(len(head[3]), 400)
+
+    def test_r1_page_text_outside_the_picture_is_not_described(self):
+        """r1: a page snapshot is cropped to the page — text of that page lying outside it is not in the words."""
+        r = self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "작은 장", "x": 5000, "y": 5000}]})
+        els = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+        fr = next(e for e in els if e["type"] == "frame")
+        small = {**fr, "width": 80, "height": 80, "version": fr["version"] + 1}
+        inside = {"id": "txtin00001", "type": "text", "x": fr["x"] + 10, "y": fr["y"] + 10, "width": 40, "height": 20, "text": "inside",
+                  "originalText": "inside", "fontSize": 16, "frameId": fr["id"], "version": 1, "versionNonce": 1, "isDeleted": False, "angle": 0}
+        off = {**inside, "id": "txtoff0001", "x": fr["x"] + 200, "y": fr["y"] + 200, "text": "offscreen", "originalText": "offscreen"}
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": [small, inside, off]})[0], 200)
+        text = self.check_image(self.snap({"page": 1, "render": "server"}))[0]
+        self.assertIn('"inside"', text)
+        self.assertNotIn("offscreen", text)
+
+    def test_r1_delete_reports_snapshot_failure(self):
+        """r1: if a snapshot cannot be removed, `cera delete` says so and keeps the site (so it can be run again)."""
+        self.check_image(self.snap({"ids": self.regions["F2"], "render": "server", "max_edge": 256}), 256)
+        self.m.close()
+        subprocess.run([sys.executable, str(CLI), "stop", self.sid], env=self.env, capture_output=True, timeout=60)
+        snaps = self.home / "snapshots"
+        os.chmod(snaps, 0o500)
+        try:
+            p = subprocess.run([sys.executable, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("스냅샷 그림 1개를 지우지 못해", p.stderr)
+            self.assertTrue((self.home / "sites" / self.sid).exists())
+        finally:
+            os.chmod(snaps, 0o700)
+        p = subprocess.run([sys.executable, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(list(snaps.glob(f"{self.sid}-*.png")), [])
+
+    def test_python39(self):
+        if not PY39.exists():
+            self.skipTest("no /usr/bin/python3")
+        m = self.mcp(py=str(PY39))
+        m.init("codex-mcp-client")
+        res = m.tool("board_snapshot", {"ids": self.regions["graph"]})
+        self.check_image(res)
+
+
+class Wp3InProcess(unittest.TestCase):
+    """r1 checks that need no board server: bounded tab wait, byte cap, file names across processes, odd remote board ids."""
+
+    def setUp(self):
+        self.mod = _load("tb_mcp", "cera_tb_mcp_wp3")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from types import SimpleNamespace
+        self.tools = self.mod.Tools(SimpleNamespace(ctx=SimpleNamespace(HOME=Path(self.tmp.name))))
+        self.conn = SimpleNamespace(base="https://example.invalid", client="ag-x")
+
+    def test_tab_wait_is_bounded_and_a_read_timeout_is_a_miss(self):
+        mod = self.mod
+
+        class Slow:
+            client, base = "ag-x", "https://example.invalid"
+            timeouts = []
+
+            def req(self, method, path, body=None, timeout=30):
+                if method == "POST":
+                    return 201, {"jid": "a" * 12}
+                self.timeouts.append(timeout)
+                time.sleep(min(timeout, 3))
+                raise mod.ToolError("read timed out")
+        t = time.time()
+        out, why = self.tools._tab_render(Slow(), "b" * 10, {"max_edge": 1024}, time.time() + 2.0, lambda: False)
+        self.assertIsNone(out)
+        self.assertIn("끊김", why)
+        self.assertLess(time.time() - t, 3.2)
+        self.assertTrue(all(x <= 2.6 for x in Slow.timeouts), Slow.timeouts)
+
+    def test_raster_byte_cap_shrinks(self):
+        fix = json.loads((HERE / "tests" / "fixtures" / "rough07.json").read_text(encoding="utf-8"))
+        self.mod.IMAGE_MAX_BYTES = 6000
+        out, note = self.tools._raster(fix["elements"], None, None, 1568, None, 16, True, lambda: False)
+        self.assertLessEqual(len(out["png"]), 6000)
+        self.assertLess(out["width"], 1568)
+        self.assertIn("용량 상한", note)
+
+    def test_odd_board_id_and_numbering(self):
+        p1 = self.tools._save_snapshot(None, self.conn, "my-board.1", b"a")
+        p2 = self.tools._save_snapshot(None, self.conn, "my-board.1", b"b")
+        self.assertNotEqual(p1, p2)
+        self.assertRegex(p2.name, r"^remote-[0-9a-f]{8}-b[0-9a-f]{12}-2\.png$")
+        self.assertEqual(p1.read_bytes(), b"a")
+
+    def test_two_processes_never_share_a_file(self):
+        code = (
+            "import sys, importlib.util; from pathlib import Path; from types import SimpleNamespace\n"
+            f"spec = importlib.util.spec_from_file_location('m', {str(HERE / 'server' / 'tb_mcp.py')!r}); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.SNAP_KEEP = 10000\n"
+            "t = m.Tools(SimpleNamespace(ctx=SimpleNamespace(HOME=Path(sys.argv[1]))))\n"
+            "c = SimpleNamespace(base='http://h', client='x')\n"
+            "for i in range(40): t._save_snapshot('site1', c, 'abcdefgh', (sys.argv[2] + str(i)).encode())\n")
+        ps = [subprocess.Popen([sys.executable, "-c", code, self.tmp.name, tag]) for tag in ("P", "Q")]
+        for p in ps:
+            self.assertEqual(p.wait(60), 0)
+        files = list((Path(self.tmp.name) / "snapshots").glob("site1-*.png"))
+        self.assertEqual(len(files), 80)
+        self.assertEqual(len({f.read_bytes() for f in files}), 80)
+
+
+def _load(name, mod_name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(mod_name, HERE / "server" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+RS = _load("raster", "cera_raster_t2")
 
 
 if __name__ == "__main__":

@@ -530,6 +530,20 @@ def cmd_delete(a):
                                f"First:  cera site uninstall --id {a.id} --load"))
     if not a.yes:
         raise SystemExit(T(f"그림까지 지운다: {SITES / a.id}  — 정말이면 --yes", f"This deletes the drawings too: {SITES / a.id}  - add --yes to confirm"))
+    # board_snapshot images of this site (tb_mcp.py: <site>-<board>-<n>.png) go first: if one cannot be removed, stop while the site still
+    # exists, so the same command can be run again after fixing the permission
+    snaps = [q for q in (HOME / "snapshots").glob(f"{a.id}-*.png") if re.fullmatch(re.escape(a.id) + r"-[A-Za-z0-9_]{1,64}-\d+\.png", q.name)]
+    failed = []
+    for snap in snaps:
+        try:
+            snap.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            failed.append(f"{snap}: {e.strerror or e}")
+    if failed:
+        raise SystemExit(T(f"스냅샷 그림 {len(failed)}개를 지우지 못해 사이트는 그대로 두었다:\n  ", f"Could not delete {len(failed)} snapshot image(s), so the site was left as is:\n  ")
+                         + "\n  ".join(failed[:10]))
     kept = keep_tunnel_files(a.id) if personal else None
     shutil.rmtree(SITES / a.id)
     print(T(f"{a.id} 지움", f"{a.id} deleted"))

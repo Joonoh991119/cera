@@ -91,12 +91,39 @@ export function renderArgs(a) {
   const region = r && num(r.x) && num(r.y) && num(r.w) && num(r.h) && r.w > 0 && r.h > 0 ? { x: r.x, y: r.y, w: r.w, h: r.h } : null;
   const page = (typeof args.page === "string" && args.page) || (num(args.page) && args.page >= 1 ? Math.floor(args.page) : null);
   return {
-    ids: ids && ids.length ? ids : null, region, page: page || null,
+    ids: Array.isArray(args.ids) ? ids : null, region, page: page || null,   // an empty id list stays empty (never "the whole board")
     maxEdge: clamp(num(args.max_edge) ? Math.round(args.max_edge) : 1024, MAX_EDGE[0], MAX_EDGE[1]),
     mono: args.mono !== false,
     pad: clamp(num(args.pad) ? args.pad : 16, 0, 200),
     scale: num(args.scale) && args.scale > 0 ? Math.min(args.scale, 8) : null,
   };
+}
+
+/**
+ * Which scene a render drew: FNV-1a (32 bit, over UTF-16 code units) of the sorted "id:version" lines of the picked elements, plus their count.
+ * The MCP computes the same tag (server/raster.py scene_tag) and only describes the picture with its own elements when the tags match.
+ */
+export function sceneTag(els) {
+  const lines = (els || []).map((e) => `${e.id}:${Number.isFinite(e.version) ? Math.trunc(e.version) : 0}`).sort().join("\n");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < lines.length; i++) { h ^= lines.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return `${(els || []).length}-${h.toString(16).padStart(8, "0")}`;
+}
+
+/**
+ * Region render: crop the picture to the region (scene units) instead of drawing everything the picked elements reach.
+ * bounds = [minX, minY, maxX, maxY] of the picked elements. -> { crop: {x, y, w, h}, scale, full: {w, h} } or null (no overlap).
+ * The scale fits the CROP into maxEdge (same rule as renderScale); the full export is capped at FULL_MAX px so a long stroke crossing the region cannot ask for a huge canvas.
+ */
+export const FULL_MAX = 4096;
+export function regionPlan(bounds, region, pad, maxEdge, want = null) {
+  const x0 = Math.max(bounds[0] - pad, region.x), y0 = Math.max(bounds[1] - pad, region.y);
+  const x1 = Math.min(bounds[2] + pad, region.x + region.w), y1 = Math.min(bounds[3] + pad, region.y + region.h);
+  if (!(x1 > x0 && y1 > y0)) return null;
+  const crop = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  const fw = bounds[2] - bounds[0] + 2 * pad, fh = bounds[3] - bounds[1] + 2 * pad;
+  const scale = Math.min(renderScale(crop.w, crop.h, maxEdge, want).scale, FULL_MAX / Math.max(1, fw, fh));
+  return { crop, scale, full: { w: fw, h: fh } };
 }
 
 /** For recognition: one dark ink on white (highlighter and colored pens become black, fills are dropped). Images are left as they are. Copies only. */

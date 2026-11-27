@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import "./_lang-ko.mjs";
-import { claimPrio, claimDelay, DELAYS, executeJob, applyChanged, withTimeout, renderArgs, monoElements, renderScale, pngBase64, mathPlan, mathCustom, mermaidOrigin } from "../src/features/jobs/jobs.js";
+import { claimPrio, claimDelay, DELAYS, executeJob, applyChanged, withTimeout, renderArgs, monoElements, renderScale, pngBase64, mathPlan, mathCustom, mermaidOrigin, sceneTag, regionPlan, FULL_MAX } from "../src/features/jobs/jobs.js";
 import { pickElements } from "../src/features/jobs/pick.js";
 
 test("visible desktop > hidden desktop > phone", () => {
@@ -171,3 +171,35 @@ test("mermaid origin: given point, else right of the board", () => {
   assert.deepEqual(mermaidOrigin(null, [0, -20, 100, 100]), { x: 180, y: -20 });
   assert.deepEqual(mermaidOrigin({ x: "1" }, null), { x: 0, y: 0 });
 });
+
+test("WP-3 r1: an empty id list never widens to the whole board", () => {
+  const els = [R("a", 0, 0), R("b", 50, 50)];
+  const a = renderArgs({ ids: [] });
+  assert.deepEqual(a.ids, []);
+  assert.deepEqual(pickElements(els, a).elements, []);
+  assert.deepEqual(pickElements(els, renderArgs({ ids: [3, ""] })).elements, []);
+});
+
+test("WP-3 r1: a region inside a page does not pull the page frame in (the picture stays the region)", () => {
+  const page = { id: "tbpage-1", type: "frame", x: 0, y: 0, width: 4000, height: 3000, angle: 0, customData: { tbPage: 1 } };
+  const els = [page, R("s", 100, 100, 20, 40, { frameId: "tbpage-1" })];
+  assert.deepEqual(pickElements(els, renderArgs({ region: { x: 90, y: 90, w: 50, h: 50 } })).elements.map((e) => e.id), ["s"]);
+  assert.deepEqual(pickElements(els, renderArgs({ region: { x: -1, y: -1, w: 5000, h: 5000 } })).elements.map((e) => e.id), ["tbpage-1", "s"]);
+});
+
+test("WP-3 r1: regionPlan crops to region and scales the crop; sceneTag matches the Python tag", () => {
+  const p = regionPlan([0, 0, 1000, 100], { x: 100, y: -50, w: 100, h: 200 }, 10, 1024, 2);
+  assert.deepEqual(p.crop, { x: 100, y: -10, w: 100, h: 120 });
+  assert.equal(p.scale, 2);
+  assert.equal(regionPlan([0, 0, 10, 10], { x: 500, y: 500, w: 5, h: 5 }, 0, 1024), null);
+  const huge = regionPlan([0, 0, 100000, 10], { x: 0, y: 0, w: 10, h: 10 }, 0, 1024, 4);
+  assert.ok(huge.scale * 100000 <= FULL_MAX + 1e-6);
+  // same value as tests/test_raster.py test_scene_tag_matches_js
+  assert.equal(sceneTag([{ id: "b", version: 3 }, { id: "a", version: 12 }, { id: "c" }, { id: "한", version: 2.0 }]), "4-" + sceneTagRef());
+});
+
+function sceneTagRef() {   // the Python side computes the same: FNV-1a over "a:12\nb:3\nc:0\n한:2"
+  const s = "a:12\nb:3\nc:0\n한:2"; let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, "0");
+}
