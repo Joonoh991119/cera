@@ -95,7 +95,13 @@ test("R1(실제 서버) — ack 직후 저장 전 강제 종료 · 같은 ID 수
   const data = mkdtempSync(join(tmpdir(), "wb-r1-"));
   const port = 18000 + Math.floor(Math.random() * 2000);
   const base = `http://127.0.0.1:${port}`;
-  const start = (interval) => spawn("python3", [SERVER, "--data", data, "--port", String(port), "--test-user", "시험", "--save-interval", String(interval)], { stdio: "ignore" });
+  let serverLog = "";   // kept so a failed restart says why (port still busy, Python missing, ...)
+  const start = (interval) => {
+    const p = spawn(process.env.TEMPBOARD_TEST_PYTHON || "python3", [SERVER, "--data", data, "--port", String(port), "--test-user", "시험", "--save-interval", String(interval)], { stdio: ["ignore", "ignore", "pipe"] });
+    p.stderr.on("data", (b) => { serverLog = (serverLog + b.toString()).slice(-2000); });
+    p.on("exit", (code, sig) => { serverLog += `\n[server exited code=${code} signal=${sig}]`; });
+    return p;
+  };
   const H = { "Content-Type": "application/json", "X-Whiteboard": "1" };
   const http = {
     push: (id, c, els) => fetch(`${base}/api/whiteboard/boards/${id}/elements`, { method: "POST", headers: H, body: JSON.stringify({ client: c, elements: els }) }).then((r) => r.json()),
@@ -130,7 +136,7 @@ test("R1(실제 서버) — ack 직후 저장 전 강제 종료 · 같은 ID 수
     srv = start(60);
     // wait for the server itself first (a slow CI machine can take seconds to start Python); the link may come back
     // over WebSocket or, after repeated failed upgrades, over long-polling: both count as reconnected
-    assert.ok(await until(async () => { try { return (await fetch(`${base}/api/whiteboard/me`)).ok; } catch { return false; } }, 15000), "서버 재시작 1");
+    assert.ok(await until(async () => { try { return (await fetch(`${base}/api/whiteboard/me`)).ok; } catch { return false; } }, 15000), "서버 재시작 1\n" + serverLog);
     assert.ok(await until(() => link.mode() !== "connecting", 15000), "다시 붙음(서버 재시작 1)");
     await sleep(300);
     const a2 = el("keep", 2, { x: 42 }), d2 = el("gone", 2, { isDeleted: true });
