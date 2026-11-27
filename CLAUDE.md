@@ -14,3 +14,4 @@
 | 2026-11-20 | 시험 보드 start 가 이전 보드를 먼저 닫음 | skills/board-uiux-test/scripts/local_board.sh | 고아 보드 발생 |
 | 2026-11-20 | 첫 실행 완료(WP 7 + 다듬기, 리뷰 r1–r2 · UI 시험 r1–r2) — 리뷰가 고침 뒤 다시 보지 않은 WP 는 UI 시험이 대신 확인하는 것으로 운영 | skills/board-orchestrator(운영 메모) | 비용 상한 |
 | 2026-11-28 | 리뷰를 neon(ocx-gemini-4-neon) + Opus medium 적대적 다회차로, UI 시험을 자동 스모크 + 사람 UX 확인 요청으로, 효율 규칙(짧은 반환 · 보고 상한 · 이어 부르기 · 조사 선택) | skills/board-orchestrator · board-review · board-uiux-test, agents/board-reviewer · board-uiux-tester | 사용자 요청: 리뷰 모델 지정 · 컨텍스트 절약 · UX 는 사람이 판정 |
+| 2026-11-28 | 용도 U1–U4 와 평가 축 A–D(코드 · 에이전트 상호작용 실측 · 처음 써 보는 사람 · 사람) 정의, 모델 대체 순서(neon → hydrogen + Luna → Codex, Haiku 안 씀), hydrogen · Luna 의 잡일 · 처음 써 보는 사람 리뷰 단계(5a · 5b) 추가 | skills/board-orchestrator(+ references/eval-goals.md) · board-review · board-uiux-test, agents/board-reviewer · board-uiux-tester | 사용자 요청: 무엇에 쓰는지와 평가 기준을 먼저 정하고, 모델을 못 쓸 때의 대체를 명시 |

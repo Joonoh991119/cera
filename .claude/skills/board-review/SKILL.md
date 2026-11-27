@@ -5,7 +5,7 @@ description: Cera 변경을 독립 검토하는 점검표 — 정확성, 여러 
 
 # board-review
 
-먼저 `git diff main...HEAD --stat` 와 해당 파일 diff 를 읽는다. 구현자 메모(`03_impl_*`)는 읽지 않는다. 2라운드부터는 이전 지적 파일 두 개(neon · opus)와 고친 부분의 diff 만 본다.
+먼저 `git diff main...HEAD --stat` 와 해당 파일 diff 를 읽는다. 구현자 메모(`03_impl_*`)는 읽지 않는다. 2라운드부터는 이전 지적 파일(리뷰어마다 하나 — neon · opus, 대체 때는 hydrogen · luna · codex)과 고친 부분의 diff 만 본다. 통과 기준 수치는 `board-orchestrator/references/eval-goals.md` 의 A 표.
 
 **적대적 리뷰:** 이 코드를 깨는 입력 · 순서 · 기기를 찾는 것이 일이다. 시험을 직접 돌려 재현한 것을 우선한다. 재현 못 한 의심은 '확인 못 함' 으로 한 줄만.
 
