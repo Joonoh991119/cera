@@ -460,6 +460,35 @@ def make_arrow(from_el: Union[Element, Point], to_el: Union[Element, Point], lab
     return out
 
 
+def route_via(arrow: Element, a: Element, b: Element, via: Sequence[Point], label: Optional[Element] = None,
+              gap: Number = BIND_GAP) -> Element:
+    """Re-route a bound arrow a → b through absolute bend points (in place; the bindings stay, so dragging a box still drags the ends).
+    Used by flow layout for edges that would otherwise cut through boxes. A label goes to the middle of the polyline."""
+    if not via:
+        return reroute(arrow, a, b)
+    ca, cb = _center(a), _center(b)
+    pts = [(float(p[0]), float(p[1])) for p in via]
+
+    def end(e, c, toward):
+        dx, dy = toward[0] - c[0], toward[1] - c[1]
+        if dx == 0 and dy == 0:
+            dx = 1.0
+        n = math.hypot(dx, dy)
+        x, y = _edge_point(e, dx, dy)
+        return x + dx / n * gap, y + dy / n * gap
+    path = [end(a, ca, pts[0])] + pts + [end(b, cb, pts[-1])]
+    x0, y0 = path[0]
+    rel = [[px - x0, py - y0] for px, py in path]
+    xs, ys = [p[0] for p in rel], [p[1] for p in rel]
+    arrow.update({"x": x0, "y": y0, "points": rel, "width": max(xs) - min(xs), "height": max(ys) - min(ys)})
+    if label is not None:
+        m = len(path) // 2
+        (px, py), (qx, qy) = (path[m - 1], path[m]) if len(path) % 2 == 0 else (path[m], path[m])
+        label["x"] = (px + qx) / 2 - _num(label.get("width")) / 2
+        label["y"] = (py + qy) / 2 - _num(label.get("height")) / 2
+    return arrow
+
+
 ARROW_HEADS = {"end": (None, "arrow"), "start": ("arrow", None), "both": ("arrow", "arrow"), "none": (None, None)}   # head → (start, end)
 
 
@@ -533,6 +562,39 @@ def make_image(file_id: str, w: Number, h: Number, x: Number = 0, y: Number = 0,
               custom={"latex": latex} if latex else None)
     e.update({"fileId": file_id, "status": "saved", "scale": [1, 1], "crop": None})
     return e
+
+
+MATH_LINES = 8          # placeholder shows at most this many source lines
+MATH_LINE_CHARS = 120   # ... each clipped to this many characters
+
+
+def math_placeholder_svg(latex: str, size: Number = 32, color: str = INK) -> Tuple[str, float, float]:
+    """Stand-in picture for a formula until a person's tab typesets it (09 plan B5): the LaTeX source in a monospace font inside a dashed
+    frame, so the board shows the formula even with no tab open. -> (svg text, width, height). color must already be a checked #hex."""
+    import re
+    from xml.sax.saxutils import escape
+    clean = re.sub("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", "", str(latex).replace("\r", "").replace("\t", " "))
+    lines = [ln[:MATH_LINE_CHARS] for ln in clean.split("\n")][:MATH_LINES] or [""]
+    fs = max(10.0, min(28.0, float(size) * 0.55))
+    pad = 8.0
+    w = max(len(ln) for ln in lines) * fs * 0.62 + 2 * pad + 4
+    h = len(lines) * fs * 1.3 + 2 * pad
+    rows = "".join('<text x="%g" y="%g">%s</text>' % (pad + 2, pad + fs * (1.3 * i + 1.0), escape(ln)) for i, ln in enumerate(lines))
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="%g" height="%g" viewBox="0 0 %g %g">'
+           '<rect x="1" y="1" width="%g" height="%g" rx="6" fill="none" stroke="#9a9a9a" stroke-dasharray="5 4"/>'
+           '<g font-family="ui-monospace, Menlo, Consolas, monospace" font-size="%g" fill="%s">%s</g></svg>'
+           % (w, h, w, h, w - 2, h - 2, fs, color, rows))
+    return svg, round(w, 2), round(h, 2)
+
+
+def tag_graph(el: Element, g: str, k: str, direction: Optional[str] = None) -> Element:
+    """Mark a flow node / edge as part of graph g (customData.cera.graph = {g, k[, d]}) — mermaid / draw.io export find the graph by it."""
+    cd = dict(el.get("customData") or {})
+    cera = dict(cd.get("cera") or {})
+    cera["graph"] = {"g": g, "k": k, **({"d": direction} if direction else {})}
+    cd["cera"] = cera
+    el["customData"] = cd
+    return el
 
 
 # ── z-order (index) ─────────────────────────────────────────────────
@@ -955,6 +1017,11 @@ def describe(elements: Iterable[Element], page: Optional[int] = None) -> Tuple[s
             elif t == "image" and cd.get("latex"):
                 item.update(kind="math", latex=str(cd["latex"]))
                 line = ind + T("[%s] 수식 $%s$", "[%s] math $%s$") % (e["id"], _clip(cd["latex"], 200))
+                render = _dict(cd.get("cera")).get("render")
+                if render in ("pending", "error"):   # MCP formula (B5): not typeset yet, or MathJax refused it
+                    item["render"] = render
+                    line += T(" (렌더 대기)", " (render pending)") if render == "pending" else \
+                        T(" (LaTeX 오류: %s)", " (LaTeX error: %s)") % _clip(str(_dict(cd.get("cera")).get("message") or ""), 120)
             elif t == "image":
                 item.update(kind="image")
                 line = ind + T("[%s] 그림", "[%s] image") % e["id"]

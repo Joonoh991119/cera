@@ -11,6 +11,7 @@ import os as _os_lang
 
 _os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
+import base64
 import http.client
 import json
 import os
@@ -24,6 +25,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -171,9 +173,9 @@ class Handshake(Base):
         self.assertEqual(m.call("tools/call", {"name": "nope", "arguments": {}})["error"]["code"], -32602)
         self.assertEqual(m.call("resources/list")["error"]["code"], -32601)
         self.assertEqual(m.call("ping")["result"], {})
-        bad = m.tool("board_add", {"items": [{"kind": "math", "latex": "x"}]})
+        bad = m.tool("board_add", {"items": [{"kind": "math"}]})   # WP-4: math is accepted now, but needs latex
         self.assertTrue(bad["isError"])
-        self.assertIn("수식", bad["content"][0]["text"])
+        self.assertIn("latex", bad["content"][0]["text"])
         self.assertTrue(m.tool("board_read", {"board": "../../x"})["isError"])
         # the name and AI marker shown on the human's screen -- server presence
         port, h = self.human(sid)
@@ -1708,6 +1710,393 @@ class Wp3R2(unittest.TestCase):
         self.assertIn("renderer: tab", text)
 
 
+FLOW07 = {"kind": "flow", "dir": "TD", "layout": "layered",
+          "nodes": [{"id": "start", "label": "start", "shape": "ellipse"}, {"id": "load", "label": "load data"},
+                    {"id": "ok", "label": "ok?", "shape": "diamond"}, {"id": "fit", "label": "fit model"},
+                    {"id": "fin", "label": "end", "shape": "ellipse"}, {"id": "clean", "label": "clean", "shape": "round"}],
+          "edges": [{"from": "start", "to": "load"}, {"from": "load", "to": "ok"}, {"from": "ok", "to": "fit", "label": "yes"},
+                    {"from": "fit", "to": "fin"}, {"from": "ok", "to": "clean", "label": "no"}, {"from": "clean", "to": "load"}]}
+DRAWIO = Path("/Applications/draw.io.app/Contents/MacOS/draw.io")
+
+
+class Wp4(Base):
+    """09 plan WP-4: board_add flow (layered / keep, undirected edges, errors that name the field), math (placeholder → a tab typesets it),
+    mermaid (a tab converts it), board_read format:"mermaid", board_export format:"drawio"."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "구조"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+
+    def board(self):
+        return raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]
+
+    def live(self):
+        return {e["id"]: e for e in self.board()["elements"] if not e.get("isDeleted")}
+
+    def test_criterion_1_7_flow_layered_mermaid_drawio(self):
+        """1: one call, < 0.5 s, boxes never overlap, every edge bound at both ends (box.boundElements has the arrow, so dragging a box drags it).
+        7: format:"mermaid" parses back to the same node / edge sets; the .drawio has 6 vertices + 6 edges and draw.io exports it to PNG."""
+        t = time.time()
+        r = self.m.ok("board_add", {"items": [FLOW07]})
+        self.assertLess(time.time() - t, 0.5)
+        made = r["structuredContent"]["created"]
+        self.assertEqual(set(made), {n["id"] for n in FLOW07["nodes"]})
+        els = self.live()
+        boxes = [els[made[n["id"]]] for n in FLOW07["nodes"]]
+        self.assertEqual([b["type"] for b in boxes], ["ellipse", "rectangle", "diamond", "rectangle", "ellipse", "rectangle"])
+        self.assertIsNone(boxes[1]["roundness"])
+        self.assertIsNotNone(boxes[5]["roundness"])   # round
+        for i, a in enumerate(boxes):
+            for b in boxes[i + 1:]:
+                self.assertFalse(a["x"] < b["x"] + b["width"] and b["x"] < a["x"] + a["width"] and
+                                 a["y"] < b["y"] + b["height"] and b["y"] < a["y"] + a["height"], (a["id"], b["id"]))
+        arrows = [e for e in els.values() if e["type"] == "arrow"]
+        self.assertEqual(len(arrows), 6)
+        for a in arrows:
+            s, t_ = a["startBinding"]["elementId"], a["endBinding"]["elementId"]
+            self.assertIn(a["id"], [x["id"] for x in els[s]["boundElements"]])
+            self.assertIn(a["id"], [x["id"] for x in els[t_]["boundElements"]])
+            self.assertEqual((a["startArrowhead"], a["endArrowhead"]), (None, "arrow"))
+            self.assertEqual(a["customData"]["cera"]["graph"]["g"], boxes[0]["customData"]["cera"]["graph"]["g"])
+        labels = sorted(e["text"] for e in els.values() if e["type"] == "text" and els.get(e.get("containerId"), {}).get("type") == "arrow")
+        self.assertEqual(labels, ["no", "yes"])
+        # 7: mermaid round trip
+        res = self.m.ok("board_read", {"format": "mermaid"})
+        src = res["structuredContent"]["mermaid"]
+        self.assertIn("```mermaid", res["content"][0]["text"])
+        g = GIO.parse_mermaid(src)
+        self.assertEqual({(n["key"], n["label"], n["shape"]) for n in g["nodes"]},
+                         {(n["id"], n["label"], n.get("shape", "box")) for n in FLOW07["nodes"]})
+        self.assertEqual({(e["from"], e["to"], e.get("label", "")) for e in g["edges"]},
+                         {(e["from"], e["to"], e.get("label", "")) for e in FLOW07["edges"]})
+        # 7: draw.io
+        out = Path(self.tmp.name) / "out"
+        st = self.m.ok("board_export", {"format": "drawio", "out_dir": str(out)})["structuredContent"]
+        self.assertEqual((st["vertices"], st["edges"]), (6, 6))
+        root = ET.parse(st["path"]).getroot()
+        self.assertEqual(sum(1 for c in root.iter("mxCell") if c.get("vertex") == "1"), 6)
+        self.assertEqual(sum(1 for c in root.iter("mxCell") if c.get("edge") == "1" and c.get("source") and c.get("target")), 6)
+        if DRAWIO.exists():
+            png = out / "flow.png"
+            p = subprocess.run([str(DRAWIO), "-x", "-f", "png", "-o", str(png), st["path"]], capture_output=True, timeout=120)
+            self.assertEqual(p.returncode, 0, p.stderr[-500:])
+            self.assertEqual(png.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertTrue(self.m.ok("board_export", {"out_dir": str(out)})["structuredContent"]["path"].endswith(".excalidraw"))   # default unchanged
+        self.assertTrue(self.m.tool("board_export", {"format": "svg"})["isError"])
+
+    def test_criterion_2_keep(self):
+        """2: layout keep — each centre within 20 px of at (at:"absolute"), y closer than 30 % of the height → the same y.
+        Without absolute the group moves but keeps its shape."""
+        nodes = [{"id": "a", "label": "입력", "at": {"x": 103, "y": 207}}, {"id": "b", "label": "처리", "at": {"x": 391, "y": 222}},
+                 {"id": "c", "label": "출력", "at": {"x": 705, "y": 199}}, {"id": "d", "label": "판단", "shape": "diamond", "at": {"x": 391, "y": 460}}]
+        item = {"kind": "flow", "nodes": nodes, "edges": [{"from": "a", "to": "b"}, {"from": "b", "to": "c"}, {"from": "b", "to": "d"}]}
+        made = self.m.ok("board_add", {"items": [item], "at": "absolute"})["structuredContent"]["created"]
+        els = self.live()
+        ctr = {k: (els[v]["x"] + els[v]["width"] / 2, els[v]["y"] + els[v]["height"] / 2) for k, v in made.items()}
+        for n in nodes:
+            dx, dy = ctr[n["id"]][0] - n["at"]["x"], ctr[n["id"]][1] - n["at"]["y"]
+            self.assertLessEqual((dx * dx + dy * dy) ** 0.5, 20, n["id"])
+        self.assertEqual(ctr["a"][1], ctr["b"][1])
+        self.assertEqual(ctr["b"][1], ctr["c"][1])
+        self.assertNotEqual(ctr["d"][1], ctr["b"][1])
+        self.assertEqual(els[made["a"]]["width"], els[made["c"]]["width"])   # one size per shape
+        made2 = self.m.ok("board_add", {"items": [item]})["structuredContent"]["created"]
+        els = self.live()
+        ctr2 = {k: (els[v]["x"] + els[v]["width"] / 2, els[v]["y"] + els[v]["height"] / 2) for k, v in made2.items()}
+        self.assertGreater(ctr2["a"][0], ctr["c"][0])   # to the right of the first one
+        for k in ctr:
+            self.assertAlmostEqual(ctr2[k][0] - ctr2["a"][0], ctr[k][0] - ctr["a"][0], delta=0.01)
+            self.assertAlmostEqual(ctr2[k][1] - ctr2["a"][1], ctr[k][1] - ctr["a"][1], delta=0.01)
+        # keep with no at at all: laid out as layered, and said so
+        r = self.m.ok("board_add", {"items": [{"kind": "flow", "nodes": [{"id": "x"}, {"id": "y"}], "edges": [{"from": "x", "to": "y"}]}]})
+        self.assertIn("layered", r["content"][0]["text"])
+
+    def test_criterion_3_undirected_graph(self):
+        """3: head:"none" edges have no arrowheads (graph A-E); mermaid shows them as ---."""
+        nodes = [{"id": k, "label": k, "shape": "ellipse"} for k in "ABCDE"]
+        edges = [{"from": f, "to": t, "head": "none"} for f, t in ("AB", "AC", "BD", "CD", "DE", "BE")]
+        self.m.ok("board_add", {"items": [{"kind": "flow", "layout": "layered", "nodes": nodes, "edges": edges}]})
+        arrows = [e for e in self.live().values() if e["type"] == "arrow"]
+        self.assertEqual(len(arrows), 6)
+        for a in arrows:
+            self.assertIsNone(a["startArrowhead"])
+            self.assertIsNone(a["endArrowhead"])
+            self.assertTrue(a["startBinding"] and a["endBinding"])
+        src = self.m.ok("board_read", {"format": "mermaid"})["structuredContent"]["mermaid"]
+        self.assertEqual(src.count(" --- "), 6)
+        self.assertNotIn("-->", src)
+
+    def test_criterion_4_errors_name_the_field(self):
+        """4: an edge to a missing node → isError with that field and the existing ids; the board seq does not move."""
+        seq = self.board()["seq"]
+        bad = dict(FLOW07, edges=FLOW07["edges"][:3] + [{"from": "fit", "to": "X"}])
+        res = self.m.tool("board_add", {"items": [bad]})
+        self.assertTrue(res["isError"])
+        self.assertIn("items[0].edges[3].to = 'X' 없음 — 있는 id: start, load, ok, fit, fin, clean", res["content"][0]["text"])
+        for item, want in ((dict(FLOW07, nodes=FLOW07["nodes"] + [{"id": "ok"}]), "items[0].nodes[6].id = 'ok' 가 겹친다"),
+                           (dict(FLOW07, layout="keep", nodes=[{"id": "a", "at": {"x": 0, "y": 0}}, {"id": "b"}], edges=[]), "없는 노드: b"),
+                           (dict(FLOW07, edges=[{"from": "start", "to": "load", "arrow": "x"}]), "edges[0] 에 모르는 칸: arrow"),
+                           (dict(FLOW07, edges=[{"from": "start", "to": "start"}]), "자기 자신"),
+                           (dict(FLOW07, edges=[{"from": "start", "to": "load", "head": "start"}]), "head"),
+                           (dict(FLOW07, dir="BT"), "dir"), (dict(FLOW07, nodes=[{"id": "n%d" % i} for i in range(51)], edges=[]), "1–50"),
+                           (dict(FLOW07, x=3), "모르는 칸: x")):
+            res = self.m.tool("board_add", {"items": [item]})
+            self.assertTrue(res["isError"], item)
+            self.assertIn(want, res["content"][0]["text"])
+        self.assertEqual(self.board()["seq"], seq)
+
+    def fake_tab(self, latex_error="\\fracc"):
+        """A person's edit tab for math / mermaid jobs. math: writes the typeset result like web/src/features/jobs/mathJob.js (file first, then
+        the element with a new fileId and cera.render done) — or render error + message when the LaTeX contains latex_error.
+        mermaid: writes a box, a diamond and a bound arrow (what mermaidJob.js makes) and returns their ids."""
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", self.h, {"client": "tab1", "pointer": {"x": 0, "y": 0}})
+        stop, seen = threading.Event(), []
+
+        def post_els(els):
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "tab1", "elements": els})
+
+        def one(j):
+            st, c = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/claim", self.h, {"client": "tab1", "prio": "high"})
+            if st != 200:
+                return
+            a, done = c["args"], {"client": "tab1", "lease": c["lease"]}
+            seen.append((c["kind"], a))
+            if c["kind"] == "math" and "STALL" in a["latex"]:
+                return   # claimed, never answered (a hung tab)
+            if c["kind"] == "math":
+                el = self.live()[a["id"]]
+                cd = dict(el["customData"])
+                nxt = {"version": el["version"] + 1, "versionNonce": el["versionNonce"] + 1}
+                if latex_error in a["latex"]:
+                    cd["cera"] = {"render": "error", "message": "Undefined control sequence \\fracc"}
+                    post_els([{**el, **nxt, "customData": cd}])
+                    body = {**done, "ok": False, "error": "Undefined control sequence \\fracc"}
+                else:
+                    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="30"><path d="M0 0h80"/></svg>'
+                    fid = "t" * 40
+                    raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/files", self.h,
+                        {"client": "tab1", "id": fid, "mimeType": "image/svg+xml", "dataURL": "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()})
+                    cd.update(w0=80, h0=30, cera={"render": "done"})
+                    post_els([{**el, **nxt, "fileId": fid, "width": 80, "height": 30, "customData": cd}])
+                    body = {**done, "ok": True, "data": {"id": el["id"], "fileId": fid, "width": 80, "height": 30}}
+            else:
+                x = AK.make_box("rectangle", "A", 0, 0)
+                y = AK.make_box("diamond", "B?", 0, 200)
+                arr = AK.make_arrow(x[0], y[0])
+                post_els(x + y + arr)
+                ids = [e["id"] for e in x + y + arr]
+                body = {**done, "ok": True, "data": {"ids": ids, "count": len(ids), "x": 0, "y": 0}}
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/result", self.h, body)
+
+        def run():
+            try:
+                while not stop.is_set():
+                    for j in (raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/jobs", self.h)[1] or {}).get("jobs") or []:
+                        one(j)
+                    time.sleep(0.05)
+            except OSError:   # the board server stopped at tearDown
+                pass
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+
+        def done():
+            stop.set()
+            th.join(2)
+        self.addCleanup(done)
+        return seen, done
+
+    def test_criterion_5_math_without_tab(self):
+        """5 (no tab): the board gets a LaTeX-source placeholder and the reply says render pending; the element is a formula image the
+        existing 'Edit formula' path opens (image + customData.latex); the job waits on the server; a tab opened later draws it and
+        board_wait does not report that as a person's edit."""
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "x^2 + y^2 = r^2 <&>", "size": 40, "color": "#1971c2"}]})
+        text = r["content"][0]["text"]
+        self.assertIn("렌더 대기(화면이 열리면 그린다)", text)
+        self.assertEqual(r["structuredContent"]["math"][0]["render"], "pending")
+        el = self.live()[r["structuredContent"]["ids"][0]]
+        self.assertEqual(el["type"], "image")
+        self.assertEqual(el["customData"]["latex"], "x^2 + y^2 = r^2 <&>")   # selectedMath / mathInitial (features/math) look at exactly this
+        self.assertEqual((el["customData"]["size"], el["customData"]["color"]), (40, "#1971c2"))
+        self.assertEqual(el["customData"]["cera"], {"render": "pending"})
+        f = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/files/{el['fileId']}", self.h)[1]
+        svg = base64.b64decode(f["dataURL"].split(",", 1)[1]).decode()
+        self.assertIn("x^2 + y^2 = r^2 &lt;&amp;&gt;", svg)
+        ET.fromstring(svg)   # well-formed
+        jobs = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/jobs", self.h)[1]["jobs"]
+        self.assertEqual([j["kind"] for j in jobs], ["math"])
+        rd = self.m.ok("board_read")
+        self.assertIn("(렌더 대기)", rd["content"][0]["text"])
+        seq = rd["structuredContent"]["seq"]
+        seen, _ = self.fake_tab()
+        deadline = time.time() + 5
+        while time.time() < deadline and self.live()[el["id"]]["customData"]["cera"]["render"] != "done":
+            time.sleep(0.1)
+        self.assertEqual(self.live()[el["id"]]["customData"]["cera"]["render"], "done")
+        self.assertEqual(seen[0][1], {"id": el["id"], "latex": "x^2 + y^2 = r^2 <&>", "size": 40, "color": "#1971c2"})
+        w = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 2})["structuredContent"]
+        self.assertTrue(w.get("timeout"), w)
+        self.assertNotIn("렌더 대기", self.m.ok("board_read")["content"][0]["text"])
+        for bad in ({"kind": "math", "latex": ""}, {"kind": "math", "latex": "x", "color": "red"}, {"kind": "math", "latex": "x", "text": "y"}):
+            self.assertTrue(self.m.tool("board_add", {"items": [bad]})["isError"], bad)
+
+    def test_criterion_5_math_with_tab(self):
+        """5 (tab open): rendered within 3 s and the reply says so; bad LaTeX → the reply carries the MathJax error within 5 s."""
+        self.fake_tab()
+        t = time.time()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\frac{a+b}{2}"}, {"kind": "text", "text": "옆 글"}]})
+        self.assertLess(time.time() - t, 3)
+        self.assertIn("렌더됨", r["content"][0]["text"])
+        self.assertNotIn("렌더 대기", r["content"][0]["text"])
+        el = self.live()[r["structuredContent"]["ids"][0]]
+        self.assertEqual((el["fileId"], el["customData"]["cera"]["render"]), ("t" * 40, "done"))
+        t = time.time()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\fracc{"}]})
+        self.assertLess(time.time() - t, 5)
+        self.assertIn("LaTeX 오류 — Undefined control sequence \\fracc", r["content"][0]["text"])
+        self.assertEqual(r["structuredContent"]["math"][0]["render"], "error")
+        self.assertIn("(LaTeX 오류: Undefined control sequence", self.m.ok("board_read")["content"][0]["text"])
+
+    def test_criterion_6_mermaid(self):
+        """6: no tab → isError recommending kind:"flow" (with the converted item); tab → editable shapes and arrows (no picture)."""
+        src = "flowchart LR\n  a[입력] --> b{맞나?}\n  b -->|예| c(끝)"
+        seq = self.board()["seq"]
+        res = self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": src}]})
+        self.assertTrue(res["isError"])
+        text = res["content"][0]["text"]
+        self.assertIn('kind:"flow"', text)
+        hint = json.loads(text.split("그대로 board_add items 에 넣으면 된다): ", 1)[1])
+        self.assertEqual(self.board()["seq"], seq)
+        ok = self.m.ok("board_add", {"items": [hint]})   # the suggested item works as is
+        self.assertEqual(len(ok["structuredContent"]["created"]), 3)
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": src}, {"kind": "text", "text": "x"}]})["isError"])
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": "x" * 20001}]})["isError"])
+        seen, _ = self.fake_tab()
+        r = self.m.ok("board_add", {"items": [{"kind": "mermaid", "source": src}], "at": {"x": 1000, "y": 50}})
+        self.assertEqual(seen[-1], ("mermaid", {"source": src, "at": {"x": 1000, "y": 50}}))
+        self.assertEqual(sorted(i["type"] for i in r["structuredContent"]["items"]), ["diamond", "rectangle"])
+        self.assertEqual(len(r["structuredContent"]["links"]), 1)
+        self.assertNotIn("그림(image)", r["content"][0]["text"])
+
+    def test_python39(self):
+        if not PY39.exists():
+            self.skipTest("no /usr/bin/python3")
+        p = subprocess.run([str(PY39), "-c", "import sys; sys.path.insert(0, 'server'); import layout, graphio"], cwd=str(HERE), capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class Wp4R1(Wp4):
+    """Review r1 of WP-4 (04_review_WP-4_neon_r1 · _opus_r1): each test reproduces one finding."""
+
+    def test_r1_layered_edges_go_around_boxes(self):
+        """opus 2: FLOW07's back edge clean → load and any layer-skipping edge bend around the boxes in between (still bound at both ends)."""
+        made = self.m.ok("board_add", {"items": [FLOW07]})["structuredContent"]["created"]
+        els = self.live()
+        rect = {k: (els[v]["x"], els[v]["y"], els[v]["x"] + els[v]["width"], els[v]["y"] + els[v]["height"]) for k, v in made.items()}
+        key = {v: k for k, v in made.items()}
+        bent = 0
+        for a in (e for e in els.values() if e["type"] == "arrow"):
+            s_, t_ = key[a["startBinding"]["elementId"]], key[a["endBinding"]["elementId"]]
+            pts = [(a["x"] + p[0], a["y"] + p[1]) for p in a["points"]]
+            bent += len(pts) > 2
+            for p, q in zip(pts, pts[1:]):
+                for k, r in rect.items():
+                    if k in (s_, t_):
+                        continue
+                    for i in range(101):
+                        x, y = p[0] + (q[0] - p[0]) * i / 100, p[1] + (q[1] - p[1]) * i / 100
+                        self.assertFalse(r[0] + 2 < x < r[2] - 2 and r[1] + 2 < y < r[3] - 2, (s_, t_, k))
+            lab = [e for e in els.values() if e.get("containerId") == a["id"]]
+            for l_ in lab:   # the label sits on the path (near one of its points or segment middles)
+                cx, cy = l_["x"] + l_["width"] / 2, l_["y"] + l_["height"] / 2
+                mids = pts + [((p[0] + q[0]) / 2, (p[1] + q[1]) / 2) for p, q in zip(pts, pts[1:])]
+                self.assertLess(min(((cx - m[0]) ** 2 + (cy - m[1]) ** 2) ** 0.5 for m in mids), 2)
+        self.assertGreaterEqual(bent, 1)
+
+    def test_r1_latex_control_character_refused(self):
+        """neon 2 · opus 1: "\\frac" sent as "\f"+"rac" (form feed) is refused with the double-backslash hint; nothing is written."""
+        seq = self.board()["seq"]
+        res = self.m.tool("board_add", {"items": [{"kind": "math", "latex": "\x0crac{a}{b} + \x08eta"}]})
+        self.assertTrue(res["isError"])
+        self.assertIn("U+000C", res["content"][0]["text"])
+        self.assertIn("\\\\frac", res["content"][0]["text"])
+        self.assertEqual(self.board()["seq"], seq)
+        ok = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "a\nb\tc"}]})   # newline and tab are fine
+        self.assertEqual(ok["structuredContent"]["math"][0]["render"], "pending")
+        self.m.ok("board_add", {"items": [{"kind": "box", "label": "bad\x0cchar"}]})
+        st = self.m.ok("board_export", {"format": "drawio", "out_dir": str(Path(self.tmp.name) / "o")})["structuredContent"]
+        ET.parse(st["path"])
+
+    def test_r1_second_formula_is_not_reported_pending(self):
+        """neon 3: the first formula's tab hangs; the second is drawn at once — its reply says rendered, not pending."""
+        self.fake_tab()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "STALL"}, {"kind": "math", "latex": "y=1"}]}, timeout=30)
+        st = r["structuredContent"]["math"]
+        self.assertEqual([x["render"] for x in st], ["pending", "done"])
+
+    def test_r1_reply_shows_the_rendered_version(self):
+        """neon 4: after the tab typesets the formula the reply describes the board's element (v2, typeset size), so base_version works."""
+        self.fake_tab()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\frac{a+b}{2}"}]})
+        eid = r["structuredContent"]["ids"][0]
+        el = self.live()[eid]
+        text = r["content"][0]["text"]
+        self.assertIn("(v%d)" % el["version"], text)
+        self.assertIn("80×30", text)
+        it = next(i for i in r["structuredContent"]["items"] if i["id"] == eid)
+        self.assertEqual(it.get("render"), None)   # done: no pending / error mark
+
+    def test_r1_mermaid_is_not_a_person_edit_for_board_wait(self):
+        """neon 5: board_read → board_add mermaid (a person's tab writes it) → board_wait from that seq does not wake for it."""
+        self.fake_tab()
+        seq = self.m.ok("board_read")["structuredContent"]["seq"]
+        self.m.ok("board_add", {"items": [{"kind": "mermaid", "source": "flowchart TD\n a --> b"}]})
+        w = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 2})["structuredContent"]
+        self.assertTrue(w.get("timeout"), w)
+
+    def test_r1_mermaid_page_matches_board_read_page(self):
+        """neon 6: shapes drawn inside page 1's area without frameId count for format:"mermaid" page:1, like board_read page:1."""
+        self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "p"}]})
+        fr = next(e for e in self.live().values() if e["type"] == "frame")
+        a = AK.make_box("rectangle", "A", fr["x"] + 100, fr["y"] + 100)
+        b = AK.make_box("rectangle", "B", fr["x"] + 400, fr["y"] + 100)
+        arr = AK.make_arrow(a[0], b[0])
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": a + b + arr})
+        self.assertEqual(len(self.m.ok("board_read", {"page": 1})["structuredContent"]["items"]), 2)
+        st = self.m.ok("board_read", {"format": "mermaid", "page": 1})["structuredContent"]
+        self.assertEqual((st["nodes"], st["edges"]), (2, 1))
+
+    def test_r1_mermaid_hint_is_always_usable(self):
+        """neon 8: with no tab, a flow hint is offered only when board_add would take it as is (51 nodes, A-->A, empty, long ids)."""
+        cases = ["flowchart TD\n" + "\n".join("n%d --> n%d" % (i, i + 1) for i in range(60)), "flowchart TD\n A --> A\n A --> B",
+                 "flowchart TD\n %% only a comment", "flowchart TD\n " + "x" * 50 + " --> b", "flowchart TD\n a --> b"]
+        offered = 0
+        for src in cases:
+            text = self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": src}]})["content"][0]["text"]
+            if "그대로 board_add items 에 넣으면 된다): " in text:
+                offered += 1
+                hint = json.loads(text.split("그대로 board_add items 에 넣으면 된다): ", 1)[1])
+                self.m.ok("board_add", {"items": [hint]})
+        self.assertGreaterEqual(offered, 1)
+
+    def test_r2_empty_page_gives_an_empty_diagram(self):
+        """r2 (neon 1 · opus 1): an empty page (or ids none of which are on the page) never leaks another page's diagram."""
+        self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "빈 장"}]})
+        made = self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "둘째"}, FLOW07]})["structuredContent"]["created"]
+        self.assertEqual(self.m.ok("board_read", {"format": "mermaid", "page": 2})["structuredContent"]["nodes"], 6)
+        for args in ({"page": 1}, {"page": 1, "ids": [made["start"], made["load"]]}):
+            st = self.m.ok("board_read", {"format": "mermaid", **args})["structuredContent"]
+            self.assertEqual((st["nodes"], st["edges"]), (0, 0), args)
+        self.assertEqual(self.m.ok("board_read", {"format": "mermaid", "ids": []})["structuredContent"]["nodes"], 6)   # no filter = all
+
+
+for _n in [n for n in vars(Wp4) if n.startswith("test")]:   # Wp4R1 borrows Wp4's helpers only — Wp4's own tests run once, in Wp4
+    setattr(Wp4R1, _n, None)
+
+
 def _load(name, mod_name):
     import importlib.util
     spec = importlib.util.spec_from_file_location(mod_name, HERE / "server" / f"{name}.py")
@@ -1717,6 +2106,8 @@ def _load(name, mod_name):
 
 
 RS = _load("raster", "cera_raster_t2")
+GIO = _load("graphio", "cera_graphio_t2")
+AK = _load("agentkit", "cera_agentkit_t2")
 
 
 if __name__ == "__main__":

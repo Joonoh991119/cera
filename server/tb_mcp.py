@@ -57,7 +57,19 @@ ITEM_FIELDS = {              # board_add: fields each kind accepts — anything 
     "line": ("kind", "ref", "points", "dashed", "color"),
     "frame_page": ("kind", "title", "x", "y"),
     "image": ("kind", "ref", "path", "w", "x", "y"),
+    "math": ("kind", "ref", "latex", "size", "color", "x", "y"),
+    "flow": ("kind", "dir", "layout", "nodes", "edges"),
+    "mermaid": ("kind", "source"),
 }
+FLOW_NODE_FIELDS = ("id", "label", "shape", "at")
+FLOW_EDGE_FIELDS = ("from", "to", "label", "head")
+FLOW_HEADS = {"end": (None, "arrow"), "none": (None, None), "both": ("arrow", "arrow")}
+FLOW_SHAPE = {"box": "rectangle", "round": "rectangle", "ellipse": "ellipse", "diamond": "diamond"}
+FLOW_EDGES_MAX = 200
+MATH_WAIT = 5.0               # board_add math: with a person's tab open, wait this long for it to typeset (B5)
+MERMAID_WAIT = 18.0           # board_add mermaid: wait this long for a tab to convert (the job itself expires after 20 s)
+MERMAID_MAX = 20_000          # mermaid source bytes
+HEX = re.compile(r"^#[0-9a-fA-F]{3,8}$")
 IMAGE_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
              ".svg": "image/svg+xml"}
 MAX_FILE = 10 * 1024 * 1024   # server /files cap (data URL length)
@@ -134,6 +146,8 @@ ak = _sibling("agentkit")
 agents = _sibling("agents")
 importers = _sibling("importers")   # board_import
 rs = _sibling("raster")   # board_snapshot (server raster)
+lay = _sibling("layout")   # board_add kind:"flow"
+gio = _sibling("graphio")   # board_read format:"mermaid", board_export format:"drawio"
 
 
 def log(*a):
@@ -517,6 +531,19 @@ def _wait_kind(e) -> str:
     return "ink" if t == "freedraw" else ("text" if t == "text" else "shape")
 
 
+def _math_rendered(prev: Optional[dict], el: dict) -> bool:
+    """The write of a math job: the same formula (same latex, place) went from render "pending" to "done" / "error"."""
+    def cera(e):
+        cd = e.get("customData") if isinstance(e, dict) else None
+        c = cd.get("cera") if isinstance(cd, dict) else None
+        return (cd or {}), (c if isinstance(c, dict) else {})
+    if not isinstance(prev, dict) or el.get("isDeleted") or el.get("type") != "image":
+        return False
+    (pcd, pc), (cd, c) = cera(prev), cera(el)
+    return pc.get("render") == "pending" and c.get("render") in ("done", "error") and pcd.get("latex") == cd.get("latex") and \
+        prev.get("x") == el.get("x") and prev.get("y") == el.get("y")
+
+
 def _is_echo(prev: dict, el: dict) -> bool:
     """el re-writes stroke prev without moving it, within ECHO_S by the element's own 'updated' clock (the app's smoothing pass)."""
     if not (isinstance(prev, dict) and el.get("type") == "freedraw" and not el.get("isDeleted")):
@@ -752,6 +779,8 @@ class Tools:
         meta = {"board": bid, "title": (d.get("meta") or {}).get("title"), "seq": d.get("seq"), "epoch": d.get("epoch")}
         self.s.remember(c.base, bid, d.get("epoch") or "", d.get("seq"), els)
         by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
+        if fmt == "mermaid":
+            return self._read_mermaid(bid, els, ids, page)
         if fmt == "elements" or ids:
             text, st = ak.describe(els, page)
             want = set(ids or [])
@@ -784,7 +813,7 @@ class Tools:
                           ". Points were left out of lines / ink with many points (points_n; pass points:true if needed)")
             return head + "\n" + json.dumps(res, ensure_ascii=False), None   # only one copy (text) — do not carry the same JSON twice
         if fmt != "summary":
-            raise ToolError(T('format 은 "summary" 또는 "elements"', 'format must be "summary" or "elements"'))
+            raise ToolError(T('format 은 "summary" · "elements" · "mermaid"', 'format must be "summary", "elements" or "mermaid"'))
         text, st = ak.describe(els, page)
         for it in st["items"]:
             e = by_id.get(it["id"]) or {}
@@ -812,6 +841,29 @@ class Tools:
         if any(cut.values()):
             st["truncated"] = cut
         return head + "\n" + "\n".join(lines), st
+
+    def _read_mermaid(self, bid: str, els, ids, page):
+        """format:"mermaid": flow nodes (customData.cera.graph) and shapes joined by both-ends-bound arrows → a mermaid flowchart (U4)."""
+        live = _live(els)
+        ids = ids or None   # ids:[] from the caller = no filter, as in the other formats
+        if page is not None:   # the same page membership as board_read page:N (frameId, or drawn inside the page's area)
+            if not any(e.get("id") == ak.page_id(page) for e in live):
+                raise ToolError(T(f"장 {page} 가 없다", f"Page {page} does not exist"))
+            on = {i["id"] for i in ak.describe(live, page)[1]["items"]}
+            ids = [i for i in ids if i in on] if ids is not None else sorted(on)   # may be [] — then the diagram is empty
+        g = gio.graph_from_elements(live, ids)
+        if not g["nodes"]:
+            return T(f"보드 {bid}: mermaid 로 꺼낼 도식이 없다(흐름도 노드나, 화살표로 양끝이 이어진 상자가 없다).",
+                     f"Board {bid}: nothing to export as mermaid (no flow nodes and no shapes joined by arrows at both ends)."), \
+                {"board": bid, "mermaid": "", "nodes": 0, "edges": 0}
+        src = gio.to_mermaid(g)
+        if len(src.encode("utf-8")) > 25_000:   # text + structured both carry it — stays within MAX_RESPONSE
+            raise ToolError(T("도식이 너무 크다 — ids · page 로 좁히거나 board_export format:\"drawio\" 로 꺼낸다",
+                              "The diagram is too large — narrow with ids / page or use board_export format:\"drawio\""))
+        keys = {n["key"]: n["id"] for n in g["nodes"]}
+        return T(f"보드 {bid} 의 도식(노드 {len(g['nodes'])} · 간선 {len(g['edges'])}) — mermaid flowchart:",
+                 f"Diagram on board {bid} (nodes {len(g['nodes'])} · edges {len(g['edges'])}) — mermaid flowchart:") + \
+            "\n```mermaid\n" + src + "```", {"board": bid, "mermaid": src, "nodes": len(g["nodes"]), "edges": len(g["edges"]), "key_to_id": keys}
 
     # ---- Writing
     def _own(self, c: Conn, bid: str, ids, written=()):
@@ -842,6 +894,266 @@ class Tools:
         except ToolError:
             pass
 
+    def _flow(self, it: dict, n: int, by: str, fid: Optional[str], ox: float, oy: float) -> Tuple[List[dict], Dict[str, dict], str]:
+        """kind:"flow" → boxes (+ labels) and both-ends-bound arrows, laid out by server/layout.py (B6). Every mistake names the field to fix
+        and nothing is written. -> (elements, {node id: box}, note)."""
+        pre = f"items[{n}]"
+        direction = it.get("dir", "TD")
+        if direction not in ("TD", "LR"):
+            raise ToolError(T(f'{pre}.dir 는 "TD"(위→아래) 또는 "LR"(왼→오)', f'{pre}.dir must be "TD" (top-down) or "LR" (left-right)'))
+        mode = it.get("layout", "keep")
+        if mode not in ("keep", "layered"):
+            raise ToolError(T(f'{pre}.layout 은 "keep"(읽은 자리 지킴) 또는 "layered"(층 배치)', f'{pre}.layout must be "keep" (keep the positions read) or "layered"'))
+        nodes, edges = it.get("nodes"), it.get("edges", [])
+        if not isinstance(nodes, list) or not 1 <= len(nodes) <= lay.MAX_NODES:
+            raise ToolError(T(f"{pre}.nodes 는 노드 1–{lay.MAX_NODES}개 목록", f"{pre}.nodes must be a list of 1-{lay.MAX_NODES} nodes"))
+        if not isinstance(edges, list) or len(edges) > FLOW_EDGES_MAX:
+            raise ToolError(T(f"{pre}.edges 는 간선 {FLOW_EDGES_MAX}개까지의 목록", f"{pre}.edges must be a list of up to {FLOW_EDGES_MAX} edges"))
+        ids: List[str] = []
+        spec: Dict[str, dict] = {}
+        for i, nd in enumerate(nodes):
+            p = f"{pre}.nodes[{i}]"
+            if not isinstance(nd, dict):
+                raise ToolError(T(f"{p} 는 객체 {{id, label, shape, at}}", f"{p} must be an object {{id, label, shape, at}}"))
+            extra = sorted(str(k) for k in nd if k not in FLOW_NODE_FIELDS)
+            if extra:
+                raise ToolError(T(f"{p} 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: {', '.join(FLOW_NODE_FIELDS)}",
+                                  f"{p} has unknown field(s): {', '.join(extra)} — allowed: {', '.join(FLOW_NODE_FIELDS)}"))
+            nid = nd.get("id")
+            if not isinstance(nid, str) or not nid.strip() or len(nid) > 40:
+                raise ToolError(T(f"{p}.id 는 1–40자 글", f"{p}.id must be text of 1-40 characters"))
+            if nid in spec:
+                raise ToolError(T(f"{p}.id = {nid!r} 가 겹친다 — 노드 id 는 서로 달라야 한다", f"{p}.id = {nid!r} is used twice — node ids must differ"))
+            shape = nd.get("shape", "box")
+            if shape not in FLOW_SHAPE:
+                raise ToolError(T(f"{p}.shape 는 box · round · ellipse · diamond", f"{p}.shape must be box, round, ellipse or diamond"))
+            label = _str(nd["label"], f"{p}.label", 400, allow_empty=True) if "label" in nd else nid
+            at_ = None
+            if nd.get("at") is not None:
+                if not isinstance(nd["at"], dict):
+                    raise ToolError(T(f"{p}.at 는 {{x, y}}(노드 가운데, 보드 좌표)", f"{p}.at must be {{x, y}} (node centre, board coordinates)"))
+                at_ = (_num(nd["at"].get("x"), f"{p}.at.x"), _num(nd["at"].get("y"), f"{p}.at.y"))
+            ids.append(nid)
+            spec[nid] = {"label": label, "shape": shape, "at": at_}
+        pairs: List[Tuple[str, str, str, str]] = []
+        for j, ed in enumerate(edges):
+            p = f"{pre}.edges[{j}]"
+            if not isinstance(ed, dict):
+                raise ToolError(T(f"{p} 는 객체 {{from, to, label, head}}", f"{p} must be an object {{from, to, label, head}}"))
+            extra = sorted(str(k) for k in ed if k not in FLOW_EDGE_FIELDS)
+            if extra:
+                raise ToolError(T(f"{p} 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: {', '.join(FLOW_EDGE_FIELDS)}",
+                                  f"{p} has unknown field(s): {', '.join(extra)} — allowed: {', '.join(FLOW_EDGE_FIELDS)}"))
+            for side in ("from", "to"):
+                if ed.get(side) not in spec:
+                    have = ", ".join(ids[:20]) + (", …" if len(ids) > 20 else "")
+                    raise ToolError(T(f"{p}.{side} = {ed.get(side)!r} 없음 — 있는 id: {have}. 아무것도 넣지 않았다.",
+                                      f"{p}.{side} = {ed.get(side)!r} does not exist — node ids: {have}. Nothing was added."))
+            if ed["from"] == ed["to"]:
+                raise ToolError(T(f"{p} 는 자기 자신으로 가는 간선 — 지원하지 않는다", f"{p} goes from a node to itself — not supported"))
+            head = ed.get("head", "end")
+            if head not in FLOW_HEADS:
+                raise ToolError(T(f'{p}.head 는 "end"(기본) · "none"(방향 없음) · "both"', f'{p}.head must be "end" (default), "none" (undirected) or "both"'))
+            lab = _str(ed["label"], f"{p}.label", 200, allow_empty=True) if ed.get("label") is not None else ""
+            pairs.append((ed["from"], ed["to"], lab, head))
+        note = ""
+        given = [k for k in ids if spec[k]["at"] is not None]
+        if mode == "keep" and not given:
+            mode = "layered"
+            note = T(f"{pre}: 노드에 at 이 없어 layered 로 배치했다.", f"{pre}: no node has at, so it was laid out as layered.")
+        elif mode == "keep" and len(given) < len(ids):
+            miss = [k for k in ids if spec[k]["at"] is None]
+            raise ToolError(T(f"{pre}: layout:\"keep\" 은 모든 노드에 at 이 필요하다 — 없는 노드: {', '.join(miss[:20])}. 아니면 layout:\"layered\".",
+                              f"{pre}: layout:\"keep\" needs at on every node — missing on: {', '.join(miss[:20])}. Or use layout:\"layered\"."))
+        g = ak.new_id()[:12]
+        boxes: Dict[str, dict] = {}
+        made: Dict[str, list] = {}
+        for k in ids:
+            sp = spec[k]
+            els_ = ak.make_box(FLOW_SHAPE[sp["shape"]], sp["label"], 0, 0, by=by, frame_id=fid)
+            if sp["shape"] == "box":
+                els_[0]["roundness"] = None
+            boxes[k], made[k] = els_[0], els_
+        for shp in set(spec[k]["shape"] for k in ids):   # one size per shape — a tidy diagram (the largest label decides)
+            grp = [k for k in ids if spec[k]["shape"] == shp]
+            w = max(boxes[k]["width"] for k in grp)
+            h = max(boxes[k]["height"] for k in grp)
+            for k in grp:
+                boxes[k]["width"], boxes[k]["height"] = w, h
+        sizes = {k: (boxes[k]["width"], boxes[k]["height"]) for k in ids}
+        vias: List[list] = [[] for _ in pairs]
+        if mode == "keep":
+            centres = lay.keep({k: spec[k]["at"] for k in ids}, sizes)
+        else:
+            centres, vias = lay.layered_routes(ids, [(p[0], p[1]) for p in pairs], sizes, direction)
+            x0 = min(centres[k][0] - sizes[k][0] / 2 for k in ids)
+            y0 = min(centres[k][1] - sizes[k][1] / 2 for k in ids)
+            centres = {k: (v[0] - x0 + ox, v[1] - y0 + oy) for k, v in centres.items()}
+            vias = [[(p[0] - x0 + ox, p[1] - y0 + oy) for p in v] for v in vias]
+        out: List[dict] = []
+        for k in ids:
+            b = boxes[k]
+            b["x"], b["y"] = centres[k][0] - b["width"] / 2, centres[k][1] - b["height"] / 2
+            ak.tag_graph(b, g, k, direction)
+            for t in made[k][1:]:
+                ak._center_label(b, t)
+            out.extend(made[k])
+        for (fr, to, lab, head), via in zip(pairs, vias):
+            sh, eh = FLOW_HEADS[head]
+            arr = ak.make_arrow(boxes[fr], boxes[to], lab or None, by=by, frame_id=fid, start_head=sh, end_head=eh)
+            ak.tag_graph(arr[0], g, f"{fr}>{to}")
+            if via:   # bend around boxes; applied again after the group is placed (board_add), since placing re-routes straight
+                arr[0]["_via"] = (boxes[fr], boxes[to], boxes[fr]["x"], boxes[fr]["y"], via, arr[1] if len(arr) > 1 else None)
+                ak.route_via(arr[0], boxes[fr], boxes[to], via, arr[1] if len(arr) > 1 else None)
+            out.extend(arr)
+        if mode == "layered" and len(ids) > 20:
+            note = (note + " " if note else "") + T("노드가 많다 — 배치가 어수선하면 board_export format:\"drawio\" 로 꺼내 draw.io 에서 정리한다.",
+                                                   "Many nodes — if the layout looks crowded, export with board_export format:\"drawio\" and tidy it in draw.io.")
+        return out, boxes, note
+
+    def _job_wait(self, c: Conn, bid: str, jid: str, deadline: float) -> Optional[dict]:
+        """Long-poll a job until it ends or `deadline`. -> the job (any state) or None if it could not be read."""
+        j = None
+        first = True
+        while first or time.time() < deadline - 0.1:   # at least one look (wait=0 when out of time): an earlier job may have used the time up
+            first = False
+            w = max(0.0, min(deadline - time.time() - 0.1, 20.0))
+            try:
+                code, j = c.req("GET", f"/api/whiteboard/boards/{bid}/jobs/{jid}?wait={w:.2f}", timeout=w + 3)
+            except ToolError:
+                return j if isinstance(j, dict) else None
+            if code != 200 or not isinstance(j, dict) or j.get("state") in ("done", "failed", "expired"):
+                break
+        return j if isinstance(j, dict) else None
+
+    def _math_jobs(self, c: Conn, bid: str, d: dict, maths: List[dict]) -> Tuple[List[str], List[dict]]:
+        """One math job per placeholder (B5). With a person's edit tab open, wait up to MATH_WAIT s for the results; otherwise the jobs wait
+        on the server (24 h) for the next tab. Updates the placeholders' customData.cera.render in place to what is known now."""
+        tab = bool(self._humans(c, bid, d))
+        jobs = []
+        for el in maths:
+            cd = el["customData"]
+            args = {"id": el["id"], "latex": cd["latex"], "size": cd["size"], "color": cd["color"]}
+            try:
+                code, r = c.req("POST", f"/api/whiteboard/boards/{bid}/jobs", {"kind": "math", "args": args}, timeout=5)
+            except ToolError as e:
+                code, r = 0, str(e)
+            ok = code in (200, 201) and isinstance(r, dict) and r.get("jid")
+            jobs.append((el, r["jid"] if ok else None, None if ok else (r.get("error") if isinstance(r, dict) else r)))
+        deadline = time.time() + MATH_WAIT
+        got = {jid: self._job_wait(c, bid, jid, deadline) for _, jid, _ in jobs if jid and tab}
+        cur = None
+        if any((j or {}).get("state") == "failed" for j in got.values()):
+            try:
+                cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
+            except ToolError:
+                cur = {}
+        lines, st = [], []
+        for el, jid, err in jobs:
+            cera = el["customData"]["cera"]
+            j = got.get(jid) or {}
+            if not jid:
+                msg = T(f"수식 [{el['id']}]: 렌더 작업을 못 만듦({str(err)[:120]}) — 보드에는 LaTeX 원문 자리 그림이 남는다",
+                        f"math [{el['id']}]: could not create the render job ({str(err)[:120]}) — the board keeps the LaTeX source placeholder")
+                state = "pending"
+            elif j.get("state") == "done":
+                if (j.get("data") or {}).get("skipped"):
+                    msg, state = T(f"수식 [{el['id']}]: 그리기 전에 사람이 고쳤다 — 그대로 둠", f"math [{el['id']}]: a person changed it before it was drawn — left as is"), "changed"
+                else:
+                    msg, state = T(f"수식 [{el['id']}]: 렌더됨", f"math [{el['id']}]: rendered"), "done"
+                    cera["render"] = "done"
+            elif j.get("state") == "failed":
+                now = (cur or {}).get(el["id"]) or {}
+                ncera = ((now.get("customData") or {}).get("cera") or {}) if isinstance((now.get("customData") or {}).get("cera"), dict) else {}
+                why = str(ncera.get("message") or j.get("error") or "")[:300]
+                if ncera.get("render") == "error":
+                    msg = T(f"수식 [{el['id']}]: LaTeX 오류 — {why}. 고치려면 이 요소를 지우고(board_delete) 고친 latex 로 다시 넣는다",
+                            f"math [{el['id']}]: LaTeX error — {why}. To fix it, delete this element (board_delete) and add the corrected latex")
+                    cera.update(render="error", message=why)
+                    state = "error"
+                else:
+                    msg, state = T(f"수식 [{el['id']}]: 렌더 실패({why}) — 자리 그림이 남는다", f"math [{el['id']}]: render failed ({why}) — the placeholder stays"), "failed"
+            elif tab:
+                msg, state = T(f"수식 [{el['id']}]: 렌더 대기 — 탭이 {int(MATH_WAIT)}초 안에 못 그렸다(그리면 바뀐다, board_read 로 확인)",
+                               f"math [{el['id']}]: render pending — no tab drew it within {int(MATH_WAIT)} s (it changes when drawn; check with board_read)"), "pending"
+            else:
+                msg, state = T(f"수식 [{el['id']}]: 렌더 대기(화면이 열리면 그린다)", f"math [{el['id']}]: render pending (drawn when a screen opens)"), "pending"
+            lines.append(msg)
+            st.append({"id": el["id"], "render": state, **({"message": cera.get("message")} if state == "error" else {})})
+        return lines, st
+
+    def _add_mermaid(self, a, it):
+        """kind:"mermaid": a person's tab converts it with the same converter as 'Flowchart from text' (WP-2 mermaid job) into editable
+        shapes and arrows. No tab → isError that suggests kind:"flow" (with the converted flow when the small parser understands it)."""
+        extra = sorted(str(k) for k in it if k not in ITEM_FIELDS["mermaid"])
+        if extra:
+            raise ToolError(T(f"items[0] (mermaid) 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: kind, source",
+                              f"items[0] (mermaid) has unknown field(s): {', '.join(extra)} — allowed: kind, source"))
+        src = it.get("source")
+        if not isinstance(src, str) or not src.strip():
+            raise ToolError(T("items[0].source 는 mermaid 글", "items[0].source must be mermaid text"))
+        if len(src.encode("utf-8")) > MERMAID_MAX:
+            raise ToolError(T(f"items[0].source 는 {MERMAID_MAX // 1000} KB 까지", f"items[0].source is limited to {MERMAID_MAX // 1000} KB"))
+        if a.get("page") is not None:
+            raise ToolError(T("mermaid 는 page 와 함께 쓰지 않는다 — 자리는 at:{x,y} 로", "mermaid does not take page — give the position with at:{x,y}"))
+        at = a.get("at", "right")
+        if at not in ("right",) and not isinstance(at, dict):
+            raise ToolError(T('mermaid 의 at 은 "right"(기본) 또는 {x, y}', 'at for mermaid must be "right" (default) or {x, y}'))
+        args = {"source": src}
+        if isinstance(at, dict):
+            args["at"] = {"x": _num(at.get("x"), "at.x"), "y": _num(at.get("y"), "at.y")}
+        c, sid = self.s.conn(a.get("site"))
+        bid = self.s.board_id(c, sid, a.get("board"))
+        d = _fetch(c, bid)
+        if not self._humans(c, bid, d):
+            hint = ""
+            try:
+                g = gio.parse_mermaid(src)
+                flow = {"kind": "flow", "dir": g["dir"], "layout": "layered",
+                        "nodes": [{"id": x["key"], "label": x["label"], "shape": x["shape"]} for x in g["nodes"]],
+                        "edges": [{"from": e["from"], "to": e["to"], **({"label": e["label"]} if e["label"] else {}), "head": e["head"]}
+                                  for e in g["edges"]]}
+                try:   # offer it only if board_add would take it as is (node count, ids, self-loops, labels)
+                    self._flow(flow, 0, "x", None, 0.0, 0.0)
+                    hint = json.dumps(flow, ensure_ascii=False)
+                except ToolError:
+                    hint = ""
+                hint = T(f"\n이 원문을 바꾼 항목(그대로 board_add items 에 넣으면 된다): {hint}", f"\nThis source as a flow item (put it in board_add items as is): {hint}") \
+                    if hint and len(hint) <= 6000 else ""
+            except gio.MermaidError:
+                pass
+            raise ToolError(T("mermaid 는 사람 화면(편집 탭)이 열려 있어야 그린다 — 지금 열린 탭이 없다. 대신 kind:\"flow\" 로 노드 · 간선을 준다"
+                              "(서버가 배치한다). 아무것도 넣지 않았다." + hint,
+                              "mermaid needs a person's screen (edit tab) open to draw — none is open now. Give nodes and edges with kind:\"flow\" "
+                              "instead (the server lays them out). Nothing was added." + hint))
+        try:
+            code, r = c.req("POST", f"/api/whiteboard/boards/{bid}/jobs", {"kind": "mermaid", "args": args}, timeout=5)
+        except ToolError as e:
+            raise ToolError(T(f"mermaid 작업을 만들지 못했다({str(e)[:160]})", f"could not create the mermaid job ({str(e)[:160]})"))
+        if code not in (200, 201) or not isinstance(r, dict) or not r.get("jid"):
+            msg = (r or {}).get("error") if isinstance(r, dict) else r
+            raise ToolError(T(f"mermaid 작업을 만들지 못했다(HTTP {code}: {str(msg)[:160]})", f"could not create the mermaid job (HTTP {code}: {str(msg)[:160]})"))
+        j = self._job_wait(c, bid, r["jid"], time.time() + MERMAID_WAIT) or {}
+        if j.get("state") == "failed":
+            raise ToolError(T(f"탭이 mermaid 를 그리지 못했다: {str(j.get('error') or '')[:300]}. 아무것도 넣지 않았다 — 원문을 고치거나 kind:\"flow\" 로.",
+                              f"The tab could not draw the mermaid: {str(j.get('error') or '')[:300]}. Nothing was added — fix the source or use kind:\"flow\"."))
+        if j.get("state") != "done":
+            raise ToolError(T(f"탭이 {int(MERMAID_WAIT)}초 안에 그리지 못했다({j.get('state') or '-'}). 늦게 나타날 수 있으니 board_read 로 확인한 뒤 다시 하거나 kind:\"flow\" 로.",
+                              f"No tab drew it within {int(MERMAID_WAIT)} s ({j.get('state') or '-'}). It may still appear — check with board_read before retrying, or use kind:\"flow\"."))
+        ids = [i for i in ((j.get("data") or {}).get("ids") or []) if isinstance(i, str)]
+        els = [e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict) and e.get("id") in set(ids) and not e.get("isDeleted")]
+        self._own(c, bid, [], els)
+        self._pointer(c, bid, els)
+        text, st = ak.describe(els)
+        pics = sum(1 for e in els if e.get("type") == "image")
+        head = T(f"보드 {bid} 에 mermaid 로 {len(els)}개를 넣었다(그린 탭: {(j.get('claimer') or {}).get('user') or '-'}).",
+                 f"Added {len(els)} item(s) from mermaid to board {bid} (drawn by the tab of {(j.get('claimer') or {}).get('user') or '-'}).")
+        if pics:
+            head += T(f" 그림(image) {pics}개 — flowchart 가 아닌 종류는 그림이 된다(편집하려면 kind:\"flow\").",
+                      f" {pics} picture(s) (image) — kinds other than flowchart become a picture (for editable shapes use kind:\"flow\").")
+        lines = annotate(text.split("\n")[1:], {e["id"]: e for e in els}, _labels(els))
+        return head + "\n" + "\n".join(lines), {"board": bid, "ids": [e["id"] for e in els], "items": st["items"], "links": st["links"]}
+
     def board_add(self, a):
         items_in = a.get("items")
         if not isinstance(items_in, list) or not items_in or len(items_in) > 300:
@@ -856,11 +1168,11 @@ class Tools:
                                       f"{', '.join(ITEM_FIELDS[it['kind']])}. Nothing was added."))
                 if it["kind"] == "arrow" and "head" in it and it["head"] not in ak.ARROW_HEADS:   # head:null is refused too (it is not "none")
                     raise ToolError(T(f'items[{n}].head 는 "end" · "start" · "both" · "none"', f'items[{n}].head must be "end", "start", "both" or "none"'))
-            if isinstance(it, dict) and it.get("kind") in ("math", "mermaid"):
-                raise ToolError(T("수식(math) · mermaid 흐름도는 아직 MCP 로 넣을 수 없다 — 사람에게 화면의 수식 · 흐름도 도구"
-                                  "(메뉴 '글로 흐름도 만들기')를 쓰라고 안내하거나, 상자 · 화살표로 그린다.",
-                                  "Math and mermaid flowcharts cannot be added through MCP yet — tell the person to use the on-screen math / flowchart tool "
-                                  "(menu 'Make a flowchart from text'), or draw with boxes and arrows."))
+            if isinstance(it, dict) and it.get("kind") == "mermaid" and len(items_in) != 1:
+                raise ToolError(T("mermaid 는 혼자 넣는다(items 에 그 하나만). 다른 항목은 다음 호출로.",
+                                  "mermaid goes alone (only that one item in items). Add the other items in another call."))
+        if isinstance(items_in[0], dict) and items_in[0].get("kind") == "mermaid":
+            return self._add_mermaid(a, items_in[0])
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
         d = _fetch(c, bid)
@@ -884,6 +1196,8 @@ class Tools:
         new: List[dict] = []
         touched_existing: Dict[str, List[str]] = {}   # existing element id → ids of arrows connecting to it (to add to boundElements)
         files = []
+        maths: List[dict] = []   # formula placeholders — a person's tab typesets them after the write (B5)
+        notes: List[str] = []
         cx = 0.0   # where items without coordinates are laid out in a row (inside the group)
         cy = 0.0
         for n, it in enumerate(items_in):
@@ -952,9 +1266,36 @@ class Tools:
                 h = w * h0 / w0 if w0 else w * 0.75
                 files.append({"id": file_id, "dataURL": url, "mimeType": mime})
                 made = [ak.make_image(file_id, w, h, x, y, by=by, frame_id=fid)]
+            elif kind == "math":
+                latex = _str(it.get("latex"), f"items[{n}].latex", 4000)
+                bad = re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", latex)
+                if bad:   # "\frac" written in JSON as "\f" + "rac": a form feed, not a backslash
+                    raise ToolError(T(f"items[{n}].latex 에 제어 문자 U+{ord(bad.group()):04X} 가 있다 — JSON 에서 역슬래시는 두 번(\\\\frac) 쓴다. 아무것도 넣지 않았다.",
+                                      f"items[{n}].latex contains control character U+{ord(bad.group()):04X} — in JSON write a backslash twice (\\\\frac). Nothing was added."))
+                size = _num(it.get("size", 32), f"items[{n}].size", 8, 200)
+                mcol = it.get("color", ak.INK)
+                if not isinstance(mcol, str) or not HEX.match(mcol):
+                    raise ToolError(T(f"items[{n}].color 는 #rgb · #rrggbb 꼴", f"items[{n}].color must be #rgb or #rrggbb"))
+                svg, w, h = ak.math_placeholder_svg(latex, size, mcol)
+                file_id = hashlib.sha1(svg.encode("utf-8")).hexdigest()[:40]
+                if file_id not in {f["id"] for f in files}:
+                    files.append({"id": file_id, "dataURL": "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii"),
+                                  "mimeType": "image/svg+xml"})
+                el = ak.make_image(file_id, w, h, x, y, latex=latex, by=by, frame_id=fid)
+                el["customData"].update(size=size, color=mcol, cera={"render": "pending"})
+                maths.append(el)
+                made = [el]
+            elif kind == "flow":
+                made, nodes_, note = self._flow(it, n, by, fid, cx, cy)
+                for k, box in nodes_.items():
+                    if k in refs:
+                        raise ToolError(T(f"items[{n}].nodes 의 id {k!r} 가 이번 호출의 다른 ref 와 겹친다", f"items[{n}].nodes id {k!r} clashes with another ref in this call"))
+                    refs[k] = box
+                if note:
+                    notes.append(note)
             else:
-                raise ToolError(T(f"items[{n}].kind = {kind!r} — text · box · arrow · line · frame_page · image",
-                                  f"items[{n}].kind = {kind!r} — must be text, box, arrow, line, frame_page or image"))
+                raise ToolError(T(f"items[{n}].kind = {kind!r} — text · box · arrow · line · frame_page · image · math · flow · mermaid",
+                                  f"items[{n}].kind = {kind!r} — must be text, box, arrow, line, frame_page, image, math, flow or mermaid"))
             if it.get("ref"):
                 refs[str(it["ref"])] = made[0]
             new.extend(made)
@@ -979,6 +1320,12 @@ class Tools:
             ak.place(els, new, at=(fx + 80, (ib[3] + 60) if ib else fy + 120))
         else:
             ak.place(els, new, at=at)
+        for e in new:   # flow edges with bend points: placing moved the group and drew them straight — bend them again, shifted
+            v = e.pop("_via", None)
+            if v:
+                a_, b_, x0_, y0_, via, labl = v
+                dx, dy = a_["x"] - x0_, a_["y"] - y0_
+                ak.route_via(e, a_, b_, [(p[0] + dx, p[1] + dy) for p in via], labl)
         for f in files:
             c.ok("POST", f"/api/whiteboard/boards/{bid}/files", {"client": c.client, **f}, want=(200, 201))
         for i in range(0, len(new), 2000):
@@ -999,14 +1346,23 @@ class Tools:
                     c.ok("POST", f"/api/whiteboard/boards/{bid}/patch", {"client": c.client, "changes": fix})
         self._own(c, bid, list(touched_existing) + [e["id"] for e in new if e.get("type") == "arrow"] if touched_existing else [], new)
         self._pointer(c, bid, new)
+        math_lines, math_st = self._math_jobs(c, bid, d, maths) if maths else ([], [])
+        if any(m["render"] != "pending" for m in math_st):   # a tab changed those formulas (version, size): describe them as they are now
+            try:
+                cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
+                new = [cur.get(e["id"], e) if e.get("type") == "image" else e for e in new]
+            except ToolError:
+                pass
         text, st = ak.describe(new + [live[i] for i in touched_existing])
         created = {k: v["id"] for k, v in refs.items()}
         res = {"board": bid, "created": created, "ids": [e["id"] for e in new], "items": st["items"], "links": st["links"]}
+        if math_st:
+            res["math"] = math_st
         nb = {e["id"]: e for e in new}
         lines = annotate(text.split("\n")[1:], nb, _labels(new))
         return T(f"보드 {bid} 에 {len(new)}개를 넣었다.", f"Added {len(new)} item(s) to board {bid}.") + \
             (f" ref→id: {json.dumps(created, ensure_ascii=False)}" if created else "") + \
-            "\n" + "\n".join(lines), res
+            "".join("\n" + x for x in notes + math_lines) + "\n" + "\n".join(lines), res
 
     def _relabel(self, c_el: dict, lab: Optional[dict], text: str) -> Tuple[dict, dict, Optional[dict]]:
         """Change the text label of a box / arrow → (box set, label set, new label element | None)."""
@@ -1453,6 +1809,13 @@ class Tools:
                         if eid not in acc and self._echo(eid, el, frm):
                             base[eid] = el   # smoothing re-write of a stroke already reported — not news
                             continue
+                        old_ = base.get(eid)
+                        if eid not in acc and not from_old and isinstance(old_, dict) and old_.get("version") == el.get("version") and \
+                                old_.get("versionNonce") == el.get("versionNonce"):
+                            continue   # exactly what this session already has (e.g. the shapes a tab wrote for this agent's mermaid job)
+                        if eid not in acc and _math_rendered(base.get(eid), el):
+                            base[eid] = el   # a person's tab typeset an agent's formula placeholder (math job) — not a person's edit
+                            continue
                         if "any" not in kinds and _wait_kind(el) not in kinds:
                             if eid not in acc:
                                 base[eid] = el
@@ -1897,10 +2260,15 @@ class Tools:
         return "\n".join(lines), {"board": bid, "selections": out}
 
     def board_export(self, a):
+        fmt = a.get("format", "excalidraw")
+        if fmt not in ("excalidraw", "drawio"):
+            raise ToolError(T('format 은 "excalidraw"(기본) 또는 "drawio"', 'format must be "excalidraw" (default) or "drawio"'))
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
         d = _fetch(c, bid)
         els = _live(d.get("elements") or [])
+        if fmt == "drawio":
+            return self._export_drawio(a, bid, d, els)
         files = {}
         for e in els:
             fid = e.get("fileId")
@@ -1917,6 +2285,22 @@ class Tools:
                "appState": {"viewBackgroundColor": "#ffffff"}, "files": files}
         p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         return T(f"{p} 에 저장했다(요소 {len(els)} · 그림 {len(files)}).", f"Saved to {p} (elements {len(els)} · images {len(files)})."), {"path": str(p), "elements": len(els), "files": len(files)}
+
+    def _export_drawio(self, a, bid: str, d: dict, els):
+        """format:"drawio": uncompressed mxGraph XML in board coordinates — shapes and free text as vertices, arrows and lines as edges (U4).
+        Ink, images and page frames are left out and counted."""
+        title = (d.get("meta") or {}).get("title") or bid
+        xml, cnt = gio.to_drawio(els, title)
+        out_dir = Path(os.path.expanduser(a["out_dir"])) if a.get("out_dir") else self.s.ctx.HOME / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^\w가-힣.-]+", "_", title).strip("_")[:60] or bid
+        p = out_dir / f"{name}-{bid}.drawio"
+        p.write_text(xml, encoding="utf-8")
+        sk = cnt["skipped"]
+        left = ", ".join(f"{k} {v}" for k, v in sorted(sk.items()))
+        return T(f"{p} 에 저장했다(도형 · 글 {cnt['vertices']} · 연결 {cnt['edges']}{' · 뺀 것: ' + left if left else ''}). draw.io 에서 열린다.",
+                 f"Saved to {p} (shapes / text {cnt['vertices']} · connections {cnt['edges']}{' · left out: ' + left if left else ''}). It opens in draw.io."), \
+            {"path": str(p), "format": "drawio", "vertices": cnt["vertices"], "edges": cnt["edges"], "skipped": sk}
 
     def board_import(self, a):
         """This computer's .excalidraw, .excalidrawlib and image files — merged into a board (merge) or as a new board (new)."""
@@ -1964,13 +2348,33 @@ def _schemas():
         "description": T("kind 별 칸(그 밖의 칸은 거절) — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(또는 text),x?,y?,w?,h?,"
                          "fill?,color?} · arrow{from,to(ref|요소 id|{x,y}),label?,dashed?,color?,head?(end 기본|start|both|none — none 은 방향 없는 선)} · "
                          "line{points:[[x,y],…],dashed?,color?}(붙지 않는 꺾은선) · frame_page{title?}(새 장 — 뒤 항목은 그 안) · "
-                         "image{path,w?,x?,y?}. x/y 는 묶음 안 자리(생략하면 왼→오로 늘어놓음). math · mermaid 는 아직 안 된다",
+                         "image{path,w?,x?,y?} · math{latex,size?,color?(#hex),x?,y?}(조판 수식 — 열린 사람 탭이 MathJax 로 그린다, 없으면 LaTeX 원문 자리 그림) · "
+                         "flow{dir?(TD|LR),layout?(keep 기본 — nodes 의 at 을 지킴|layered — 서버가 층 배치),nodes:[{id,label?,shape?(box|round|ellipse|diamond),at?{x,y}}],"
+                         "edges:[{from,to,label?,head?(end|none|both)}]}(노드 50개까지, 서버가 상자 · 양끝이 붙은 화살표로 만든다) · "
+                         "mermaid{source}(flowchart 글 — 혼자만, 열린 사람 탭이 바꾼다). x/y 는 묶음 안 자리(생략하면 왼→오로 늘어놓음)",
                          "Fields by kind (other fields are refused) — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(or text),x?,y?,w?,h?,"
                          "fill?,color?} · arrow{from,to(ref|element id|{x,y}),label?,dashed?,color?,head?(end default|start|both|none — none is an undirected edge)} · "
                          "line{points:[[x,y],…],dashed?,color?} (an unbound polyline) · frame_page{title?} (a new page — the items after it go inside) · "
-                         "image{path,w?,x?,y?}. x/y is the position within the group (if omitted, laid out left to right). math and mermaid are not supported yet"),
+                         "image{path,w?,x?,y?} · math{latex,size?,color?(#hex),x?,y?} (a typeset formula — an open person's tab draws it with MathJax; with none, a LaTeX source placeholder) · "
+                         "flow{dir?(TD|LR),layout?(keep default — keeps the nodes' at|layered — the server lays out layers),nodes:[{id,label?,shape?(box|round|ellipse|diamond),at?{x,y}}],"
+                         "edges:[{from,to,label?,head?(end|none|both)}]} (up to 50 nodes; the server makes boxes and arrows bound at both ends) · "
+                         "mermaid{source} (flowchart text — alone; an open person's tab converts it). x/y is the position within the group (if omitted, laid out left to right)"),
         "properties": {
-            "kind": {"type": "string", "enum": ["text", "box", "arrow", "line", "frame_page", "image", "math", "mermaid"]},
+            "kind": {"type": "string", "enum": ["text", "box", "arrow", "line", "frame_page", "image", "math", "flow", "mermaid"]},
+            "latex": {"type": "string", "description": T("math: LaTeX(달러 기호 없이)", "math: LaTeX (without dollar signs)")},
+            "source": {"type": "string", "description": T("mermaid: flowchart 글(20 KB 까지)", "mermaid: flowchart text (up to 20 KB)")},
+            "dir": {"type": "string", "enum": ["TD", "LR"], "description": T("flow 방향(기본 TD)", "flow direction (default TD)")},
+            "layout": {"type": "string", "enum": ["keep", "layered"],
+                       "description": T("flow: keep(기본) — 노드 at(스냅샷에서 읽은 가운데, 보드 좌표)을 20 px 격자 · 줄 맞춤만 하고 지킨다. at:\"absolute\" 면 그 자리, "
+                                        "아니면 모양 그대로 묶음째 옮긴다 · layered — 서버가 층으로 배치",
+                                        "flow: keep (default) — keeps the nodes' at (centres read from a snapshot, board coordinates), only a 20 px grid and row alignment; "
+                                        "with at:\"absolute\" exactly there, otherwise the whole group moves with its shape kept · layered — the server lays out layers")},
+            "nodes": {"type": "array", "maxItems": 50, "items": {"type": "object", "required": ["id"], "properties": {
+                "id": {"type": "string"}, "label": {"type": "string"}, "shape": {"type": "string", "enum": ["box", "round", "ellipse", "diamond"]},
+                "at": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}}},
+            "edges": {"type": "array", "maxItems": 200, "items": {"type": "object", "required": ["from", "to"], "properties": {
+                "from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"},
+                "head": {"type": "string", "enum": ["end", "none", "both"]}}}},
             "head": {"type": "string", "enum": list(ak.ARROW_HEADS), "description": T("arrow 화살촉(기본 end)", "arrow heads (default end)")},
             "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
                        "minItems": 2, "maxItems": 500, "description": T("line 의 점(묶음 안 자리)", "line points (positions within the group)")},
@@ -2027,10 +2431,12 @@ def tool_defs(remote: bool) -> List[dict]:
          "inputSchema": obj({"site": SITE, "title": {"type": "string"}}, ["title"]), "annotations": w},
         {"name": "board_read", "title": T("보드 읽기", "Read a board"),
          "description": T("보드를 읽는다. summary(기본): 장 순서 · 위→아래로 상자 · 글 · 수식 · 연결(\"A\" → \"B\") · 손글씨 획 수와 "
-                          "[id] 와 줄 끝 (vN · 라벨 vM) — 고칠 때 이 id 와 판을 쓴다. elements: 원래 요소 JSON(ids · page 로 좁힌다).",
+                          "[id] 와 줄 끝 (vN · 라벨 vM) — 고칠 때 이 id 와 판을 쓴다. elements: 원래 요소 JSON(ids · page 로 좁힌다). "
+                          "mermaid: 흐름도 노드와 화살표로 이어진 상자를 mermaid flowchart 글로.",
                           "Reads the board. summary (default): in page order, top to bottom — boxes, text, math, arrows (\"A\" → \"B\"), ink stroke counts, "
-                          "with the [id] and (vN · label vM) at the end of each line — use that id and version when editing. elements: the raw element JSON (narrow with ids / page)."),
-         "inputSchema": obj({"site": SITE, "board": BOARD, "format": {"type": "string", "enum": ["summary", "elements"], "default": "summary"},
+                          "with the [id] and (vN · label vM) at the end of each line — use that id and version when editing. elements: the raw element JSON (narrow with ids / page). "
+                          "mermaid: flow nodes and shapes joined by arrows as mermaid flowchart text."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "format": {"type": "string", "enum": ["summary", "elements", "mermaid"], "default": "summary"},
                              "page": {"type": "integer", "description": T("장 번호(판서 장)만", "Only this page number (a board page)")},
                              "ids": {"type": "array", "items": {"type": "string"}},
                              "limit": {"type": "integer", "default": READ_LIMIT, "maximum": 2000, "description": T("줄 · 요소 수 상한", "Maximum number of lines / elements")},
@@ -2038,9 +2444,9 @@ def tool_defs(remote: bool) -> List[dict]:
                              "points": {"type": "boolean", "description": T("elements: 손글씨 · 선의 점까지(크다)", "elements: include the points of ink / lines (large)")}}),
          "annotations": ro},
         {"name": "board_add", "title": T("보드에 그리기", "Draw on a board"),
-         "description": T("상자 · 글 · 화살표 · 새 장 · 그림을 한 묶음으로 넣는다. 사람 화면에 바로 보인다. at: 묶음을 놓을 곳 — "
+         "description": T("상자 · 글 · 화살표 · 새 장 · 그림 · 수식 · 흐름도를 한 묶음으로 넣는다. 사람 화면에 바로 보인다. at: 묶음을 놓을 곳 — "
                           "\"right\"(기존 그림 오른쪽, 기본) · \"below\" · {x,y} · \"absolute\"(x/y 를 보드 좌표로). page: 그 장 안에.",
-                          "Adds boxes, text, arrows, a new page and images as one group. It shows on people's screens right away. at: where to put the group — "
+                          "Adds boxes, text, arrows, a new page, images, formulas and flowcharts as one group. It shows on people's screens right away. at: where to put the group — "
                           "\"right\" (right of the existing drawing, default), \"below\", {x,y} or \"absolute\" (x/y as board coordinates). page: inside that page."),
          "inputSchema": obj({"site": SITE, "board": BOARD, "items": {"type": "array", "items": ITEM, "minItems": 1},
                              "at": {"description": "\"right\" | \"below\" | \"absolute\" | {x, y}"},
@@ -2138,10 +2544,13 @@ def tool_defs(remote: bool) -> List[dict]:
                              "title": {"type": "string", "description": T("mode:new 의 보드 이름(기본: 파일 이름)", "Board name for mode:new (default: the file name)")},
                              "at": {"description": T("merge 자리 — \"right\"(기본) · \"below\" · {x, y}(묶음 가운데)", "merge position — \"right\" (default), \"below\" or {x, y} (center of the group)")}}, ["path"]),
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}},
-        {"name": "board_export", "title": T(".excalidraw 로 저장", "Save as .excalidraw"),
-         "description": T("보드를 .excalidraw 파일로 저장한다(기본 $CERA_HOME/exports). excalidraw.com 에서 열린다.",
-                          "Saves the board as a .excalidraw file (default $CERA_HOME/exports). It opens on excalidraw.com."),
-         "inputSchema": obj({"site": SITE, "board": BOARD, "out_dir": {"type": "string"}}), "annotations": w},
+        {"name": "board_export", "title": T("파일로 저장", "Save to a file"),
+         "description": T("보드를 파일로 저장한다(기본 $CERA_HOME/exports). format:\"excalidraw\"(기본) — excalidraw.com 에서 열린다. "
+                          "format:\"drawio\" — draw.io 파일(비압축 XML, 보드 좌표 그대로): 도형 · 글은 칸, 화살표 · 선은 연결. 손글씨 · 그림은 빠진다.",
+                          "Saves the board to a file (default $CERA_HOME/exports). format:\"excalidraw\" (default) — opens on excalidraw.com. "
+                          "format:\"drawio\" — a draw.io file (uncompressed XML, board coordinates): shapes and text become cells, arrows and lines connections. Ink and images are left out."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "out_dir": {"type": "string"},
+                             "format": {"type": "string", "enum": ["excalidraw", "drawio"], "default": "excalidraw"}}), "annotations": w},
     ]
     if remote:
         defs = [t for t in defs if not t["name"].startswith("site_")]

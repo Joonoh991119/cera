@@ -61,6 +61,17 @@ export function adjustArrow(arrow, targetId, box0, box1) {
   return out;
 }
 
+/** customData of a re-typeset formula: the new latex / size / colour / typeset size; an MCP formula's render state (cera.render · message,
+ *  WP-4) is dropped — it described the old LaTeX (mathJob sets "done" again after this) */
+function freshCustom(cd, next) {
+  const out = { ...(cd || {}), latex: next.latex, size: next.size, color: next.color, w0: next.w, h0: next.h };
+  if (out.cera && typeof out.cera === "object") {
+    const { render, message, ...rest } = out.cera;   // eslint-disable-line no-unused-vars
+    if (Object.keys(rest).length) out.cera = rest; else delete out.cera;
+  }
+  return out;
+}
+
 /**
   * Returns the scene (everything, including deleted elements) with the same formula element replaced by the new formula.
   * next = { fileId, latex, size, color, w, h }, where w/h is the new formula's typeset size.
@@ -76,7 +87,7 @@ export function replaceMath(elements, id, next, natural = null, rand = Math.rand
   const width = next.w * sx, height = next.h * sy;
   const el = bumpWith(old, {
     fileId: next.fileId, width, height, status: "saved",
-    customData: { ...(old.customData || {}), latex: next.latex, size: next.size, color: next.color, w0: next.w, h0: next.h },
+    customData: freshCustom(old.customData, next),
   }, rand);
   const box0 = { x: old.x, y: old.y, width: old.width, height: old.height };
   const box1 = { x: old.x, y: old.y, width, height };

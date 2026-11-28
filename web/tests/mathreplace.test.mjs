@@ -151,3 +151,11 @@ test("리뷰 S2 — color 는 #hex 만", async () => {
   const src = (await import("node:fs")).readFileSync(new URL("../src/features/math/insert.js", import.meta.url), "utf8");
   assert.ok(src.includes('/^#[0-9a-fA-F]{3,8}$/'), "insert.js 의 isHex 가 같은 규칙");
 });
+
+test("WP-4 r1: 고치면 MCP 수식의 렌더 상태(cera.render · message)는 지운다 — 다른 cera 칸은 둔다", () => {
+  const old = math({ customData: { latex: "\\fracc{", size: 32, color: "#1e1e1e", cera: { render: "error", message: "Undefined", by: "Claude" } } });
+  const m = replaceMath([old], "m", { fileId: "f1", latex: "\\frac{a}{b}", size: 32, color: "#1e1e1e", w: 50, h: 40 }, null, rand)[0];
+  assert.deepEqual(m.customData.cera, { by: "Claude" });
+  const plain = replaceMath([math()], "m", { fileId: "f1", latex: "y", size: 32, color: "#E31A1C", w: 120, h: 40 }, null, rand)[0];
+  assert.equal("cera" in plain.customData, false, "cera 가 없던 수식에 빈 cera 를 만들지 않는다");
+});
