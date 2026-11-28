@@ -22,7 +22,15 @@ export function anchorsOf(elements) {
 /** Pids of live anchors as one string (cheap to compare between renders). */
 export const pidKey = (elements) => anchorsOf(elements).map((e) => proposalOf(e).pid).join(",");
 
-/** Request chips the card already speaks for: a proposed request whose pid has a live card shows the card only (no '제안 도착' chip on top). */
+/** Is a card's anchor rect (screen px {x, y, w, h}) at least partly inside the view {w, h}? Off-screen anchors get no card. */
+export const onScreen = (rect, view) => rect.x < view.w && rect.y < view.h && rect.x + rect.w > 0 && rect.y + rect.h > 0;
+
+/** Pids of the cards actually drawn ([{p}] from the layer), as one string for hideCarded: an anchor off screen (or with no room for its
+ * card) draws nothing, so its '제안 도착' chip must stay. */
+export const shownKey = (drawn) => (drawn || []).map((it) => it && it.p && it.p.pid).filter(Boolean).join(",");
+
+/** Request chips a drawn card already speaks for: a proposed request whose pid has a card on screen shows the card only (no chip on top).
+ * key: shownKey of the drawn cards. */
 export function hideCarded(list, key) {
   const pids = new Set(String(key || "").split(",").filter(Boolean));
   if (!pids.size) return list;

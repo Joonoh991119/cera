@@ -139,7 +139,7 @@ REQ_KEEP = 86400.0       # requests are kept 24 h ...
 REQ_KEEP_COUNT = 50      # ... and at most this many per board (finished ones dropped first)
 REQ_GONE_S = 60.0        # working, but the agent that took it has had no presence for this long -> interrupted
 REQ_ID = re.compile(r"^[a-f0-9]{10}$")
-PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")   # = the card route; the anchor id prop-<pid> stays within 64
 # Proposal cards (WP-6, B2): the agent's result sits beside the originals with a locked dashed 'anchor' rectangle (id prop-<pid>) whose
 # customData.cera.proposal = {pid, rid, sources, results, status, home, src_box, deleted, ...}. People press apply / revert / keep / dismiss;
 # the server does it under the board lock (from_status must match, so two presses at once never both win) and broadcasts to everyone.
@@ -733,9 +733,15 @@ class Board:
                     code, body = 409, {"error": T(f"{r.get('agent')} 가 작업 중", f"{r.get('agent')} is working on it"), "status": "working"}
                 else:
                     new = dict(r, status=status, updated=int(t * 1000))
+                    seen = r.get("_seen") if isinstance(r.get("_seen"), dict) else None
                     if agent:
                         new["agent"], new["_agent_client"] = by, client
                         self.agent_seen[client] = t
+                    if status == "working" and seen is None:   # what was on the area when an agent first took it: a later session counts from here
+                        seen = self._req_seen(r)
+                        if seen is not None:
+                            new["_seen"] = seen
+                        seen = None
                     if reply is not None:
                         new["reply"] = reply
                     if pid is not None:
@@ -744,9 +750,28 @@ class Board:
                     self.dirty = True
                     self.publish("request", self.req_public(new))
                     code, body, swept = 200, self.req_public(new), True
+                    if status == "working" and seen is not None:   # only to the agent that takes it, never published
+                        body["seen"] = seen
         if swept:
             self._requests_changed()
         return code, body
+
+    def _req_seen(self, r):
+        """Under the lock: {id: version} of request r's targets plus the live elements centred in its box (anchors left out), or None if huge."""
+        try:
+            b = r["bbox"]
+            x0, y0, x1, y1 = float(b["x"]), float(b["y"]), float(b["x"]) + float(b["w"]), float(b["y"]) + float(b["h"])
+        except (TypeError, KeyError, ValueError):
+            return None
+        tids = {t.get("id") for t in r.get("targets") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)}
+        out = {}
+        for i, e in self.elements.items():
+            if not isinstance(e, dict) or e.get("isDeleted") or proposal_of(e):
+                continue
+            bx = element_box(e)
+            if i in tids or (bx and x0 <= (bx[0] + bx[2]) / 2 <= x1 and y0 <= (bx[1] + bx[3]) / 2 <= y1):
+                out[i] = e.get("version")
+        return out if len(out) <= 20000 else None
 
     def sweep_requests(self):
         with self.lock:
@@ -824,7 +849,12 @@ class Board:
             def with_labels(ids):   # ids plus the live text bound inside them (labels people added later too)
                 ids = [i for i in ids if isinstance(self.elements.get(i), dict) and not self.elements[i].get("isDeleted")]
                 have = set(ids)
-                return [self.elements[i] for i in ids] + [e for e in alive if e.get("containerId") in have and e["id"] not in have]
+                return [self.elements[i] for i in ids] + [e for e in alive if isinstance(e.get("containerId"), str) and e["containerId"] in have
+                                                          and e["id"] not in have]
+
+            def bound_to(e, k, ids):   # arrow e's end k is bound to one of ids (odd records an edit connection posted are skipped)
+                b_ = e.get(k)
+                return isinstance(b_, dict) and isinstance(b_.get("elementId"), str) and b_["elementId"] in ids
 
             def num(v):
                 return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
@@ -842,7 +872,7 @@ class Board:
                     if e.get("type") != "arrow" or e["id"] in ids or not (dx or dy):
                         continue
                     pts = e.get("points")
-                    ends = [isinstance(e.get(k), dict) and e[k].get("elementId") in ids for k in ("startBinding", "endBinding")]
+                    ends = [bound_to(e, k, ids) for k in ("startBinding", "endBinding")]
                     if not any(ends) or not isinstance(pts, list) or len(pts) < 2 or num(e.get("x")) is None or num(e.get("y")) is None or \
                             not all(isinstance(q, (list, tuple)) and len(q) >= 2 and num(q[0]) is not None and num(q[1]) is not None for q in pts):
                         continue
@@ -862,8 +892,16 @@ class Board:
                 if not results:
                     return 409, {"error": T("제안 결과가 모두 지워져서 바꿀 수 없다", "every result of the proposal was deleted - nothing to put in"),
                                  "status": cur}
-                src = [e for e in with_labels(_ids(p.get("sources"))) if e["id"] not in rids]
+                # a page frame picked with the drawings is not an original: the page stays, the results join it (revert lets them go)
+                src = [e for e in with_labels(_ids(p.get("sources"))) if e["id"] not in rids and e.get("type") not in ("frame", "magicframe")]
+                if not src:   # e.g. another proposal on the same originals already replaced them: '원본 ↺' would have nothing to bring back
+                    return 409, {"error": T("원본이 이미 보드에 없어서 바꿀 수 없다", "the originals are no longer on the board - nothing to replace"),
+                                 "status": cur}
                 sids = {e["id"] for e in src}
+                pages = {e.get("frameId") for e in src}
+                page = pages.pop() if len(pages) == 1 else None
+                fr = self.elements.get(page) if isinstance(page, str) else None
+                page = page if isinstance(fr, dict) and not fr.get("isDeleted") and fr.get("type") in ("frame", "magicframe") else None
                 sb = union(src)
                 if sb is None:
                     b0 = p.get("src_box")
@@ -874,31 +912,34 @@ class Board:
                 for e in alive:   # arrows from outside bound to an original: let go now, bind again on revert
                     if e.get("type") == "arrow" and e["id"] not in sids and e["id"] not in rids:
                         for k in ("startBinding", "endBinding"):
-                            if isinstance(e.get(k), dict) and e[k].get("elementId") in sids:
+                            if bound_to(e, k, sids):
                                 unbound.append([e["id"], k, e[k]])
                                 bump(e, **{k: None})
-                np.update(status="applied", deleted=[e["id"] for e in src], unbound=unbound, by_act=by)
+                framed = [[e["id"], e.get("frameId") if isinstance(e.get("frameId"), str) else None] for e in results
+                          if page and e.get("frameId") != page]
+                np.update(status="applied", deleted=[e["id"] for e in src], unbound=unbound, framed=framed, by_act=by)
                 bump(a, **moved(a, dx, dy), customData=self._prop_custom(a, np))   # the anchor first: its record must never be cut off
                 for e in src:
                     bump(e, isDeleted=True)
                 for e in results:
-                    bump(e, **moved(e, dx, dy))
+                    bump(e, **moved(e, dx, dy), **({"frameId": page} if page else {}))
                 follow(rids, dx, dy)
                 new_status = "applied"
             elif action == "revert":
                 home, ax, ay = p.get("home"), num(a.get("x")), num(a.get("y"))
                 ok = isinstance(home, list) and len(home) == 2 and all(num(v) is not None for v in home) and ax is not None and ay is not None
                 dx, dy = (home[0] - ax, home[1] - ay) if ok else (0.0, 0.0)
-                np.update(status="proposed", deleted=[], unbound=[], by_act=by)
+                np.update(status="proposed", deleted=[], unbound=[], framed=[], by_act=by)
                 bump(a, **moved(a, dx, dy), customData=self._prop_custom(a, np))
                 for i in _ids(p.get("deleted")):
                     e = self.elements.get(i)
                     if isinstance(e, dict) and e.get("isDeleted"):
                         bump(e, isDeleted=False)
+                back = {u[0]: u[1] for u in p.get("framed") if isinstance(u, list) and len(u) == 2 and isinstance(u[0], str)} if isinstance(p.get("framed"), list) else {}
                 for e in results:
-                    bump(e, **moved(e, dx, dy))
+                    bump(e, **moved(e, dx, dy), **({"frameId": back[e["id"]]} if e["id"] in back else {}))
                 follow(rids, dx, dy)
-                for u in p.get("unbound") or []:
+                for u in p.get("unbound") if isinstance(p.get("unbound"), list) else []:
                     e = self.elements.get(u[0]) if isinstance(u, list) and len(u) == 3 and isinstance(u[0], str) else None
                     if isinstance(e, dict) and not e.get("isDeleted") and u[1] in ("startBinding", "endBinding") and isinstance(u[2], dict) and \
                             not (out.get(e["id"]) or e).get(u[1]):
@@ -911,6 +952,11 @@ class Board:
                 bump(a, isDeleted=True)
                 for e in results:
                     bump(e, isDeleted=True)
+                for e in alive:   # outside arrows bound to a result let go (they would point at a deleted id)
+                    if e.get("type") == "arrow" and e["id"] not in rids:
+                        sets = {k: None for k in ("startBinding", "endBinding") if bound_to(e, k, rids)}
+                        if sets:
+                            bump(e, **sets)
                 new_status = "gone"
             lst_out = list(out.values())
             took = []
@@ -1982,7 +2028,7 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.send(201, b.meta_public())
             if path == "/api/whiteboard/boards/import":   # import into a new board
                 return self.do_import(None, data, "new", usr, client=str(data.get("client", ""))[:40])
-            pm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/proposals/([A-Za-z0-9_-]{1,40})$", path)
+            pm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/proposals/([A-Za-z0-9_-]{1,40})$", path)   # = PID_RE
             if pm:
                 return self.do_proposal(pm, data, usr)
             rm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/requests(?:/([A-Za-z0-9]{1,40}))?$", path)

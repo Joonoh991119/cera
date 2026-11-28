@@ -1294,7 +1294,8 @@ class Tools:
                     raise ToolError(T(f"요청 {prop['request']} 는 이미 {req.get('status')} — 제안을 놓지 않았다", f"Request {prop['request']} is already {req.get('status')} — no proposal placed"))
             src_in = prop["sources"] if prop["sources"] is not None else \
                 [t.get("id") for t in (req or {}).get("targets") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)]
-            prop["sources"] = [i for i in dict.fromkeys(src_in) if i in live and not ak.proposal_of(live[i])]
+            prop["sources"] = [i for i in dict.fromkeys(src_in) if i in live and not ak.proposal_of(live[i])   # a page frame picked with the drawings
+                               and live[i].get("type") not in ("frame", "magicframe")]                              # is not an original (the page stays)
             if not prop["sources"]:
                 raise ToolError(T("proposal.sources 의 원본이 보드에 하나도 없다(지워졌거나 id 가 틀리다). 아무것도 넣지 않았다.",
                                   "None of proposal.sources is on the board (deleted, or wrong ids). Nothing was added."))
@@ -1453,7 +1454,8 @@ class Tools:
         anchor = None
         if prop is not None:
             src_els = [live[i] for i in prop["sources"]]
-            drift = self._drift(c, bid, req, els, {e["id"] for e in new}) if req else 0
+            seen = self._claim(c, bid, req) if req else None   # take the request before anything goes in: held by another connection -> nothing added
+            drift = self._drift(c, bid, req, els, {e["id"] for e in new}, seen) if req else 0
             anchor = ak.make_anchor(secrets.token_hex(5), ak.scene_bbox(new), rid=req.get("rid") if req else None, sources=prop["sources"],
                                     results=[e["id"] for e in new], src_box=ak.scene_bbox(src_els), note=prop["note"],
                                     uncertain=prop["uncertain"], drift=drift, agent=by, by=by)
@@ -1515,6 +1517,18 @@ class Tools:
         return T(f"보드 {bid} 에 {len(new)}개를 넣었다.", f"Added {len(new)} item(s) to board {bid}.") + \
             (f" ref→id: {json.dumps(created, ensure_ascii=False)}" if created else "") + prop_line + \
             "".join("\n" + x for x in notes + math_lines) + "\n" + "\n".join(lines), res
+
+    def _claim(self, c: Conn, bid: str, req: dict) -> Optional[dict]:
+        """Hold request req (working) before a proposal for it is placed, so the card and the 'proposal placed' chip go in together or not at all.
+        -> what the server kept on the request's area at the first working ({id: version}, for 'changed after reading'), or None."""
+        code, d = c.req("POST", f"/api/whiteboard/boards/{bid}/requests/{req['rid']}", {"client": c.client, "status": "working"})
+        if code != 200 or not isinstance(d, dict):
+            err = (d or {}).get("error") if isinstance(d, dict) else d
+            raise ToolError(T(f"요청 [{req['rid']}] 을 잡지 못했다({code}: {err}) — 다른 연결이 작업 중이면 끝나거나 '중단됨' 이 된 뒤 다시. 아무것도 넣지 않았다.",
+                              f"Could not take request [{req['rid']}] ({code}: {err}) — if another connection is working on it, retry once it finishes "
+                              f"or shows 'interrupted'. Nothing was added."))
+        seen = d.get("seen")
+        return seen if isinstance(seen, dict) else None
 
     def _refit_anchor(self, c: Conn, bid: str, cur: dict, anchor: dict) -> Optional[dict]:
         """After a tab typeset the formulas (their size changed), make the anchor wrap the result again - only if nobody acted on it meanwhile
@@ -1617,11 +1631,14 @@ class Tools:
                 store = self.s.req_seen = {}
             store[(c.base, bid, r["rid"])] = seen
 
-    def _drift(self, c: Conn, bid: str, req: dict, els: List[dict], own: set) -> int:
+    def _drift(self, c: Conn, bid: str, req: dict, els: List[dict], own: set, server_seen: Optional[dict] = None) -> int:
         """How much changed on the request's area since this agent took it or last looked at it (board_snapshot request): elements seen then
         whose version moved or that were deleted, plus people's elements now centred in the box that were not there. Server versions only.
-        Without a record (another session took it) only the targets' versions at request time are compared."""
+        Without this session's record (another session took it, or this MCP restarted) the server's record from the first working is used
+        (server_seen); without either, only the targets' versions at request time are compared."""
         seen = (getattr(self.s, "req_seen", None) or {}).get((c.base, bid, req.get("rid")))
+        if seen is None:
+            seen = server_seen
         if seen is None:
             seen, count_new = {t.get("id"): t.get("v") for t in req.get("targets") or [] if isinstance(t, dict)}, False
         else:

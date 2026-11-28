@@ -4,13 +4,15 @@
 // After apply the card says 바꿈 [원본 ↺] [확정]. Every press goes to the server, which acts under its lock and tells everyone; each screen
 // shows a 3 s toast (the apply toast has [원래대로]). Drawn as HTML, never as elements, so exports and undo never see it.
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { anchorsOf, proposalOf, cardModel, cardSize, actionBody, toastModel, retryNote, retryIds, label, TITLE, driftText, stateText, TOAST_MS } from "./proposal.js";
+import { anchorsOf, proposalOf, onScreen, shownKey, cardModel, cardSize, actionBody, toastModel, retryNote, retryIds, label, TITLE, driftText, stateText, TOAST_MS } from "./proposal.js";
 import { toScreen, place } from "../ask/requests.js";
 import { screenObstacles, viewSize, afterLayout } from "../ask/dom.js";
 import { call } from "../ask/useRequests.js";
 import { tr } from "../../i18n.js";
 import "../ask/ask.css";
 import "./proposal.css";
+
+const RETRY_GAP_MS = 3000;   // server REQ_GAP: one request every 3 s per connection
 
 function why(r) {
   if (r.status === 409) return tr("그사이 다른 사람이 먼저 눌렀어요", "Someone else got there first");
@@ -73,6 +75,7 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
   const [unsure, setUnsure] = useState(null);    // desktop: pid whose '?' list is open
   const [toast, setToast] = useState(null);      // {text, undo, pid, key}
   const env = useRef({});
+  const flying = useRef(new Set());              // pids whose press is on the way, seen at once (a double press before the re-render)
   env.current = { boardId, client, viewOnly, requests, create };
 
   useEffect(() => {
@@ -113,7 +116,6 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
   const els = excal ? excal.getSceneElements() : [];
   const anchors = anchorsOf(els);
   const key = anchors.map((a) => `${proposalOf(a).pid}`).join(",");
-  useEffect(() => { onPids && onPids(key); }, [key, onPids]);
   const sheetState = sheet ? (anchors.find((a) => proposalOf(a).pid === sheet) ? proposalOf(anchors.find((a) => proposalOf(a).pid === sheet)).status : "gone") : "";
   useEffect(() => { if (sheet && sheetState !== "proposed") setSheet(null); }, [sheet, sheetState]);   // someone else decided meanwhile: the sheet closes
 
@@ -121,19 +123,22 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
 
   async function act(p, button) {
     const { boardId: bid, client: cl } = env.current;
-    if (env.current.viewOnly || busy[p.pid]) return;
+    if (env.current.viewOnly || busy[p.pid] || flying.current.has(p.pid)) return;
     if (button === "open") { setSheet(p.pid); return; }
     if (button === "retry") {
       const ids = retryIds(p, excal.getSceneElements());
       if (!ids.length) { say(tr("원본이 보드에 없어서 다시 맡길 수 없어요", "The original is gone, so it can't be sent again")); return; }
       const r0 = (env.current.requests || []).find((r) => r.rid === p.rid);
-      try { await env.current.create({ kind: (r0 && r0.kind) || "auto", note: retryNote(p.pid, (r0 && r0.note) || ""), ids }); say(tr("다시 맡겼어요", "Sent to the AI again")); setSheet(null); }
-      catch (e) { say(tr(`다시 보내지 못했어요: ${e.message}`, `Couldn't send it again: ${e.message}`)); }
+      // a double press sends one request: the buttons stay off until the server takes the next one (one request every 3 s), so no 429 toast
+      flying.current.add(p.pid); setBusy((b) => ({ ...b, [p.pid]: true }));
+      const free = () => { flying.current.delete(p.pid); setBusy((b) => { const n = { ...b }; delete n[p.pid]; return n; }); };
+      try { await env.current.create({ kind: (r0 && r0.kind) || "auto", note: retryNote(p.pid, (r0 && r0.note) || ""), ids }); say(tr("다시 맡겼어요", "Sent to the AI again")); setSheet(null); setTimeout(free, RETRY_GAP_MS); }
+      catch (e) { say(tr(`다시 보내지 못했어요: ${e.message}`, `Couldn't send it again: ${e.message}`)); free(); }
       return;
     }
     const body = actionBody(p, button, cl);
     if (!body) return;
-    setBusy((b) => ({ ...b, [p.pid]: true }));
+    flying.current.add(p.pid); setBusy((b) => ({ ...b, [p.pid]: true }));
     try {
       const r = await call("POST", `/api/whiteboard/boards/${bid}/proposals/${encodeURIComponent(p.pid)}`, body);
       if (r.status === 409) {
@@ -143,7 +148,7 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
       } else if (r.status !== 200) say(why(r));
       else setSheet(null);
     } catch (_) { say(tr("보내지 못했어요 — 연결을 확인해 주세요", "Couldn't send — check your connection")); }
-    finally { setBusy((b) => { const n = { ...b }; delete n[p.pid]; return n; }); }
+    finally { flying.current.delete(p.pid); setBusy((b) => { const n = { ...b }; delete n[p.pid]; return n; }); }
   }
 
   const undo = (t) => {
@@ -159,7 +164,7 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
     for (const a of anchors) {
       const p = proposalOf(a), m = cardModel(p, { touch, viewOnly });
       const rect = toScreen({ x: a.x, y: a.y, w: a.width, h: a.height }, st);
-      if (!(rect.x < view.w && rect.y < view.h && rect.x + rect.w > 0 && rect.y + rect.h > 0)) continue;
+      if (!onScreen(rect, view)) continue;
       const { w, h } = cardSize(m, touch);
       const at = place(rect, w, h, placed, view);
       if (!at) continue;
@@ -169,6 +174,8 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
     }
     return out;
   }, [excal, frame, key, touch, viewOnly, st && st.scrollX, st && st.scrollY, st && st.zoom && st.zoom.value]);   // eslint-disable-line react-hooks/exhaustive-deps
+  const shown = shownKey(items);   // only cards on screen hide their '제안 도착' chip — an off-screen card leaves the chip showing
+  useEffect(() => { onPids && onPids(shown); }, [shown, onPids]);
 
   const open = sheet ? items.find((it) => it.p.pid === sheet) || anchors.map((a) => ({ p: proposalOf(a) })).find((it) => it.p.pid === sheet) : null;
   return (

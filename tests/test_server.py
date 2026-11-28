@@ -1105,5 +1105,94 @@ class ProposalsR1(Proposals):
         self.assertFalse(self.els()["s0"].get("isDeleted"))
 
 
+class ProposalsR2(Proposals):
+    """WP-6 review r2 repros (Fable 2 · 3 · 5, Opus: dismiss binding · seen in request meta, neon 10)."""
+    for _n in [n for n in dir(Proposals) if n.startswith("test_")]:
+        locals()[_n] = None
+    del _n
+
+    def test_r2_page_frame_among_sources_is_never_deleted_and_results_join_the_page(self):
+        """Fable r2 #2: a page frame selected with the drawings is not an original - apply leaves the page; the results join it, revert lets go."""
+        fr = _ak().make_frame(None, -160, -50, 1600, 900, page=1)
+        self.post([fr] + [dict(e, frameId=fr["id"], version=e["version"] + 1) for e in self.src])
+        a = _ak().make_anchor("pg", (300, 30, 480, 70), rid=None, sources=["s0", "s1", "s2", "box", fr["id"]], results=["r0", "r1"],
+                              src_box=(-160, -50, 1440, 850), agent="C", by="C")
+        self.post([a])
+        self.assertEqual(self.act("apply", pid="pg")[0], 200)
+        e = self.els()
+        self.assertFalse(e[fr["id"]].get("isDeleted"), "장은 지우지 않는다")
+        self.assertTrue(e["s0"]["isDeleted"])
+        self.assertEqual((e["r0"]["x"], e["r0"]["y"]), (0.0, 20.0), "결과는 장이 아니라 그림 자리로")
+        self.assertEqual((e["r0"].get("frameId"), e["r1"].get("frameId")), (fr["id"], fr["id"]), "결과가 장에 들어간다")
+        self.assertEqual(self.act("revert", "applied", pid="pg")[0], 200)
+        e = self.els()
+        self.assertEqual((e["r0"].get("frameId"), e["s0"].get("isDeleted")), (None, False), "원래대로 하면 장에서 나온다")
+        self.assertEqual(self.act("keep", pid="pg")[0], 200)
+        self.assertFalse(self.els()[fr["id"]].get("isDeleted"))
+
+    def test_r2_odd_ids_on_the_board_never_break_the_buttons(self):
+        """Fable r2 #3: non-string containerId / binding ids and a non-list unbound are skipped, not a dropped connection."""
+        self.post([{"id": "j1", "type": "text", "x": 0, "y": 0, "width": 1, "height": 1, "containerId": ["x"], "version": 1, "versionNonce": 1},
+                   {"id": "j2", "type": "arrow", "x": 0, "y": 0, "width": 1, "height": 1, "points": [[0, 0], [1, 1]],
+                    "startBinding": {"elementId": ["x"]}, "endBinding": {"elementId": {"a": 1}}, "version": 1, "versionNonce": 1}])
+        self.assertEqual(self.act("apply")[0], 200)
+        b = self.store.get(self.bid)
+        with b.lock:
+            a = b.elements["prop-p1"]
+            b.elements["prop-p1"] = dict(a, customData={"cera": {"proposal": dict(srv.proposal_of(a), unbound=5)}})
+        self.assertEqual(self.act("revert", "applied")[0], 200)
+        self.assertEqual(self.act("dismiss")[0], 200)
+
+    def test_r2_apply_refused_when_the_originals_are_already_gone(self):
+        """Fable r2 #5: another proposal on the same originals already replaced them - this one cannot apply (its '원본 ↺' would bring back nothing)."""
+        self.post([{"id": "q0", "type": "rectangle", "x": 300, "y": 200, "width": 80, "height": 40, "version": 1, "versionNonce": 1}])
+        self.post([_ak().make_anchor("p2", (300, 200, 380, 240), rid=None, sources=["s0", "s1", "s2", "box"], results=["q0"],
+                                     src_box=(0, 20, 80, 100), agent="C", by="C")])
+        self.assertEqual(self.act("apply", pid="p1")[0], 200)
+        st, d = self.act("apply", pid="p2")
+        self.assertEqual((st, d.get("status")), (409, "proposed"), d)
+        e = self.els()
+        self.assertEqual((e["q0"]["x"], srv.proposal_of(e["prop-p2"])["status"]), (300, "proposed"), "둘째는 그대로")
+        self.assertEqual(self.act("revert", "applied", pid="p1")[0], 200)
+        self.assertEqual(self.act("apply", pid="p2")[0], 200, "첫째를 되돌리면 둘째를 바꿀 수 있다")
+
+    def test_r2_dismiss_lets_go_of_arrows_bound_to_the_results(self):
+        """Opus r2 (minor): an outside arrow bound to a result does not point at a deleted id after dismiss."""
+        self.post([{"id": "ext", "type": "arrow", "x": 600, "y": 50, "width": 120, "height": 0, "points": [[0, 0], [-120, 0]], "version": 1,
+                    "versionNonce": 1, "startBinding": {"elementId": "s0", "focus": 0, "gap": 4}, "endBinding": {"elementId": "r1", "focus": 0, "gap": 4}}])
+        self.assertEqual(self.act("dismiss")[0], 200)
+        e = self.els()
+        self.assertIsNone(e["ext"]["endBinding"])
+        self.assertEqual(e["ext"]["startBinding"]["elementId"], "s0", "다른 끝은 그대로")
+
+    def test_r2_long_pid_route_matches_the_pid_rule(self):
+        """neon r1 #10: a pid the request accepts is one the card route takes (40 - the anchor id prop-<pid> stays within 64)."""
+        self.assertIsNone(srv.PID_RE.match("p" * 41))
+        pid = "p" * 40
+        self.post([_ak().make_anchor(pid, (300, 30, 480, 70), rid=None, sources=["s0"], results=["r0"], src_box=(0, 20, 80, 100), agent="x", by="x")])
+        self.assertEqual(self.act("keep", pid=pid)[0], 200)
+
+    def test_r2_first_working_records_what_was_there_for_a_later_session(self):
+        """Opus r2 / risk (a): 'changed after reading' must not reset when another session (an MCP restart) places the proposal. The server keeps
+        what was on the area at the first working ({id: version}) and gives it back to the agent that takes the request later."""
+        _, r = self.call("POST", self.base + "/requests", self.person("민수"), {"client": "c2", "kind": "diagram", "ids": ["r0", "r1"]})
+        st, d = self.call("POST", f"{self.base}/requests/{r['rid']}", self.agent(), {"client": "ag-1", "status": "working"})
+        self.assertEqual(st, 200, d)
+        self.assertNotIn("seen", d, "처음 잡을 때는 앞선 기록이 없다")
+        b = self.store.get(self.bid)
+        with b.lock:
+            self.assertEqual(b._reqs()[-1]["_seen"], {"r0": 1, "r1": 1}, "그 자리에 있던 것과 version")
+        st, d = self.call("POST", f"{self.base}/requests/{r['rid']}", self.agent(), {"client": "ag-2", "status": "working"})
+        self.assertEqual(st, 409, "다른 연결이 잡고 있으면 못 잡는다")
+        with b.lock:   # ag-1 went away long ago
+            b.agent_seen["ag-1"] = 0.0
+            b.loaded_at = 0.0
+            b.meta["requests"] = [dict(x, updated=0) if x["rid"] == r["rid"] else x for x in b.meta["requests"]]
+        st, d = self.call("POST", f"{self.base}/requests/{r['rid']}", self.agent(), {"client": "ag-2", "status": "working"})
+        self.assertEqual((st, d.get("seen")), (200, {"r0": 1, "r1": 1}), d)
+        _, lst = self.call("GET", self.base + "/requests", self.person())
+        self.assertNotIn("_seen", json.dumps(lst), "사람 화면에는 안 나간다")
+
+
 if __name__ == "__main__":
     unittest.main()

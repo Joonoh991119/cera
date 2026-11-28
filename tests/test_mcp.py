@@ -2444,6 +2444,48 @@ class Wp6(Base):
         self.assertEqual({e["id"]: e["version"] for e in self.board() if e["id"] in self.vers}, self.vers)
 
 
+class Wp6R2(Wp6):
+    """WP-6 review r2: a request another connection holds gets nothing (Opus r2), a page frame among the targets is not an original (Fable r2 #2)."""
+    for _n in [n for n in dir(Wp6) if n.startswith("test_")]:
+        locals()[_n] = None
+    del _n
+
+    def test_r2_request_held_by_another_connection_gets_nothing(self):
+        r = self.ask()
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        before = sorted(e["id"] for e in self.board())
+        m2 = self.mcp()
+        m2.init()
+        try:
+            res = m2.tool("board_add", {"site": self.sid, "board": self.bid, "items": [{"kind": "text", "text": "x"}], "proposal": {"request": r["rid"]}})
+        finally:
+            m2.close()
+        self.assertTrue(res.get("isError"), res)
+        self.assertIn("아무것도 넣지 않았다", res["content"][0]["text"])
+        self.assertEqual(sorted(e["id"] for e in self.board()), before, "카드도 결과도 안 들어간다")
+        rq = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/requests", self.h)[1]["requests"][0]
+        self.assertEqual(rq["status"], "working")
+        # the session that holds it still places it
+        res = self.m.ok("board_add", {"items": [{"kind": "text", "text": "x"}], "proposal": {"request": r["rid"]}})
+        self.assertIn("제안 도착", res["content"][0]["text"])
+
+    def test_r2_page_frame_picked_with_the_drawings_is_not_an_original(self):
+        sb = self.src_box()
+        fr = AK.make_frame(None, sb[0] - 100, sb[1] - 100, sb[2] - sb[0] + 900, sb[3] - sb[1] + 200, page=1)
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": [fr]})[0], 200)
+        r = self.ask(ids=self.flow + [fr["id"]])
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        res = self.m.ok("board_add", {"items": [{"kind": "box", "label": "X"}], "proposal": {"request": r["rid"]}})
+        a = next(e for e in self.board() if e["id"] == res["structuredContent"]["proposal"]["anchor"])
+        p = AK.proposal_of(a)
+        self.assertNotIn(fr["id"], p["sources"], "장은 원본이 아니다")
+        self.assertEqual(sorted(p["sources"]), sorted(self.flow))
+        self.assertLess(a["x"] + a["width"], fr["x"] + fr["width"], "자리는 장이 아니라 그림 옆 — 장 안에 놓인다")
+        st, d = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/proposals/{p['pid']}", self.h, {"client": "hum1", "action": "apply", "from_status": "proposed"})
+        self.assertEqual(st, 200, d)
+        self.assertFalse(next(e for e in self.board() if e["id"] == fr["id"]).get("isDeleted"), "바꿔도 장은 남는다")
+
+
 class Wp6Spot(unittest.TestCase):
     """WP-6 placement in-process: right of the originals +30 when free, below when the right is taken."""
     def test_right_then_below(self):
@@ -2464,6 +2506,22 @@ class Wp6Spot(unittest.TestCase):
         self.assertEqual(mod.Tools._proposal_spot({"s": src, fr["id"]: fr}, ["s"], res), (300 + 30 + AK.PROPOSAL_PAD, 100))
         with self.assertRaises(mod.ToolError):
             mod.Tools._proposal_spot({"s": dict(src, x="bad")}, ["s"], res)
+
+    def test_r2_drift_counts_from_the_servers_record_after_a_restart(self):
+        """Opus r2 / risk (a): a session that did not take the request (an MCP restart) counts from what the server kept at the first working,
+        not from the request's targets only; this session's own reading still comes first."""
+        import types
+        mod = _load("tb_mcp", "cera_tb_mcp_wp6r2")
+        req = {"rid": "r1", "targets": [{"id": "a", "v": 1}], "bbox": {"x": 0, "y": 0, "w": 100, "h": 100}}
+        els = [{"id": "a", "type": "rectangle", "x": 10, "y": 10, "width": 10, "height": 10, "version": 1},
+               {"id": "b", "type": "freedraw", "x": 30, "y": 30, "width": 10, "height": 10, "version": 2},
+               {"id": "late", "type": "freedraw", "x": 50, "y": 50, "width": 10, "height": 10, "version": 1}]
+        me = types.SimpleNamespace(s=types.SimpleNamespace())
+        c = types.SimpleNamespace(base="http://x")
+        self.assertEqual(mod.Tools._drift(me, c, "bd", req, els, set()), 0, "기록 없으면 대상 version 만")
+        self.assertEqual(mod.Tools._drift(me, c, "bd", req, els, set(), {"a": 1, "b": 1}), 2, "서버 기록: 고친 b + 새 late")
+        me.s.req_seen = {("http://x", "bd", "r1"): {"a": 1, "b": 2, "late": 1}}
+        self.assertEqual(mod.Tools._drift(me, c, "bd", req, els, set(), {"a": 1, "b": 1}), 0, "이 세션이 더 나중에 읽은 것이 먼저")
 
 
 if __name__ == "__main__":

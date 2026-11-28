@@ -4,6 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   proposalOf, isAnchor, anchorsOf, pidKey, hideCarded, cardModel, cardSize, actionBody, toastModel, retryNote, retryIds, sceneHash, label, driftText, ACTION,
+  onScreen, shownKey,
 } from "../src/features/proposal/proposal.js";
 import { resolveScope, expandSelection } from "../src/features/export/exporters.js";
 import { place } from "../src/features/ask/requests.js";
@@ -108,6 +109,18 @@ test("WP-5 chip: a proposed request whose card is on the board shows only the ca
   const list = [{ rid: "a", status: "proposed", pid: "p1" }, { rid: "b", status: "proposed", pid: "p9" }, { rid: "c", status: "working", pid: null }];
   assert.deepEqual(hideCarded(list, "p1,p2").map((r) => r.rid), ["b", "c"]);
   assert.equal(hideCarded(list, ""), list);
+});
+
+test("Fable r2 #1: a card off screen does not hide its '제안 도착' chip — only drawn cards do", () => {
+  const view = { w: 390, h: 844 };
+  assert.equal(onScreen({ x: 400, y: 100, w: 200, h: 80 }, view), false, "오른쪽 밖");
+  assert.equal(onScreen({ x: 380, y: 100, w: 200, h: 80 }, view), true, "조금이라도 보이면");
+  assert.equal(onScreen({ x: -300, y: 100, w: 200, h: 80 }, view), false);
+  const list = [{ rid: "a", status: "proposed", pid: "p1" }, { rid: "b", status: "proposed", pid: "p2" }];
+  const drawn = [{ p: { pid: "p2" } }];   // p1's anchor is off screen: no card
+  assert.equal(shownKey(drawn), "p2");
+  assert.deepEqual(hideCarded(list, shownKey(drawn)).map((r) => r.rid), ["a"], "p1 의 칩은 남는다");
+  assert.deepEqual(hideCarded(list, shownKey([])).map((r) => r.rid), ["a", "b"]);
 });
 
 test("scene hash: sorted id:version of live elements", () => {
