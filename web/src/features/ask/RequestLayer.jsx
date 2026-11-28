@@ -54,7 +54,7 @@ export default function RequestLayer({ excal, list, touch, viewOnly, onAction })
         <React.Fragment key={rid}>
           <div className={`wb-ask-area wb-ask-${model.tone}`} style={{ left: rect.x - 6, top: rect.y - 6, width: rect.w + 12, height: rect.h + 12 }} aria-hidden="true" />
           {chip && (
-            <div className={`wb-ask-chip wb-ask-${model.tone}${touch ? " wb-ask-touch" : ""}`} style={{ left: chip.x, top: chip.y, width: chip.w, height: chip.h }}
+            <div className={`wb-ask-chip wb-ask-${model.tone}${touch ? " wb-ask-touch" : ""}`} data-rid={rid} style={{ left: chip.x, top: chip.y, width: chip.w, height: chip.h }}
               role="status" onPointerDown={(e) => e.stopPropagation()}>
               <span className="wb-ask-line">
                 {order && <b className="wb-ask-order" title={tr(`겹치는 요청 중 ${order}번째`, `Request ${order} in this area`)}>{order}</b>}

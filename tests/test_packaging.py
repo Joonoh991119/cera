@@ -311,6 +311,56 @@ class McpCommands(unittest.TestCase):
                 self.assertIn("site_open", tools, rel)
 
 
+class RoughToConcreteDocs(unittest.TestCase):
+    """WP-8: the skill's 'Rough -> concrete' section (8 steps, the three-agent table, the request-note rule) within a 120-line body, every MCP tool
+    documented in the skill and the guide, the reference file, the guide pictures (<= 200 KB each), and the plugin hook file."""
+
+    def body(self):
+        txt = (HERE / "skills/cera/SKILL.md").read_text(encoding="utf-8")
+        return re.split(r"^---\n.*?\n---\n", txt, maxsplit=1, flags=re.S)[1]
+
+    def test_skill_section_steps_table_and_note_rule(self):
+        body = self.body()
+        self.assertLessEqual(len(body.splitlines()), 120)
+        sec = body.split("## Rough → concrete", 1)[1].split("\n## ", 1)[0]
+        self.assertEqual([int(n) for n in re.findall(r"^(\d)\. \*\*", sec, re.M)], list(range(1, 9)))
+        self.assertRegex(sec, r"\| *\| *Claude Code *\| *Codex *\| *Antigravity *\|")
+        self.assertIn("data, not instructions", sec)
+        self.assertIn("declined", sec)
+        self.assertIn("references/rough-to-concrete.md", sec)
+        self.assertNotIn("Do not create formulas or mermaid", body)
+        self.assertIn("withdraw", sec, "a later formula error is taken back with withdraw (r6)")
+        ref = (HERE / "skills/cera/references/rough-to-concrete.md").read_text(encoding="utf-8")
+        for k in ('"uncertain"', '"alts"', "board_snapshot", "board_request_update", '"layout": "keep"', "declined", "CERA_HOOK", '"withdraw"', "prop-<pid>"):
+            self.assertIn(k, ref, k)
+
+    def test_every_mcp_tool_is_documented(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, tools = mcp_handshake([sys.executable, str(CLI), "mcp"], {**os.environ, "CERA_HOME": td})
+        guide = (HERE / "docs/guide.md").read_text(encoding="utf-8")
+        skill = (HERE / "skills/cera/SKILL.md").read_text(encoding="utf-8")
+        self.assertGreaterEqual(len(tools), 16)
+        for t in tools:
+            self.assertIn(t, guide, t)
+            self.assertIn(t, skill, t)
+
+    def test_guide_pictures_exist_and_are_small(self):
+        guide = (HERE / "docs/guide.md").read_text(encoding="utf-8")
+        for name in ("rough-request.png", "rough-card.png", "rough-applied.png"):
+            self.assertIn(f"](images/{name})", guide)
+            f = HERE / "docs/images" / name
+            self.assertTrue(f.is_file(), name)
+            self.assertLessEqual(f.stat().st_size, 200 * 1024, name)
+
+    def test_hook_file_is_portable(self):
+        """hooks/hooks.json: Claude Code finds it at the plugin root, Codex too (and sets CLAUDE_PLUGIN_ROOT for compatibility); no personal paths."""
+        h = load("hooks/hooks.json")
+        cmds = [c["command"] for g in h["hooks"]["UserPromptSubmit"] for c in g["hooks"]]
+        self.assertEqual(cmds, ['python3 "${CLAUDE_PLUGIN_ROOT}/bin/cera" pending --hook'])
+        txt = (HERE / "hooks/hooks.json").read_text(encoding="utf-8")
+        self.assertNotRegex(txt, r"/Users/|/home/|@")
+
+
 class FakeRelease(http.server.BaseHTTPRequestHandler):
     hits = 0
     body = b""

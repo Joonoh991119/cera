@@ -166,3 +166,44 @@ class R2(unittest.TestCase):
             for pt in via[2] + via[3]:
                 for k in ids:
                     self.assertFalse(r[k][0] < pt[0] < r[k][2] and r[k][1] < pt[1] < r[k][3], (d, pt, k))
+
+
+class LabelRoom(unittest.TestCase):
+    """Leader r4: a labelled edge between stacked nodes must be long enough to show its line and arrowhead around the label."""
+    def test_r4_short_labelled_edge_pushes_the_far_side_away(self):
+        sizes = {"top": (160, 80), "ok": (160, 80), "fit": (160, 80), "end": (160, 80), "side": (160, 80)}
+        at = {"top": (0, -120), "ok": (0, 0), "fit": (0, 120), "end": (0, 240), "side": (300, 0)}
+        c, via = lay.make_room(at, sizes, [("ok", "fit", 30, 21.6)], [[(150, 200)]])
+        need = 21.6 + lay.LABEL_EDGE_ROOM
+        self.assertGreaterEqual(c["fit"][1] - 40 - (c["ok"][1] + 40), need - 0.01, "라벨 높이 + 화살촉 둘 + 여유")
+        self.assertEqual((c["top"], c["ok"], c["side"]), (at["top"], at["ok"], at["side"]), "위쪽은 그대로")
+        self.assertEqual(c["end"][1] - c["fit"][1], 120, "아래쪽은 같이 밀린다(사이는 그대로)")
+        self.assertEqual(via[0][0][1], 200 + c["fit"][1] - 120, "꺾인 점도 같이")
+        c2, _ = lay.make_room(at, sizes, [("fit", "ok", 30, 21.6)], [])   # drawn upwards: the side it points to moves (up)
+        self.assertEqual((c2["fit"], c2["end"]), (at["fit"], at["end"]))
+        self.assertGreaterEqual(c2["fit"][1] - 40 - (c2["ok"][1] + 40), need - 0.01)
+        self.assertEqual(lay.make_room(c, sizes, [("ok", "fit", 30, 21.6)], [])[0], c, "이미 넉넉하면 그대로")
+
+    def test_r4_flow_keep_yes_edge_shows_its_arrow(self):
+        """The docs figure: ok? and fit model 42 px apart (layout keep) - the 'yes' arrow was hidden under its label."""
+        import sys
+        sys.path.insert(0, str(HERE / "server"))
+        sp = importlib.util.spec_from_file_location("cera_tb_mcp_r4", HERE / "server" / "tb_mcp.py")
+        mod = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(mod)
+        it = {"kind": "flow", "layout": "keep", "nodes": [
+            {"id": "ok", "label": "ok?", "shape": "diamond", "at": {"x": 0, "y": 0}},
+            {"id": "fit", "label": "fit model", "at": {"x": 0, "y": 120}},
+            {"id": "clean", "label": "clean", "at": {"x": 240, "y": 0}}],
+            "edges": [{"from": "ok", "to": "fit", "label": "yes"}, {"from": "ok", "to": "clean", "label": "no"}]}
+        out, boxes, _ = mod.Tools._flow(None, it, 0, "Claude", None, 0, 0)
+        by = {e["id"]: e for e in out}
+        for e in out:
+            if e["type"] != "arrow":
+                continue
+            lab = next(t for t in out if t.get("containerId") == e["id"])
+            span = max(abs(p[1]) for p in e["points"]) if e["width"] < 1 else max(abs(p[0]) for p in e["points"])
+            size = lab["height"] if e["width"] < 1 else lab["width"]
+            self.assertGreaterEqual(span, size + 2 * 16 + 4 - 0.01, (lab["text"], span, size))
+        self.assertLess(abs(boxes["ok"]["y"] - boxes["clean"]["y"]), 1, "옆 간선은 그대로")
+        del by

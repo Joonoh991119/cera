@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   proposalOf, isAnchor, anchorsOf, pidKey, hideCarded, cardModel, cardSize, actionBody, toastModel, retryNote, retryIds, sceneHash, label, driftText, ACTION,
-  onScreen, shownKey,
+  onScreen, shownKey, resultBoxes, cardSpot, edgeSpot, layoutCards, MINI,
 } from "../src/features/proposal/proposal.js";
 import { resolveScope, expandSelection } from "../src/features/export/exporters.js";
 import { place } from "../src/features/ask/requests.js";
@@ -149,4 +149,100 @@ test("neon r1 #1: a stale phone sheet's 'keep both' says what it meant (proposed
   assert.equal(actionBody(after, "dismiss", "c1").from_status, "proposed");
   assert.equal(actionBody(rec(), "revert", "c1").from_status, "applied");
   assert.equal(actionBody(rec(), "keepDone", "c1").from_status, "applied");
+});
+
+test("leader r4: the card never covers a result — above the anchor, else below / right / left, else no card (the chip shows)", () => {
+  const hitAny = (c, list) => list.some((o) => c.x < o.x + o.w && o.x < c.x + c.w && c.y < o.y + o.h && o.y < c.y + c.h);
+  const p = rec({ results: ["n1", "n2", "a1"] });
+  const els = [el("n1", { type: "ellipse", x: 312, y: 12, width: 160, height: 80 }), el("n2", { type: "rectangle", x: 312, y: 150, width: 160, height: 80 }),
+    el("a1", { type: "arrow", x: 392, y: 92, width: 0, height: 58, points: [[0, 0], [0, 58]] }), el("n1-label", { type: "text", x: 370, y: 40, width: 40, height: 20, containerId: "n1" }),
+    el("gone", { x: 312, y: 300, width: 9, height: 9, isDeleted: true })];
+  const boxes = resultBoxes(p, els);
+  assert.equal(boxes.length, 4, "결과 셋 + 그 안 글");
+  assert.deepEqual(boxes.find((b) => b.h === 58), { x: 392, y: 92, w: 0, h: 58 });
+  const view = { w: 1280, h: 800 }, w = 330, h = 80;
+  // room above the anchor: there
+  let a = { x: 300, y: 200, w: 184, h: 254 };
+  let at = cardSpot(a, w, h, boxes.map((b) => ({ ...b, y: b.y + 200 })), [], view);
+  assert.deepEqual(at, { x: 300, y: 200 - h - 6 });
+  // the docs figure: anchor at the top of the screen, so 'above' would be clamped onto the first node — it goes beside instead
+  a = { x: 300, y: 0, w: 184, h: 254 };
+  at = cardSpot(a, w, h, boxes, [], view);
+  assert.ok(at && !hitAny({ ...at, w, h }, boxes), JSON.stringify(at));
+  // phone, zoomed in: the result fills the screen — no spot, so no card
+  const big = [{ x: 0, y: 0, w: 390, h: 844 }];
+  assert.equal(cardSpot({ x: -10, y: -10, w: 410, h: 870 }, 300, 60, big, [], { w: 390, h: 844 }), null);
+  // other cards / chips are avoided too
+  a = { x: 300, y: 300, w: 184, h: 254 };
+  at = cardSpot(a, w, h, [], [{ x: 0, y: 200, w: 1280, h: 100 }], view);
+  assert.ok(at && !hitAny({ ...at, w, h }, [{ x: 0, y: 200, w: 1280, h: 100 }]));
+});
+
+test("leader r4: on a phone with no room for one row, the card can go in two rows (narrower)", () => {
+  for (const st of ["proposed", "applied"]) {
+    const m = cardModel(rec({ status: st }), { touch: true });
+    const wide = cardSize(m, true), narrow = cardSize(m, true, true);
+    assert.ok(narrow.w < wide.w && narrow.w <= 180, `${st}: ${narrow.w} < ${wide.w}`);
+    assert.ok(narrow.h > wide.h);
+  }
+});
+
+test("leader r4: an applied card's phone sheet (from the small ✦ button) offers 원본 ↺ and 확정 only", () => {
+  const m = cardModel(rec({ status: "applied" }), { touch: true });
+  assert.deepEqual(m.sheet.map(label), ["원본 ↺", "확정"]);
+  assert.deepEqual(m.more, []);
+  assert.deepEqual(actionBody(rec({ status: "applied" }), "revert", "c1"), { client: "c1", action: "revert", from_status: "applied" });
+});
+
+test("leader r4: beside the anchor the card slides down past the top bar", () => {
+  const bar = { x: 0, y: 0, w: 390, h: 52 }, res = [{ x: 100, y: 26, w: 140, h: 600 }];
+  const at = cardSpot({ x: 94, y: 20, w: 152, h: 620 }, 44, 44, res, [bar], { w: 390, h: 664 });
+  assert.deepEqual(at, { x: 252, y: 58 });
+});
+
+test("r5 (Fable #2): a card never comes out wider than the screen — too wide gives null, so the layer falls back to two rows, then ✦", () => {
+  assert.equal(cardSpot({ x: 68, y: 163, w: 224, h: 954 }, 374, 60, [], [], { w: 360, h: 640 }), null, "place() 자리도 폭 검사");
+  const wide = cardModel(rec({ status: "applied", drift: 12, uncertain: [{ text: "a", alts: [] }] }), { touch: true });
+  for (const vw of [360, 390]) {
+    const one = cardSize(wide, true, false, vw - 16);
+    if (one) assert.ok(one.w <= vw - 16, `${vw}: ${one.w}`);
+    const two = cardSize(wide, true, true, vw - 16);
+    assert.ok(two && two.w <= vw - 16, `${vw}: two rows ${two && two.w}`);
+  }
+  assert.equal(cardSize(wide, true, false, 374), null, "배지 둘 + 단추 둘은 390 폰 한 줄에 안 들어간다");
+  const plain = cardModel(rec(), { touch: true });
+  assert.ok(cardSize(plain, true, false, 344), "제안 상태의 고르기는 360 에서도 한 줄");
+  assert.deepEqual(cardSize(plain, true), cardSize(plain, true, false, Infinity));
+});
+
+test("r5 (Fable minor): when no spot keeps off the result, the ✦ still shows at the screen edge, off the bars", () => {
+  const view = { w: 390, h: 664 }, bars = [{ x: 0, y: 0, w: 390, h: 52 }, { x: 0, y: 528, w: 390, h: 136 }];
+  const at = edgeSpot(48, bars, view);
+  assert.deepEqual(at, { x: 390 - 48 - 8, y: 58 });
+  assert.equal(edgeSpot(48, [{ x: 0, y: 0, w: 390, h: 664 }], view), null);
+});
+
+test("r5: a result with a huge freedraw does not throw (no spread into Math.min)", () => {
+  const big = { id: "huge", type: "freedraw", x: 0, y: 0, width: 10, height: 10, points: Array.from({ length: 150000 }, (_, k) => [k % 500, k % 300]) };
+  assert.deepEqual(resultBoxes({ results: ["huge"] }, [big]), [{ x: 0, y: 0, w: 499, h: 299 }]);
+});
+
+test("r5 (Fable #3): with two proposals a card keeps off the other's results and the other's chip, not off its own chip", () => {
+  const st = { scrollX: 0, scrollY: 0, zoom: { value: 1 } }, view = { w: 1280, h: 800 };
+  const hit = (c, o) => c.x < o.x + o.w && o.x < c.x + c.w && c.y < o.y + o.h && o.y < c.y + c.h;
+  const A = anchor({ id: "prop-A", x: 300, y: 200, width: 200, height: 300 }, { pid: "A", rid: "ra", results: ["a1"] });
+  const B = anchor({ id: "prop-B", x: 300, y: 560, width: 200, height: 200 }, { pid: "B", rid: "rb", results: ["b1"] });
+  const els = [A, B, el("a1", { type: "rectangle", x: 312, y: 212, width: 176, height: 276 }), el("b1", { type: "rectangle", x: 312, y: 572, width: 176, height: 176 })];
+  const chips = [{ rid: "ra", x: 520, y: 400, w: 700, h: 400 }, { rid: "rb", x: 300, y: 100, w: 400, h: 80 }];   // A's chip fills the right; B's chip sits above B
+  const out = layoutCards(anchorsOf(els), els, st, view, { chips, bars: [] });
+  const b = out.find((it) => it.p.pid === "B").card;
+  assert.ok(!hit(b, { x: 312, y: 212, w: 176, h: 276 }), "A 의 결과를 안 가린다 " + JSON.stringify(b));
+  assert.ok(!hit(b, chips[0]), "A 의 칩을 안 가린다");
+  const a = out.find((it) => it.p.pid === "A").card;
+  assert.ok(!hit(a, b) && !hit(a, { x: 312, y: 572, w: 176, h: 176 }), "카드끼리 · B 결과");
+  // the result fills a phone screen: the ✦ still shows on the edge
+  const big = anchor({ id: "prop-C", x: -20, y: -20, width: 440, height: 900 }, { pid: "C", rid: "rc", results: ["c1"] });
+  const e2 = [big, el("c1", { type: "rectangle", x: -8, y: -8, width: 416, height: 876 })];
+  const o2 = layoutCards(anchorsOf(e2), e2, st, { w: 390, h: 664 }, { touch: true, bars: [{ x: 0, y: 0, w: 390, h: 52 }] });
+  assert.deepEqual(o2.map((it) => [it.mini, it.card.w, it.card.y >= 52]), [[true, MINI, true]]);
 });

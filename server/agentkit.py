@@ -567,9 +567,33 @@ def proposal_of(e: Element) -> Optional[dict]:
     return p if isinstance(p, dict) and isinstance(p.get("pid"), str) else None
 
 
+def result_fp(e: Element, typeset: Optional[set] = None) -> str:
+    """What a person can change on a proposal's result element, as one string (server.py result_fp is the same): where it is and its text (a formula: its
+    LaTeX and its turn); for an arrow, what it joins. A formula being typeset changes none of these (only its file, size and render state)."""
+    def r(v):
+        return round(float(v), 1) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    if e.get("type") == "arrow":
+        ends = [(e.get(k) or {}).get("elementId") if isinstance(e.get(k), dict) else None for k in ("startBinding", "endBinding")]
+        if any(isinstance(i, str) and i in (typeset or ()) for i in ends):   # the typeset moves arrows bound to a formula: only what it joins
+            return json.dumps(["a"] + ends, ensure_ascii=False)
+        return json.dumps(["v", e.get("version")], ensure_ascii=False)
+    if is_typeset(e):   # a formula: the tab's typeset changes size, file and version later - where it is, its LaTeX and its turn only
+        cd = e.get("customData") if isinstance(e.get("customData"), dict) else {}
+        return json.dumps([r(e.get("x")), r(e.get("y")), cd.get("latex") if isinstance(cd.get("latex"), str) else None, r(e.get("angle") or 0)],
+                          ensure_ascii=False)
+    return json.dumps(["v", e.get("version")], ensure_ascii=False)   # anything else: any change (size too) is a person's
+
+
+def is_typeset(e) -> bool:
+    """A result a tab typesets after it is placed (a formula image): its version is not the agent's to keep."""
+    cd = e.get("customData") if isinstance(e.get("customData"), dict) else {}
+    return e.get("type") == "image" and isinstance(cd.get("latex"), str)
+
+
 def make_anchor(pid: str, result_box: Tuple[float, float, float, float], *, rid: Optional[str], sources: Sequence[str],
                 results: Sequence[str], src_box: Optional[Tuple[float, float, float, float]], note: str = "",
-                uncertain: Optional[list] = None, drift: int = 0, agent: str = "", by: Optional[str] = None) -> Element:
+                uncertain: Optional[list] = None, drift: int = 0, agent: str = "", by: Optional[str] = None,
+                result_els: Optional[Sequence[Element]] = None) -> Element:
     """The proposal anchor: a locked dashed box around the result (people cannot grab or erase it by accident). The card on screen is drawn
     over it; exports leave it out (web/src/features/export/exporters.js). Its record is what the server's apply / revert act on."""
     x0, y0, x1, y1 = result_box
@@ -577,6 +601,9 @@ def make_anchor(pid: str, result_box: Tuple[float, float, float, float], *, rid:
     rec = {"pid": pid, "rid": rid, "sources": list(sources), "results": list(results), "status": "proposed",
            "home": [x0 - pad, y0 - pad], "src_box": list(src_box) if src_box else None, "deleted": [],
            "note": note, "uncertain": list(uncertain or []), "drift": int(drift), "agent": agent}
+    if result_els is not None:   # what the result looked like when placed: the agent may withdraw it only while nobody changed it
+        ts = {r["id"] for r in result_els if isinstance(r, dict) and is_typeset(r)}
+        rec["fp"] = {r["id"]: result_fp(r, ts) for r in result_els if isinstance(r, dict) and isinstance(r.get("id"), str)}
     e = _base("rectangle", x0 - pad, y0 - pad, x1 - x0 + 2 * pad, y1 - y0 + 2 * pad, by=by, id=PROPOSAL_PREFIX + pid,
               stroke=PROPOSAL_COLOR, roundness={"type": 3}, custom={"cera": {"proposal": rec}})
     e.update(strokeStyle="dashed", locked=True, opacity=60)

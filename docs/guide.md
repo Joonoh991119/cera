@@ -41,6 +41,7 @@ The board screen is separate: the board picks Korean or English from your browse
 - **Pages**: flip through pages, add a blank page, grid background. Export the current page as PNG or all pages as one PDF.
 - **Follow mode**: tap a person's chip to follow their view, or use 모두 나에게 (everyone to me). Viewers on a view-only link follow the board's creator automatically.
 - **Export and import**: export the whole board, the current page or the selection as PNG/PDF, and boards as `.excalidraw`. Import `.excalidraw`, `.excalidrawlib` and image files by dragging them onto the board, from the CLI or over MCP.
+- **Rough → concrete**: select a sketch, a handwritten formula or a scribbled diagram and press ✦ Ask AI. Your agent session reads it and places a proposal beside it (a typeset formula, a clean flowchart or graph, tidy text); anyone presses Replace, Keep both or Discard. See [Rough → concrete](#rough--concrete).
 - **Agents over MCP**: a stdio MCP server (`cera mcp`) lets Claude Code, Codex and Antigravity read and draw on boards. Agents appear on the board with an "AI" badge, and the server never overwrites a change a person made after the agent read the board.
 - **Personal board on your own domain**: an always-on board at `board.<your-domain>` through a Cloudflare named tunnel, optionally behind Cloudflare Access (only the email addresses you allow), restarted automatically after reboot (launchd on macOS, systemd on Linux).
 - **Works on phones**: text, including text inside shapes, is typed in an input bar at the bottom that opens the keyboard on tap. A top bar holds the menu, undo, eraser, time left and the participant count.
@@ -171,12 +172,15 @@ Installing the plugin registers the `cera` MCP server (`python3 <plugin>/bin/cer
 |---|---|
 | `site_list` · `site_open` · `site_close` | List sites · open one (defaults to `tunnel:"none"`, this computer only) · close one |
 | `board_list` · `board_create` | List boards · create one |
-| `board_read` | A summary (pages, boxes, text, connections, formulas, handwriting stroke counts, each line ending in its version `(vN · label vM)`; `(vN · 라벨 vM)` in Korean), or raw elements with `format:"elements"`, narrowed by `ids`, `page`, `limit`, `offset` |
-| `board_add` | Add text, boxes, arrows, pages and images in one batch. `at`: `"right"` of existing drawings (default), `"below"`, `{x, y}` or `"absolute"` |
+| `board_read` | A summary (pages, boxes, text, connections, formulas, handwriting stroke counts, each line ending in its version `(vN · label vM)`; `(vN · 라벨 vM)` in Korean), raw elements with `format:"elements"` (narrowed by `ids`, `page`, `limit`, `offset`), or `format:"mermaid"` |
+| `board_add` | Add text, boxes, arrows, lines, pages, images, formulas (`kind:"math"`) and flowcharts or graphs (`kind:"flow"`, laid out by the server) in one batch. `at`: `"right"` of existing drawings (default), `"below"`, `{x, y}` or `"absolute"`. With `proposal`, the result goes beside the originals as a proposal card |
+| `board_snapshot` | The board, a selection, a region, a page or a request's targets as a PNG (drawn by a person's open tab, else by the server), with a pixel → board coordinate formula and the PNG path |
+| `board_selection` | What each person selected in the last 60 s ("this" in chat) |
+| `board_requests` · `board_request_update` | ✦ Ask AI requests on the board · set one to `working`, `failed` or `declined` |
 | `board_update` | Change text, labels, position, size or color |
 | `board_delete` | Delete elements, cleaning up labels and arrow bindings |
-| `board_wait` | Wait (up to 60 s) for a person to change the board and return the changes line by line |
-| `board_import` · `board_export` | Import `.excalidraw`, `.excalidrawlib` or image files / save a board as `.excalidraw` (default `$CERA_HOME/exports`) |
+| `board_wait` | Wait for a person to change the board (or make a request) and return the changes line by line. One call lasts up to 600 s in Claude Code, 50 s in Codex, 55 s elsewhere (`CERA_WAIT_MAX`) |
+| `board_import` · `board_export` | Import `.excalidraw`, `.excalidrawlib` or image files / save a board as `.excalidraw` or `.drawio` (default `$CERA_HOME/exports`) |
 
 **Version-guarded edits.** Every line of a `board_read` summary ends with `(vN · label vM)`, the element's version and, for labeled shapes, its label's version. `board_update` calls that change text or color must pass `base_version=N`, plus `label_base_version=M` for a labeled box or arrow. Every `board_delete` item must carry both as well (`{id, base_version, label_base_version}`). Versions are plain integers (`2`, not `"v2"`). A missing version returns `refused`. If a person edited the element after the agent read it, the server returns `conflict` with what changed and does not overwrite anything. Moving or resizing alone needs no version. Label text is edited through the box's id; label ids are rejected.
 
@@ -185,6 +189,37 @@ Installing the plugin registers the `cera` MCP server (`python3 <plugin>/bin/cer
 - **Same computer:** the MCP server creates its own agent token for each site and revokes it when it exits. The agent appears as `Claude · AI` (set the name with `CERA_AGENT_NAME`).
 - **A board on another computer:** set `CERA_URL=<board address>` and `CERA_TOKEN=tb_ag_…`, issued with `cera agent add <id> --name <name> [--role edit|view] [--ttl 2h]`. The token is shown only once, and by default it expires with the site or after 12 hours, whichever comes first. For a personal board in Access mode, use a Cloudflare Access service token instead: `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`. In remote mode the `site_*` tools are hidden.
 - **Revoking:** `cera agent revoke <id> <token-id>` or `cera agent revoke <id> --all` cuts the token off within 2 seconds. `cera agent list <id>` shows tokens (never their plaintext).
+
+## Rough → concrete
+
+Sketch first, make it neat later. Select what you drew — a handwritten formula, a boxes-and-arrows diagram, a graph, a messy note — and press **✦ Ask AI** above the selection. Pick what it should become (Auto, Math, Diagram, Graph, Text, Tidy) and add a one-line note if you like.
+
+A chip appears above your selection on everyone's screen. When your agent session takes the request it shows *working…*:
+
+![A hand-drawn flowchart with the chip "Claude working…" above it](images/rough-request.png)
+
+The agent looks at a snapshot of the selection and places its version **beside** yours, with a card. Nothing of yours has changed yet. The **?** on the card lists the characters the agent wasn't sure of, with alternatives.
+
+![The proposal card next to the sketch: Replace, Keep both, Discard, Retry](images/rough-card.png)
+
+Anyone with the edit link can decide: **Replace** swaps your sketch for the proposal, **Keep both** keeps the two, **Discard** removes the proposal, **Retry** asks again. After Replace, **Original ↺** brings your sketch back and **Done** closes the card. The server applies each press in one step for everyone, so if two people press at once, one press wins and the other sees "Someone else got there first".
+
+![After Replace: the clean flowchart, with Original ↺ and Done on the card](images/rough-applied.png)
+
+Formulas become real math elements (edit them with the board's math tool); diagrams and graphs become boxes and arrows you can move, and export with `board_export format:"drawio"` or `board_read format:"mermaid"`.
+
+**Who does the reading.** Cera itself calls no AI model and needs no API key. The request waits on the board until an agent session with the Cera plugin picks it up — Claude Code, Codex or Antigravity, on the computer that runs the board. In Claude Code and Codex the plugin adds a hook that mentions waiting requests when you type your next message (`cera pending` shows the same list in the terminal; Codex runs plugin hooks only after you trust them in `/hooks`). You can also tell the agent "watch the board for requests". If no agent takes a request for 20 seconds, the chip offers **Copy request**: paste that sentence into your agent session.
+
+**Turning the hook off.** The hook reads only local files and prints nothing when no request waits. To silence it, set `CERA_HOOK=off` where the agent will see it: `export CERA_HOOK=off` in your shell profile (then start the agent from a new terminal), or in Claude Code's `settings.json` as `"env": {"CERA_HOOK": "off"}`. In Codex, leaving the hook untrusted in `/hooks` also keeps it off. Disabling the Cera plugin turns off the hook together with the tools. A `cera install --mode link` setup installs the skill and the MCP server only, so it has no hook — the agent learns about requests from `board_wait` or when you tell it.
+
+**Check it with your agent (Codex, Antigravity).** Image results and the hook were measured with Claude Code; for Codex and Antigravity please check once:
+1. Install the plugin (see [Install](#install)) and open a board with something drawn on it.
+2. Ask the agent: "Take a board snapshot and tell me what shape is on it." If it describes the drawing, images reach it (or it opened the PNG path itself, which also works). If it only lists positions, it is working from text.
+3. Select the drawing, press ✦ Ask AI, then type any message to the agent: in Codex the hook should mention the request (after you trust it in `/hooks`); in Antigravity ask it to "handle the board requests". Note what happened and, if something did not work, [open an issue](https://github.com/Joonoh991119/cera/issues) with the agent's name and version.
+
+**The snapshot goes to your model provider.** To read a request, the agent sends an image of the selected area (which may include other people's drawings) to the model behind your agent session, under that provider's terms. Notes on requests are treated as data, not instructions: a request can only lead to a proposal on the board, never to commands, files or web access.
+
+**Writing by hand on a tablet or phone.** If you'd rather have typed text than ink, your device's own handwriting input works in the board's text tools and in the phone's input bar: Scribble with Apple Pencil on iPad, S Pen handwriting on Samsung Galaxy, or the handwriting keyboard in Gboard. Ink stays ink until you ask the AI.
 
 ## Importing boards
 
@@ -247,7 +282,7 @@ Menu names can differ slightly between dashboard versions. In Access mode the pu
 | Path | Contents |
 |---|---|
 | `~/.cera/` | Everything; override with `CERA_HOME`. An existing `~/.tempboard` is moved here on the first run and left as a link |
-| `~/.cera/sites/<id>/` | One site: drawings in `data/`, `state.json` (0600). A personal site adds `cloudflared.yml`, `tunnel.json` (0600) and optionally `members.json` |
+| `~/.cera/sites/<id>/` | One site: drawings in `data/`, `state.json` (0600), `pending.json` (0600, waiting requests for the prompt hook). A personal site adds `cloudflared.yml`, `tunnel.json` (0600) and optionally `members.json` |
 | `~/.cera/dist/<version>/` | Downloaded or built web UI |
 | `~/.cera/exports/` | Default output of the MCP `board_export` tool |
 | `~/.cera/kept/` | Tunnel credentials moved aside when a personal site is deleted |
@@ -262,6 +297,8 @@ Environment variables:
 | `CERA_DIST` | Use this web UI build. Lookup order: `CERA_DIST` > the checkout's `web/dist` (if built) > `$CERA_HOME/dist/<version>/` |
 | `CERA_RELEASE_URL` | Download the UI bundle from another base URL (mirror, testing) |
 | `CERA_AGENT_NAME` | Display name of the MCP agent on the board |
+| `CERA_WAIT_MAX` | Upper limit in seconds for one `board_wait` call |
+| `CERA_HOOK` | `off` turns off the prompt hook that mentions waiting ✦ Ask AI requests (set it in your shell profile or in Claude Code's `settings.json` `env`) |
 | `CERA_URL`, `CERA_TOKEN` | Connect `cera mcp` to a board on another computer |
 | `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service token for a personal board in Access mode |
 
@@ -273,12 +310,14 @@ The old `TEMPBOARD_*` names of these variables still work when the `CERA_*` one 
 cd web && npm ci && npm run build && npm test        # build the UI and run the JS tests
 python3 -m unittest discover -s tests -q             # server, CLI, MCP and installer tests
 python3 packaging/gen.py --check                     # generated manifests match the source (run in CI)
+python3 tests/live/live_rough.py                     # end-to-end: ✦ Ask AI → scripted agent → proposal card → Replace (needs Playwright)
 python3 server/server.py --data /tmp/tb --edit-key dev   # → http://127.0.0.1:8790/?k=dev
 scripts/release-dist.sh && gh release create v<version> web/cera-dist.tar.gz   # release the UI bundle
 ```
 
 - **The manifest source of truth is `.claude-plugin/plugin.json`.** After changing the version, description or MCP config, run `python3 packaging/gen.py` to regenerate the root `plugin.json` and `mcp.json`, `.antigravity-plugin/plugin.json`, `mcp_config.json` and the version in `marketplace.json`, and commit them together. Don't add a root `.mcp.json` (Claude Code would load it as a project MCP server while you work on this repo) or `.agents/plugins/marketplace.json` (Codex would read it first and the marketplace name would change).
 - **After changing dependencies**, regenerate `THIRD_PARTY_NOTICES.md` with `python3 packaging/notices.py`. `gen.py --check` verifies it against `web/node_modules`, and also checks that versions and licenses in `web/package.json` and `web/package-lock.json` match the source.
+- **Plugin hook:** `hooks/hooks.json` (read by Claude Code and by Codex from the plugin root) runs `cera pending --hook` on every prompt; it must stay fast (files only, no network) and print nothing when no request waits.
 - The HTTP API of `server/server.py` (boards, element merge, WebSocket, long polling, files, patch, import) is documented in the server's header and code comments. Merging follows Excalidraw's rule: the higher `version` wins, and on a tie the lower `versionNonce` wins.
 
 Cera started as the team whiteboard for a research-competition wiki and was extracted and generalized here.

@@ -13,6 +13,7 @@ Making it concrete comes later — that's what your agent is for.
 
 - **Meetings.** Open a board, drop the link into Discord, and sketch together while you talk. Everyone draws live; no accounts.
 - **Working with an agent.** Ask Claude Code, Codex or Antigravity to put a background on the board (a diagram, axes, a picture) and draw over it by hand. When you're done, the agent reads the board — or you save the drawing and hand it over — and turns the rough idea into something real.
+- **Rough → concrete.** Select a scribble — a handwritten formula, a boxes-and-arrows sketch — and press **✦ Ask AI**. Your agent session puts a neat version beside it; anyone presses *Replace* or *Discard*. No API key: the agent you already use does the reading ([how it works](docs/guide.md#rough--concrete)).
 - **Text and math too.** Type a note, or write a formula in LaTeX ($p(x\mid y) \propto p(y\mid x)\,p(x)$).
 
 ```mermaid

@@ -9,6 +9,7 @@ Both take node sizes and return centres {id: (cx, cy)}; the caller builds the el
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Sequence, Tuple
 
 GRID = 20.0
@@ -194,3 +195,39 @@ def layered_routes(ids: Sequence[str], edges: Sequence[Tuple[str, str]], sizes: 
         else:
             via[i] = [(mx + step * (cw / 2 + 30), my)]
     return {k: pos[k] for k in ids}, via
+
+
+LABEL_EDGE_ROOM = 48.0   # a labelled straight edge needs the label's length plus this between the two boxes: two arrowheads (16) + binding gaps (6) + 4
+
+
+def make_room(centres: Dict[str, Centre], sizes: Dict[str, Size], labelled: Sequence[Tuple[str, str, float, float]],
+              vias: Sequence[Sequence[Centre]] = ()) -> Tuple[Dict[str, Centre], List[List[Centre]]]:
+    """Labelled edges between stacked (or side-by-side) nodes: if the gap along the edge is shorter than the label (its height for an up-down
+    edge, its width for a left-right one) + LABEL_EDGE_ROOM, everything past the middle of that edge moves away by the shortfall (nodes and
+    bend points), so the label never hides the line and the arrowhead. Moving a whole side only widens gaps, so one pass is enough.
+    labelled: (from, to, label width, label height). -> (centres, vias)"""
+    c = dict(centres)
+    vs = [list(v) for v in vias]
+    for a, b, lw, lh in labelled:
+        if a not in c or b not in c or a == b:
+            continue
+        (ax, ay), (bx, by) = c[a], c[b]
+        (aw, ah), (bw, bh) = sizes[a], sizes[b]
+        if abs(by - ay) >= abs(bx - ax):   # up-down: they must overlap left-right to be 'stacked'
+            if abs(bx - ax) >= (aw + bw) / 2:
+                continue
+            k, gap, need = 1, abs(by - ay) - (ah + bh) / 2, lh + LABEL_EDGE_ROOM
+        else:
+            if abs(by - ay) >= (ah + bh) / 2:
+                continue
+            k, gap, need = 0, abs(bx - ax) - (aw + bw) / 2, lw + LABEL_EDGE_ROOM
+        if gap >= need:
+            continue
+        mid, s, d = (c[a][k] + c[b][k]) / 2, (1 if c[b][k] > c[a][k] else -1), float(math.ceil(need - gap))
+        def push(p):
+            if (p[k] - mid) * s <= 0:
+                return p
+            return (p[0] + s * d, p[1]) if k == 0 else (p[0], p[1] + s * d)
+        c = {n: push(p) for n, p in c.items()}
+        vs = [[push(p) for p in v] for v in vs]
+    return c, vs

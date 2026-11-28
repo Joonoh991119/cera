@@ -753,7 +753,7 @@ class Requests(unittest.TestCase):
                          "다른 에이전트가 살아 있는 작업을 가로채지 못한다")
         st, p = self.upd(rid, "proposed", reply="둘째 줄이 불확실", pid="p_1")
         self.assertEqual((st, p["status"], p["reply"], p["pid"]), (200, "proposed", "둘째 줄이 불확실", "p_1"))
-        self.assertEqual(self.upd(rid, "working")[0], 409, "제안 뒤 다시 working 안 됨")
+        self.assertEqual(self.upd(rid, "working")[0], 409, "제안 뒤 다시 working 안 됨(거두려면 withdraw 를 준다 — ProposalsR6)")
         self.assertEqual(self.upd(rid, "cancelled", who="person", client="c1")[0], 409)
         st, d = self.upd(rid, "done", who="person", client="c1")
         self.assertEqual((st, d["status"]), (200, "done"))
@@ -920,7 +920,7 @@ class Proposals(unittest.TestCase):
     def place(self, pid):
         ak = _ak()
         a = ak.make_anchor(pid, (300, 30, 480, 70), rid=self.req["rid"], sources=["s0", "s1", "s2", "box"], results=["r0", "r1"],
-                           src_box=(0, 20, 80, 100), note="둘째 줄 확인", agent="Claude", by="Claude")
+                           src_box=(0, 20, 80, 100), note="둘째 줄 확인", agent="Claude", by="Claude", result_els=self.res)
         self.post([a])
         b = self.store.get(self.bid)
         with b.lock:   # a new round: the request is being worked on again
@@ -1193,6 +1193,120 @@ class ProposalsR2(Proposals):
         _, lst = self.call("GET", self.base + "/requests", self.person())
         self.assertNotIn("_seen", json.dumps(lst), "사람 화면에는 안 나간다")
 
+
+class ProposalsR6(Proposals):
+    """WP-8 r2: an agent withdraws a proposal only explicitly (withdraw: pid), only its request's own card, only while nobody chose and nobody
+    changed the result. A chat proposal (no request) is withdrawn the same way through POST /proposals/<pid> {action: withdraw}."""
+    for _n in [n for n in dir(Proposals) if n.startswith("test_")]:
+        locals()[_n] = None
+    del _n
+
+    def upd(self, status, rid=None, client="ag-1", **kw):
+        return self.call("POST", f"{self.base}/requests/{rid or self.req['rid']}", self.agent(), {"client": client, "status": status, **kw})
+
+    def gone(self, *ids):
+        e = self.els()
+        return [bool(e[i].get("isDeleted")) for i in ids]
+
+    def test_r6_working_without_withdraw_is_409_and_takes_nothing(self):
+        for st in ("working", "failed"):
+            self.assertEqual(self.upd(st, reply="x")[0], 409)
+        self.assertEqual(self.gone("prop-p1", "r0"), [False, False])
+
+    def test_r6_withdraw_takes_back_card_and_results_and_says_so(self):
+        st, d = self.upd("working", withdraw="p1")
+        self.assertEqual((st, d.get("status"), d.get("pid"), d.get("withdrawn")), (200, "working", None, {"pid": "p1", "elements": 3}), d)
+        self.assertEqual(self.gone("prop-p1", "r0", "r1", "s0"), [True, True, True, False], "원본은 그대로")
+
+    def test_r6_failed_with_withdraw_from_another_session_works(self):
+        st, d = self.upd("failed", client="ag-2", withdraw="p1", reply="LaTeX 오류")   # an MCP restarted with the pid in hand
+        self.assertEqual((st, d.get("status")), (200, "failed"), d)
+        self.assertTrue(self.gone("prop-p1")[0])
+
+    def test_r6_pid_must_be_this_requests_card(self):
+        _, r2 = self.call("POST", self.base + "/requests", self.person("민수"), {"client": "c2", "kind": "text", "ids": ["s0"]})
+        self.assertEqual(self.upd("working", rid=r2["rid"])[0], 200)
+        self.assertEqual(self.upd("proposed", rid=r2["rid"], pid="p1")[0], 200)   # request 2 claims request 1's card
+        st, d = self.upd("working", rid=r2["rid"], withdraw="p1")
+        self.assertEqual(st, 409, d)
+        self.assertEqual(self.gone("prop-p1", "r0"), [False, False], "요청 1 의 카드는 그대로")
+        self.assertEqual(self.upd("working", withdraw="nope")[0], 409)
+
+    def test_r6_not_when_a_person_changed_the_result_or_chose(self):
+        e = self.els()["r0"]
+        self.post([dict(e, x=e["x"] + 40, version=e["version"] + 1)])   # a person moved a result
+        st, d = self.upd("working", withdraw="p1")
+        self.assertEqual(st, 409, d)
+        self.assertIn("사람이 결과를 고쳤다", d["error"])
+        self.assertEqual(self.gone("prop-p1", "r0"), [False, False])
+        self.post([dict(self.els()["r0"], x=e["x"], version=e["version"] + 2)])   # moved back: untouched again
+        self.post([{"id": "lab", "type": "text", "x": 310, "y": 40, "width": 20, "height": 20, "text": "x", "containerId": "r1", "version": 1, "versionNonce": 1}])
+        self.assertEqual(self.upd("working", withdraw="p1")[0], 409, "결과에 사람이 단 글")
+        self.post([dict(self.els()["lab"], isDeleted=True, version=2)])
+        self.assertEqual(self.act("apply")[0], 200)
+        b = self.store.get(self.bid)
+        with b.lock:
+            b.meta["requests"] = [dict(r, status="proposed") for r in b.meta["requests"]]
+        self.assertEqual(self.upd("working", withdraw="p1")[0], 409, "바꾼 뒤")
+
+    def test_r6_a_shape_resized_by_a_person_counts_as_touched(self):
+        e = self.els()["r0"]
+        self.post([dict(e, width=e["width"] + 50, version=e["version"] + 1)])   # only the size: x, y and text are the same
+        st, d = self.upd("working", withdraw="p1")
+        self.assertEqual(st, 409, d)
+        self.assertEqual(self.gone("prop-p1", "r0"), [False, False])
+
+    def test_r6_a_typeset_formula_still_counts_as_untouched(self):
+        """The tab's typeset changes a formula's size, file and version (and the arrows bound to it): that is not a person's edit."""
+        m0 = {"id": "m0", "type": "image", "x": 300, "y": 300, "width": 100, "height": 40, "fileId": "a" * 40, "version": 1, "versionNonce": 1,
+              "customData": {"latex": "x", "cera": {"render": "pending"}}}
+        ar = {"id": "ar", "type": "arrow", "x": 200, "y": 320, "width": 100, "height": 0, "points": [[0, 0], [100, 0]], "version": 1, "versionNonce": 1,
+              "startBinding": None, "endBinding": {"elementId": "m0", "focus": 0, "gap": 4}}
+        self.post([m0, ar])
+        b = self.store.get(self.bid)
+        with b.lock:   # the card's own request
+            b.meta["requests"] = [dict(r, status="working") for r in b.meta["requests"]]
+        self.post([_ak().make_anchor("pm", (200, 300, 400, 340), rid=self.req["rid"], sources=["s0"], results=["m0", "ar"], src_box=(0, 20, 80, 100),
+                                     agent="C", by="C", result_els=[m0, ar])])
+        self.assertEqual(self.upd("proposed", pid="pm")[0], 200)
+        self.post([dict(m0, width=300, fileId="f" * 40, customData={"latex": "x", "cera": {"render": "error", "message": "x"}}, version=2),
+                   dict(ar, width=110, points=[[0, 0], [110, 0]], version=2)])
+        self.assertEqual(self.upd("working", withdraw="pm")[0], 200)
+
+    def test_r7_a_formula_a_person_rewrote_or_turned_counts_as_touched(self):
+        """Review r3: a formula image has no `text` - its LaTeX is customData.latex. A person who fixed the formula in the math dialog (or turned
+        it) changed the result, and withdrawing must not delete that."""
+        for name, change in (("rewrote", {"customData": {"latex": "x^{2}", "cera": {"render": "done"}}}), ("turned", {"angle": 0.5})):
+            mid, pid = f"m-{name}", f"p-{name}"
+            m0 = {"id": mid, "type": "image", "x": 300, "y": 300, "width": 100, "height": 40, "fileId": "a" * 40, "version": 1, "versionNonce": 1,
+                  "angle": 0, "customData": {"latex": "x", "cera": {"render": "pending"}}}
+            self.post([m0])
+            b = self.store.get(self.bid)
+            with b.lock:
+                b.meta["requests"] = [dict(r, status="working") for r in b.meta["requests"]]
+            self.post([_ak().make_anchor(pid, (300, 300, 400, 340), rid=self.req["rid"], sources=["s0"], results=[mid], src_box=(0, 20, 80, 100),
+                                         agent="C", by="C", result_els=[m0])])
+            self.assertEqual(self.upd("proposed", pid=pid)[0], 200)
+            self.post([dict(m0, **change, fileId="f" * 40, width=140, version=2)])   # the person's edit, typeset again by the tab
+            st, d = self.upd("working", withdraw=pid)
+            self.assertEqual(st, 409, (name, d))
+            self.assertIn("사람이 결과를 고쳤다", d["error"])
+            self.assertEqual(self.gone(f"prop-{pid}", mid), [False, False], name)
+            self.post([dict(self.els()[f"prop-{pid}"], isDeleted=True, version=self.els()[f"prop-{pid}"]["version"] + 1)])   # clear the card for the next case
+
+    def test_r6_chat_proposal_withdrawn_through_the_card_route(self):
+        self.post([{"id": "q0", "type": "rectangle", "x": 300, "y": 200, "width": 80, "height": 40, "version": 1, "versionNonce": 1}])
+        q0 = self.els()["q0"]
+        self.post([_ak().make_anchor("c1", (300, 200, 380, 240), rid=None, sources=["s0"], results=["q0"], src_box=(0, 20, 80, 100), agent="C", by="C",
+                                     result_els=[q0])])
+        st, d = self.act("withdraw", pid="c1", h=self.agent(), client="ag-1")
+        self.assertEqual((st, d.get("withdrawn")), (200, {"pid": "c1", "elements": 2}), d)
+        self.assertEqual(self.gone("prop-c1", "q0"), [True, True])
+        st, d = self.act("withdraw", pid="p1", h=self.agent(), client="ag-1")
+        self.assertEqual(st, 409, "요청에 놓인 카드는 board_request_update withdraw 로")
+        self.assertIn("withdraw", d["error"])
+        self.assertEqual(self.act("dismiss", h=self.agent(), client="ag-1")[0], 403, "에이전트는 고를 수 없다")
+        self.assertEqual(self.act("withdraw")[0], 403, "사람은 거두기를 못 쓴다")
 
 if __name__ == "__main__":
     unittest.main()

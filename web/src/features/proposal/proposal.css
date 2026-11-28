@@ -9,6 +9,7 @@
 .wb-prop-note { line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--dk-mut); }
 .wb-prop-row { display: flex; gap: 6px; }
 .wb-prop-row .wb-ask-act { height: 28px; }
+.wb-ask-touch .wb-prop-row .wb-ask-act { height: 44px; }
 .wb-prop-main { background: #1d8a5b !important; color: #fff !important; }
 .wb-prop-applied .wb-prop-main { background: #7b61ff !important; }
 .wb-ask-act:disabled { opacity: .5; cursor: default; }
@@ -30,3 +31,6 @@
 .wb-sheeting .wb-prop-layer, .wb-sheeting .wb-prop-toast { display: none; }
 .wb-ask-touch .wb-prop-pop { max-width: calc(100vw - 32px); }
 .wb-ask-touch .wb-prop-unsure { font-size: 15px; }
+.wb-prop-card.wb-prop-mini { display: block; padding: 0; border-radius: 24px; }
+.wb-prop-card.wb-prop-mini > * { display: grid; place-items: center; box-sizing: border-box; width: 100%; height: 100%; }
+.wb-ask-touch.wb-prop-mini .wb-ask-act, .wb-prop-mini .wb-ask-act { width: 100%; height: 100%; padding: 0; border-radius: 22px; font-size: 18px; }

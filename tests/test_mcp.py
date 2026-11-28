@@ -2486,6 +2486,107 @@ class Wp6R2(Wp6):
         self.assertFalse(next(e for e in self.board() if e["id"] == fr["id"]).get("isDeleted"), "바꿔도 장은 남는다")
 
 
+class Wp6R5(Wp6):
+    """WP-8 r1-r2 (Fable #1, Opus): a proposal whose formula fails leaves nothing (the request stays working); one typeset later is taken back
+    only explicitly (withdraw: pid), only while untouched; result and card always go in together."""
+    for _n in [n for n in dir(Wp6) if n.startswith("test_")]:
+        locals()[_n] = None
+    del _n
+    fake_tab = Wp4.fake_tab
+
+    def live(self):
+        return {e["id"]: e for e in self.board() if not e.get("isDeleted")}
+
+    def rq(self):
+        return raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/requests?all=1", self.h)[1]["requests"][-1]
+
+    def test_r5_latex_error_leaves_nothing_and_the_request_stays_working(self):
+        self.fake_tab()
+        r = self.ask()
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        before = set(self.live())
+        bad = self.m.tool("board_add", {"items": [{"kind": "math", "latex": "\\fracc{a}"}], "proposal": {"request": r["rid"]}})
+        self.assertTrue(bad.get("isError"), bad)
+        text = bad["content"][0]["text"]
+        self.assertIn("아무것도 남기지 않았다", text)
+        self.assertIn("Undefined control sequence", text)
+        self.assertIn(f'board_request_update {{rid:"{r["rid"]}", status:"failed"', text)
+        self.assertEqual(set(self.live()), before, "결과도 카드도 남지 않는다")
+        self.assertEqual(self.rq()["status"], "working")
+        ok = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\frac{a}{b}"}], "proposal": {"request": r["rid"]}})
+        a = self.live()[ok["structuredContent"]["proposal"]["anchor"]]
+        img = self.live()[ok["structuredContent"]["ids"][0]]
+        self.assertTrue(a["x"] <= img["x"] and a["x"] + a["width"] >= img["x"] + img["width"] and a["y"] + a["height"] >= img["y"] + img["height"],
+                        "카드는 그려진 수식을 감싼다")
+        self.assertEqual(self.rq()["status"], "proposed")
+
+    def test_r6_card_goes_in_with_the_result_not_after_the_typeset(self):
+        """Opus r2: the session may end while it waits for the typeset - the result must never be on the board without its card."""
+        self.fake_tab()
+        r = self.ask()
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        got = {}
+        th = threading.Thread(target=lambda: got.update(r=self.m.tool("board_add", {"items": [{"kind": "math", "latex": "STALL x"}], "proposal": {"request": r["rid"]}})))
+        th.start()
+        seen = None
+        for _ in range(60):
+            time.sleep(0.05)
+            els = self.live()
+            imgs = [e for e in els.values() if e.get("type") == "image"]
+            if imgs:
+                seen = (len(imgs), sum(1 for e in els.values() if AK.proposal_of(e)))
+                break
+        th.join(30)
+        self.assertEqual(seen, (1, 1), "결과가 보이는 순간 카드도 있다")
+
+    def test_r6_typeset_later_withdraw_is_explicit_and_says_so(self):
+        r = self.ask()
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        res = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\fracc{a}"}], "proposal": {"request": r["rid"]}})
+        pid = res["structuredContent"]["proposal"]["pid"]
+        way = f'board_request_update {{rid:"{r["rid"]}", status:"working", withdraw:"{pid}"}}'
+        self.assertIn(way, res["content"][0]["text"])
+        again = self.m.tool("board_add", {"items": [{"kind": "math", "latex": "a"}], "proposal": {"request": r["rid"]}})
+        self.assertTrue(again.get("isError"))
+        self.assertIn(way, again["content"][0]["text"], "이미 proposed 라는 거절도 길을 알려 준다")
+        listing = self.m.ok("board_requests", {})["content"][0]["text"]
+        self.assertIn("이미 제안이 놓인 것 1건", listing)
+        self.assertIn(f"제안 [{pid}]", listing)
+        self.assertNotIn("가져갈 수 있는 것", listing, "제안이 놓인 요청은 '가져가려면' 아래에 없다")
+        m2 = self.mcp()
+        m2.init()
+        try:
+            plain = m2.tool("board_request_update", {"site": self.sid, "board": self.bid, "rid": r["rid"], "status": "working"})
+        finally:
+            m2.close()
+        self.assertTrue(plain.get("isError"), "withdraw 없이는 아무것도 거두지 않는다")
+        self.assertIn("prop-" + pid, self.live())
+        out = self.m.ok("board_request_update", {"rid": r["rid"], "status": "working", "withdraw": pid})
+        self.assertIn(f"제안 [{pid}] 을 거뒀다(카드와 결과 2개)", out["content"][0]["text"])
+        self.assertNotIn("prop-" + pid, self.live())
+        self.assertNotIn(res["structuredContent"]["ids"][0], self.live(), "결과도")
+        self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\frac{a}{b}"}], "proposal": {"request": r["rid"]}})
+        self.assertEqual((self.rq()["status"], sum(1 for e in self.live().values() if AK.proposal_of(e))), ("proposed", 1))
+
+    def test_r6_chat_proposal_is_taken_back_with_board_delete_on_its_card(self):
+        res = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\fracc{a}"}], "proposal": {"sources": self.flow}})
+        pid = res["structuredContent"]["proposal"]["pid"]
+        self.assertIn(f'board_delete {{ids:[{{id:"prop-{pid}"}}]}}', res["content"][0]["text"])
+        rid_ = res["structuredContent"]["ids"][0]
+        out = self.m.ok("board_delete", {"ids": [{"id": rid_, "base_version": 1}, {"id": "prop-" + pid}]})   # result listed first: the card still goes first
+        self.assertIn("거뒀다(2개)", out["content"][0]["text"])
+        self.assertFalse(any(AK.proposal_of(e) for e in self.live().values()))
+        self.assertNotIn(res["structuredContent"]["ids"][0], self.live())
+        box = self.m.ok("board_add", {"items": [{"kind": "box", "label": "X"}], "proposal": {"sources": self.flow}})   # shapes: by version
+        bp = box["structuredContent"]["proposal"]["pid"]
+        self.assertIn("거뒀다(3개)", self.m.ok("board_delete", {"ids": [{"id": "prop-" + bp}]})["content"][0]["text"], "놓은 그대로면 거둔다")
+        box = self.m.ok("board_add", {"items": [{"kind": "box", "label": "X"}], "proposal": {"sources": self.flow}})
+        bp, b0 = box["structuredContent"]["proposal"]["pid"], next(i for i in box["structuredContent"]["ids"] if self.live()[i]["type"] == "rectangle")
+        e = self.live()[b0]
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": [dict(e, width=e["width"] + 40, version=e["version"] + 1)]})
+        self.assertIn("거두지 않았다", self.m.ok("board_delete", {"ids": [{"id": "prop-" + bp}]})["content"][0]["text"], "사람이 크기만 바꿔도")
+
+
 class Wp6Spot(unittest.TestCase):
     """WP-6 placement in-process: right of the originals +30 when free, below when the right is taken."""
     def test_right_then_below(self):
@@ -2522,6 +2623,33 @@ class Wp6Spot(unittest.TestCase):
         self.assertEqual(mod.Tools._drift(me, c, "bd", req, els, set(), {"a": 1, "b": 1}), 2, "서버 기록: 고친 b + 새 late")
         me.s.req_seen = {("http://x", "bd", "r1"): {"a": 1, "b": 2, "late": 1}}
         self.assertEqual(mod.Tools._drift(me, c, "bd", req, els, set(), {"a": 1, "b": 1}), 0, "이 세션이 더 나중에 읽은 것이 먼저")
+
+
+class InstructionsWp8(unittest.TestCase):
+    """WP-8: the initialize instructions no longer say math / mermaid are on-screen only, and point to the rough -> concrete order in one line."""
+
+    def test_instructions_match_the_tools(self):
+        import importlib.util
+        mod = sys.modules.get("cera_tb_mcp")
+        if mod is None:
+            sys.path.insert(0, str(HERE / "server"))
+            spec = importlib.util.spec_from_file_location("cera_tb_mcp", HERE / "server" / "tb_mcp.py")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["cera_tb_mcp"] = mod
+            spec.loader.exec_module(mod)
+        en, ko = mod._INSTRUCTIONS_EN, mod._INSTRUCTIONS_KO
+        for old in ("only be added with the on-screen", "on-screen math / flowchart tools"):
+            self.assertNotIn(old, en)
+        self.assertNotIn("도구로만 넣을 수 있다", ko)
+        for text in (en, ko):
+            self.assertIn('kind:"math"', text)
+            self.assertIn('kind:"flow"', text)
+            line = [x for x in text.splitlines() if "board_snapshot" in x]
+            self.assertEqual(len(line), 1, text)
+            order = [line[0].find(k) for k in ("board_requests", "working", "board_snapshot", "proposal")]
+            self.assertNotIn(-1, order, line[0])
+            self.assertEqual(order[1:], sorted(order[1:]), line[0])
+        self.assertIsNone(HANGUL.search(en))
 
 
 if __name__ == "__main__":

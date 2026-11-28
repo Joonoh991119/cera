@@ -1,0 +1,16 @@
+{
+  "description": "Cera: before each prompt, mention 'Ask the AI' requests waiting on this computer's boards (reads local files only; CERA_HOOK=off turns it off).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/cera\" pending --hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

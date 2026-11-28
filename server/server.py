@@ -129,6 +129,7 @@ REQ_KINDS = ("auto", "text", "math", "diagram", "graph", "tidy")
 REQ_HUMAN = {"cancelled": ("open", "working"), "done": ("proposed", "failed", "declined", "interrupted")}   # status a person may set -> from which
 REQ_AGENT = {"working": ("open", "working", "interrupted"), "proposed": ("open", "working", "interrupted"),
              "failed": ("open", "working", "interrupted"), "declined": ("open", "working", "interrupted")}   # status an agent token may set -> from which
+# (from proposed only with withdraw: pid - the agent takes its card back while nobody chose or changed it, then working or failed - WP-6 r6)
 REQ_LIVE = ("open", "working", "proposed", "failed", "declined", "interrupted")   # shown as a chip until a person closes it (done / cancelled)
 REQ_META = ("requests", "request_n")   # meta keys that never leave the server as meta (requests go out only through req_public)
 REQ_NOTE_MAX = 200       # characters of a request note / agent reply (longer -> 400)
@@ -146,6 +147,28 @@ PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")   # = the card route; the anchor i
 PROP_PREFIX = "prop-"
 PROP_ACTIONS = {"apply": ("proposed",), "revert": ("applied",), "keep": ("proposed", "applied"), "dismiss": ("proposed",)}
 PROP_IDS_MAX = 20000     # sources / results ids the server acts on per proposal
+
+
+def result_fp(e, typeset=None):
+    """agentkit.result_fp: what a person can change on a proposal's result element (place, text or LaTeX, turn; an arrow's ends)."""
+    def r(v):
+        return round(float(v), 1) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    if e.get("type") == "arrow":
+        ends = [(e.get(k) or {}).get("elementId") if isinstance(e.get(k), dict) else None for k in ("startBinding", "endBinding")]
+        if any(isinstance(i, str) and i in (typeset or ()) for i in ends):   # the typeset moves arrows bound to a formula: only what it joins
+            return json.dumps(["a"] + ends, ensure_ascii=False)
+        return json.dumps(["v", e.get("version")], ensure_ascii=False)
+    if is_typeset(e):   # a formula: the tab's typeset changes size, file and version later - where it is, its LaTeX and its turn only
+        cd = e.get("customData") if isinstance(e.get("customData"), dict) else {}
+        return json.dumps([r(e.get("x")), r(e.get("y")), cd.get("latex") if isinstance(cd.get("latex"), str) else None, r(e.get("angle") or 0)],
+                          ensure_ascii=False)
+    return json.dumps(["v", e.get("version")], ensure_ascii=False)   # anything else: any change (size too) is a person's
+
+
+def is_typeset(e) -> bool:
+    """A result a tab typesets after it is placed (a formula image): its version is not the agent's to keep."""
+    cd = e.get("customData") if isinstance(e.get("customData"), dict) else {}
+    return e.get("type") == "image" and isinstance(cd.get("latex"), str)
 
 
 def proposal_of(e):
@@ -711,7 +734,7 @@ class Board:
         self.publish("request", self.req_public(r))
         return 201, self.req_public(r)
 
-    def request_update(self, rid, status, by, client, agent, reply=None, pid=None):
+    def request_update(self, rid, status, by, client, agent, reply=None, pid=None, withdraw=None):
         """Status change: a person (cancelled · done) or an agent token (working · proposed · failed · declined), each only from the states in
         REQ_HUMAN / REQ_AGENT. A request another agent is still working on gets 409. -> (status, body)"""
         t = time.time()
@@ -725,13 +748,29 @@ class Board:
                 r = lst[i]
                 rule = REQ_AGENT if agent else REQ_HUMAN
                 other = r.get("_agent_client")
-                if r.get("status") not in rule[status]:
+                took = None
+                if withdraw is not None:   # an explicit withdraw: that request's own card, untouched, nobody chose yet
+                    if not agent or r.get("status") != "proposed" or status not in ("working", "failed"):
+                        code, body = 409, {"error": T("withdraw 는 proposed 요청을 working · failed 로 바꿀 때만", "withdraw only takes a proposed request to working or failed"),
+                                           "status": r.get("status")}
+                    else:
+                        code, err = self._withdrawable(withdraw, rid)
+                        if code == 200:
+                            code, d = self.proposal_act(withdraw, "dismiss", "proposed", by, keep_request=True)
+                            err = d.get("error")
+                            took = {"pid": withdraw, "elements": len(d.get("applied") or [])}
+                        body = {"error": err, "status": r.get("status")}
+                        if code == 200:
+                            r = dict(r, status=status, pid=None)   # the card is gone: the request is back with the agent
+                elif r.get("status") not in rule[status]:
                     code, body = 409, {"error": T(f"지금 상태({r.get('status')})에서는 {status} 로 못 바꾼다", f"cannot go from {r.get('status')} to {status}"),
                                        "status": r.get("status")}
                 elif agent and r.get("status") == "working" and other and other != client and \
                         t - max(self.agent_seen.get(other, 0.0), self.loaded_at, (r.get("updated") or 0) / 1000) < REQ_GONE_S:   # same grace as _sweep_requests
                     code, body = 409, {"error": T(f"{r.get('agent')} 가 작업 중", f"{r.get('agent')} is working on it"), "status": "working"}
                 else:
+                    code = 200
+                if code == 200:
                     new = dict(r, status=status, updated=int(t * 1000))
                     seen = r.get("_seen") if isinstance(r.get("_seen"), dict) else None
                     if agent:
@@ -752,9 +791,58 @@ class Board:
                     code, body, swept = 200, self.req_public(new), True
                     if status == "working" and seen is not None:   # only to the agent that takes it, never published
                         body["seen"] = seen
+                    if took:
+                        body["withdrawn"] = took
         if swept:
             self._requests_changed()
         return code, body
+
+    def _withdrawable(self, pid, rid):
+        """Under the lock: may an agent take proposal pid back? It must be on the board, belong to request rid (None: a chat proposal), still wait
+        for a person, and its result must be as placed (the anchor's fp; a person's moves, text edits, deletions or added labels say no).
+        -> (200, None) or (409, why)"""
+        a = self.elements.get(PROP_PREFIX + pid) if isinstance(pid, str) and PID_RE.match(pid) else None
+        p = proposal_of(a)
+        if p is None or a.get("isDeleted") or p.get("pid") != pid:
+            return 409, T("그 제안이 보드에 없다", "that proposal is not on the board")
+        if p.get("rid") != rid:
+            return 409, T("그 pid 는 이 요청의 제안이 아니다", "that pid is not this request's proposal")
+        if p.get("status") != "proposed":
+            return 409, T("사람이 이미 제안을 골랐다 — 거두지 않았다", "a person already chose on the proposal - not withdrawn")
+        fp = p.get("fp")
+        res = _ids(p.get("results"))
+        ts = {i for i in res if isinstance(self.elements.get(i), dict) and is_typeset(self.elements[i])}
+        touched = not isinstance(fp, dict) or any(
+            i not in fp or not isinstance(self.elements.get(i), dict) or self.elements[i].get("isDeleted") or result_fp(self.elements[i], ts) != fp[i]
+            for i in res)
+        have = set(res)
+        if not touched and any(isinstance(e, dict) and not e.get("isDeleted") and isinstance(e.get("containerId"), str) and e["containerId"] in have
+                               and e.get("id") not in have for e in self.elements.values()):
+            touched = True   # a label a person put on a result
+        if touched:
+            return 409, T("사람이 결과를 고쳤다 — 거두지 않았다", "a person changed the result - not withdrawn")
+        return 200, None
+
+    def proposal_withdraw(self, pid, by):
+        """An agent takes back a chat proposal (no request) it placed: POST /proposals/<pid> {action: withdraw}. A request's card goes through
+        the request (withdraw: pid) instead, so its chip follows. -> (status, body)"""
+        with self.lock:
+            a = self.elements.get(PROP_PREFIX + pid)
+            p = proposal_of(a)
+            rid = p.get("rid") if p else None
+            if isinstance(rid, str):
+                lst = self._reqs()
+                r = next((x for x in lst if x.get("rid") == rid), None)
+                if r is not None and r.get("status") == "proposed" and r.get("pid") == pid:
+                    return 409, {"error": T(f"요청에 놓인 카드다 — board_request_update {{rid:\"{rid}\", status:\"working\", withdraw:\"{pid}\"}} 로 거둔다",
+                                            f"this card belongs to a request - withdraw it with board_request_update {{rid:\"{rid}\", status:\"working\", withdraw:\"{pid}\"}}")}
+            code, err = self._withdrawable(pid, rid)
+            if code != 200:
+                return code, {"error": err}
+            code, d = self.proposal_act(pid, "dismiss", "proposed", by, keep_request=True)
+            if code == 200:
+                d = dict(d, withdrawn={"pid": pid, "elements": len(d.get("applied") or [])})
+            return code, d
 
     def _req_seen(self, r):
         """Under the lock: {id: version} of request r's targets plus the live elements centred in its box (anchors left out), or None if huge."""
@@ -813,7 +901,7 @@ class Board:
         return changed
 
     # ---------- proposal cards (WP-6) ----------
-    def proposal_act(self, pid, action, from_status, by):
+    def proposal_act(self, pid, action, from_status, by, keep_request=False):
         """A person's apply · revert · keep · dismiss on proposal pid, all under the lock. from_status must be the card's status right now
         (proposed · applied), otherwise 409 - so of two people pressing at once exactly one wins, and the originals and the result are never
         both deleted (dismiss only from proposed, apply only while some result is alive, revert brings the originals back first).
@@ -963,7 +1051,7 @@ class Board:
             for k in range(0, len(lst_out), MAX_ELEMENTS_PER_POST):   # merge takes MAX_ELEMENTS_PER_POST at a time; the lock is held throughout
                 took += self.merge(lst_out[k:k + MAX_ELEMENTS_PER_POST], "")   # client "" is nobody's: every screen gets it, the presser's too
             rid = p.get("rid")
-            if isinstance(rid, str):   # the request follows the card: apply · keep · dismiss close it, revert reopens it as proposed
+            if isinstance(rid, str) and not keep_request:   # the request follows the card: apply · keep · dismiss close it, revert reopens it as proposed
                 lst = self._reqs()
                 i = next((k for k, r in enumerate(lst) if r.get("rid") == rid), None)
                 want = "proposed" if action == "revert" else "done"
@@ -2122,8 +2210,11 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 if not agent or not isinstance(data["pid"], str) or not PID_RE.match(data["pid"]):
                     return self.send(400, {"error": "pid"})
                 pid = data["pid"]
+            withdraw = data.get("withdraw")
+            if withdraw is not None and (not agent or not isinstance(withdraw, str) or not PID_RE.match(withdraw)):
+                return self.send(400, {"error": "withdraw: the pid of this request's proposal (agent only)"})
             by = re.sub(r"\s*·\s*AI$", "", usr["name"]) if agent else usr["name"]
-            code, out = b.request_update(rid, status, by, client, agent, reply, pid)
+            code, out = b.request_update(rid, status, by, client, agent, reply, pid, withdraw)
             return self.send(code, out)
 
         def do_proposal(self, pm, data, usr):
@@ -2134,10 +2225,14 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.send(404, {"error": "no board"})
             if not isinstance(data, dict):
                 return self.send(400, {"error": "body must be an object"})
-            if usr.get("agent"):
-                return self.send(403, {"error": T("사람 편집 연결만", "a person's edit connection only")})
             if not CLIENT_ID.match(str(data.get("client", ""))):
                 return self.send(400, {"error": "client"})
+            if usr.get("agent") or data.get("action") == "withdraw":   # agents may only take their own untouched card back; people choose
+                if not usr.get("agent") or data.get("action") != "withdraw":
+                    return self.send(403, {"error": T("사람 편집 연결만" if usr.get("agent") else "에이전트 토큰만",
+                                                      "a person's edit connection only" if usr.get("agent") else "agent token only")})
+                code, out = b.proposal_withdraw(pm.group(2), re.sub(r"\s*·\s*AI$", "", usr["name"]))
+                return self.send(code, out)
             action, frm = data.get("action"), data.get("from_status")
             if not isinstance(action, str) or action not in PROP_ACTIONS:
                 return self.send(400, {"error": "action", "allowed": list(PROP_ACTIONS)})

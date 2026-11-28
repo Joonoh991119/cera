@@ -4,15 +4,15 @@
 // After apply the card says 바꿈 [원본 ↺] [확정]. Every press goes to the server, which acts under its lock and tells everyone; each screen
 // shows a 3 s toast (the apply toast has [원래대로]). Drawn as HTML, never as elements, so exports and undo never see it.
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { anchorsOf, proposalOf, onScreen, shownKey, cardModel, cardSize, actionBody, toastModel, retryNote, retryIds, label, TITLE, driftText, stateText, TOAST_MS } from "./proposal.js";
-import { toScreen, place } from "../ask/requests.js";
+import { anchorsOf, proposalOf, onScreen, shownKey, layoutCards, cardModel, cardSize, actionBody, toastModel, retryNote, retryIds, label, TITLE, driftText, stateText, TOAST_MS } from "./proposal.js";
 import { screenObstacles, viewSize, afterLayout } from "../ask/dom.js";
 import { call } from "../ask/useRequests.js";
 import { tr } from "../../i18n.js";
 import "../ask/ask.css";
 import "./proposal.css";
 
-const RETRY_GAP_MS = 3000;   // server REQ_GAP: one request every 3 s per connection
+const RETRY_GAP_MS = 3000;
+const MINI = 48;              // phone, no room even for the two-row card: one ✦ button (opens the sheet) beside the result   // server REQ_GAP: one request every 3 s per connection
 
 function why(r) {
   if (r.status === 409) return tr("그사이 다른 사람이 먼저 눌렀어요", "Someone else got there first");
@@ -50,7 +50,7 @@ function Sheet({ p, m, busy, onAct, onClose }) {
         </div>
         <div className="wb-ask-actions">
           {more ? m.more.map((a) => <button key={a} type="button" className="wb-btn" disabled={busy} onClick={() => onAct(p, a)}>{label(a)}</button>)
-            : <button type="button" className="wb-btn" aria-label={tr("더 보기", "More")} onClick={() => setMore(true)}>…</button>}
+            : m.more.length > 0 && <button type="button" className="wb-btn" aria-label={tr("더 보기", "More")} onClick={() => setMore(true)}>…</button>}
           <button type="button" className="wb-btn" onClick={onClose}>{tr("닫기", "Close")}</button>
         </div>
       </div>
@@ -72,6 +72,7 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
   const [frame, setFrame] = useState(0);
   const [busy, setBusy] = useState({});          // pid -> true while its press is on the way
   const [sheet, setSheet] = useState(null);      // phone: pid whose sheet is open
+  const [sheetFrom, setSheetFrom] = useState("proposed");   // the card status the open sheet was drawn for
   const [unsure, setUnsure] = useState(null);    // desktop: pid whose '?' list is open
   const [toast, setToast] = useState(null);      // {text, undo, pid, key}
   const env = useRef({});
@@ -117,14 +118,14 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
   const anchors = anchorsOf(els);
   const key = anchors.map((a) => `${proposalOf(a).pid}`).join(",");
   const sheetState = sheet ? (anchors.find((a) => proposalOf(a).pid === sheet) ? proposalOf(anchors.find((a) => proposalOf(a).pid === sheet)).status : "gone") : "";
-  useEffect(() => { if (sheet && sheetState !== "proposed") setSheet(null); }, [sheet, sheetState]);   // someone else decided meanwhile: the sheet closes
+  useEffect(() => { if (sheet && sheetState !== sheetFrom) setSheet(null); }, [sheet, sheetState, sheetFrom]);   // someone else decided meanwhile: the sheet closes
 
   const say = (text) => { setToast({ text, undo: null, key: Date.now() }); setTimeout(() => setToast((t) => (t && t.text === text ? null : t)), TOAST_MS); };
 
   async function act(p, button) {
     const { boardId: bid, client: cl } = env.current;
     if (env.current.viewOnly || busy[p.pid] || flying.current.has(p.pid)) return;
-    if (button === "open") { setSheet(p.pid); return; }
+    if (button === "open") { setSheet(p.pid); setSheetFrom(p.status === "applied" ? "applied" : "proposed"); return; }
     if (button === "retry") {
       const ids = retryIds(p, excal.getSceneElements());
       if (!ids.length) { say(tr("원본이 보드에 없어서 다시 맡길 수 없어요", "The original is gone, so it can't be sent again")); return; }
@@ -160,18 +161,11 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
   const st = excal ? excal.getAppState() : null;
   const items = useMemo(() => {
     if (!excal || !anchors.length) return [];
-    const view = viewSize(), placed = screenObstacles([".wb-ask-chip"]), out = [];
-    for (const a of anchors) {
-      const p = proposalOf(a), m = cardModel(p, { touch, viewOnly });
-      const rect = toScreen({ x: a.x, y: a.y, w: a.width, h: a.height }, st);
-      if (!onScreen(rect, view)) continue;
-      const { w, h } = cardSize(m, touch);
-      const at = place(rect, w, h, placed, view);
-      if (!at) continue;
-      const card = { x: at.x, y: at.y, w, h };
-      placed.push(card);
-      out.push({ p, m, card });
-    }
+    const chips = [...document.querySelectorAll(".wb-ask-chip")].map((el) => {
+      const r = el.getBoundingClientRect();
+      return { rid: el.getAttribute("data-rid"), x: r.left, y: r.top, w: r.width, h: r.height };
+    }).filter((c) => c.w > 0 && c.h > 0);
+    const out = layoutCards(anchors, els, st, viewSize(), { touch, viewOnly, bars: screenObstacles(), chips });
     return out;
   }, [excal, frame, key, touch, viewOnly, st && st.scrollX, st && st.scrollY, st && st.zoom && st.zoom.value]);   // eslint-disable-line react-hooks/exhaustive-deps
   const shown = shownKey(items);   // only cards on screen hide their '제안 도착' chip — an off-screen card leaves the chip showing
@@ -182,18 +176,31 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
     <>
       {items.length > 0 && (
         <div className="wb-ask-layer wb-prop-layer" aria-label={tr("AI 제안", "AI proposals")}>
-          {items.map(({ p, m, card }) => (
-            <div key={p.pid} className={`wb-prop-card wb-prop-${m.state}${touch ? " wb-ask-touch" : ""}`} style={{ left: card.x, top: card.y, width: card.w, height: card.h }}
+          {items.map(({ p, m, card, narrow, mini }) => mini ? (
+            <div key={p.pid} className={`wb-prop-card wb-prop-mini wb-prop-${m.state} wb-ask-touch`} style={{ left: card.x, top: card.y, width: card.w, height: card.h }}
+              onPointerDown={(e) => e.stopPropagation()}>
+              {viewOnly ? <span aria-label={m.title} title={m.title}>✦</span>
+                : <button type="button" className="wb-ask-act" aria-label={m.title} title={m.title} disabled={!!busy[p.pid]} onClick={() => act(p, "open")}>✦</button>}
+            </div>
+          ) : (
+            <div key={p.pid} className={`wb-prop-card wb-prop-${m.state}${touch ? " wb-ask-touch" : ""}${narrow ? " wb-prop-narrow" : ""}`} style={{ left: card.x, top: card.y, width: card.w, height: card.h }}
               role="group" aria-label={m.title} onPointerDown={(e) => e.stopPropagation()}>
               <div className="wb-prop-head">
                 <span className="wb-prop-title" title={m.title}>{m.title}</span>
                 {m.uncertain.length > 0 && <button type="button" className="wb-prop-q" aria-expanded={unsure === p.pid}
                   title={tr("AI 가 자신 없는 곳", "Where the AI is unsure")} onClick={() => setUnsure((u) => (u === p.pid ? null : p.pid))}>?</button>}
                 {m.drift > 0 && <span className="wb-prop-drift" title={tr("요청한 뒤 원본 쪽이 바뀌었어요", "The original changed after the request")}>{driftText(m.drift)}</span>}
-                {touch && m.actions.map((a) => (
+                {touch && !narrow && m.actions.map((a) => (
                   <button key={a} type="button" className="wb-ask-act" disabled={!!busy[p.pid]} title={TITLE[a] && TITLE[a]()} onClick={() => act(p, a)}>{label(a)}</button>
                 ))}
               </div>
+              {touch && narrow && m.actions.length > 0 && (
+                <div className="wb-prop-row">
+                  {m.actions.map((a) => (
+                    <button key={a} type="button" className="wb-ask-act" disabled={!!busy[p.pid]} title={TITLE[a] && TITLE[a]()} onClick={() => act(p, a)}>{label(a)}</button>
+                  ))}
+                </div>
+              )}
               {!touch && m.note && <small className="wb-prop-note" title={m.note}>{m.note}</small>}
               {!touch && (m.actions.length ? (
                 <div className="wb-prop-row">
@@ -210,7 +217,7 @@ export default function ProposalLayer({ excal, boardId, client, touch, viewOnly,
           ))}
         </div>
       )}
-      {open && !viewOnly && touch && <Sheet p={open.p} m={cardModel(open.p, { touch })} busy={!!busy[open.p.pid]} onAct={act} onClose={() => setSheet(null)} />}
+      {open && !viewOnly && <Sheet p={open.p} m={cardModel(open.p, { touch })} busy={!!busy[open.p.pid]} onAct={act} onClose={() => setSheet(null)} />}
       {toast && (
         <div key={toast.key} className="wb-prop-toast" role="status" aria-live="polite">
           <span>{toast.text}</span>
