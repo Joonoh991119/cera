@@ -28,7 +28,7 @@ $S/local_board.sh stop                                  # 끝나면 꼭
 ## 보고 형식(`_workspace/05_smoke.md`, ≤ 20줄)
 - 기준 표: 기준 · 엔진/기기 · 통과/실패 · 근거(값 · 재현 명령). 스크린샷은 실패한 것만 경로로.
 - 사용성 · 느낌 · 실제 기기 자판 같은 것은 적지 않는다 → `05_ux_request.md` 항목으로 넘긴다.
-- 실측(`05_metrics.md`) · 처음 써 보는 사람 리뷰(`05_naive_<모델>_r<k>.md`)의 기준 · 과제 · 형식은 `board-orchestrator/references/eval-goals.md` B · C 표와 `agents/board-uiux-tester.md`. 처음 써 보는 사람 리뷰를 맡은 에이전트는 이 스킬의 '쓸모 있는 조작' 절을 읽지 않는다(내부 API 를 알려 준다).
+- 실측(`05_metrics.md`) · 처음 써 보는 사람 리뷰(`05_naive_<모델>_r<k>.md`)의 기준 · 과제 · 형식은 `board-orchestrator/references/eval-goals.md` B · C 표와 `agents/board-uiux-tester.md`. 잡일은 Opus(또는 Fable) 하나, 처음 써 보는 사람 리뷰는 Fable + Opus 새 에이전트 둘(`<모델>` = `fable` · `opus`). 처음 써 보는 사람 리뷰를 맡은 에이전트는 이 스킬의 '쓸모 있는 조작' 절을 읽지 않는다(내부 API 를 알려 준다).
 
 ## 사람 UX 확인 요청서(`_workspace/05_ux_request.md`)
 ```
