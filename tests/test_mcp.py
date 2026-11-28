@@ -1489,6 +1489,22 @@ class Wp3(Base):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(list(snaps.glob(f"{self.sid}-*.png")), [])
 
+    def test_r2_delete_stops_when_snapshots_cannot_be_listed(self):
+        """R1-08: a snapshots folder that cannot be read (0300: glob sees nothing) must stop the delete, not skip the PNGs."""
+        self.check_image(self.snap({"ids": self.regions["F2"], "render": "server", "max_edge": 256}), 256)
+        self.m.close()
+        subprocess.run([sys.executable, str(CLI), "stop", self.sid], env=self.env, capture_output=True, timeout=60)
+        snaps = self.home / "snapshots"
+        os.chmod(snaps, 0o300)
+        try:
+            for py in [sys.executable] + ([str(PY39)] if PY39.exists() else []):
+                p = subprocess.run([py, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(p.returncode, 0, py)
+                self.assertTrue((self.home / "sites" / self.sid).exists(), py)
+        finally:
+            os.chmod(snaps, 0o700)
+        self.assertEqual(len(list(snaps.glob(f"{self.sid}-*.png"))), 1)
+
     def test_python39(self):
         if not PY39.exists():
             self.skipTest("no /usr/bin/python3")
@@ -1541,7 +1557,7 @@ class Wp3InProcess(unittest.TestCase):
         p1 = self.tools._save_snapshot(None, self.conn, "my-board.1", b"a")
         p2 = self.tools._save_snapshot(None, self.conn, "my-board.1", b"b")
         self.assertNotEqual(p1, p2)
-        self.assertRegex(p2.name, r"^remote-[0-9a-f]{8}-b[0-9a-f]{12}-2\.png$")
+        self.assertRegex(p2.name, r"^remote_[0-9a-f]{8}-b[0-9a-f]{12}-2\.png$")
         self.assertEqual(p1.read_bytes(), b"a")
 
     def test_two_processes_never_share_a_file(self):
@@ -1558,6 +1574,138 @@ class Wp3InProcess(unittest.TestCase):
         files = list((Path(self.tmp.name) / "snapshots").glob("site1-*.png"))
         self.assertEqual(len(files), 80)
         self.assertEqual(len({f.read_bytes() for f in files}), 80)
+
+
+class FakeBoardConn:
+    """In-process stand-in for a Conn to one board (no server): board GET, presence poll, render job create / wait.
+    tab(job_args, elements) -> job data (or None: never done). Records (method, path, timeout, body) of each request."""
+
+    def __init__(self, mod, elements, tab=None, presence=True, delays=None):
+        self.mod, self.elements, self.tab, self.presence = mod, elements, tab, presence
+        self.client, self.base = "ag-x", "https://example.invalid"
+        self.calls, self.delays, self.board_gets, self.job = [], delays or {}, 0, None
+
+    def req(self, method, path, body=None, timeout=30):
+        self.calls.append((method, path, timeout, body))
+        if "/poll?" in path:
+            time.sleep(min(timeout, self.delays.get("poll", 0)))
+            return 200, {"presence": [{"role": "edit", "user": "길동"}] if self.presence else []}
+        if method == "POST" and path.endswith("/jobs"):
+            if len(json.dumps(body["args"], ensure_ascii=False).encode("utf-8")) > 64 * 1024:   # server.py JOB_ARGS_MAX
+                return 413, {"error": "args too large"}
+            self.job = body["args"]
+            return 201, {"jid": "j" * 12}
+        if "/jobs/" in path:
+            data = self.tab(self.job, self.elements) if self.tab else None
+            if data is None:
+                time.sleep(min(timeout, 0.2))
+                return 200, {"state": "claimed"}
+            return 200, {"state": "done", "data": data, "claimer": {"user": "길동"}}
+        if method == "GET" and path.endswith("/boards/b1"):
+            self.board_gets += 1
+            d = self.delays.get("board%d" % self.board_gets, 0)
+            if d:
+                time.sleep(min(timeout, d))
+                if timeout <= d:
+                    raise self.mod.ToolError("read timed out")
+            return 200, {"elements": self.elements, "seq": 1, "epoch": "e"}
+        return 404, {"error": "?"}
+
+    def ok(self, method, path, body=None, timeout=30, want=(200, 201, 204)):
+        code, data = self.req(method, path, body, timeout)
+        if code not in want:
+            raise self.mod.ToolError("HTTP %s" % code)
+        return data
+
+
+def _tab_data(a, elements, tag=None, png=None):
+    """What a tab would answer for render args a: the raster of the picked scene."""
+    region = a.get("region")
+    picked = RS.pick(elements, ids=a.get("ids"), region=region and (region["x"], region["y"], region["w"], region["h"]))[0]
+    out = RS.render(picked, max_edge=a["max_edge"], scale=a.get("scale"), pad=a["pad"])
+    return {"png": __import__("base64").b64encode(png if png is not None else out["png"]).decode(), "width": out["width"],
+            "height": out["height"], "scale": out["scale"], "x0": out["x0"], "y0": out["y0"], "tag": tag or RS.scene_tag(picked)}
+
+
+class Wp3R2(unittest.TestCase):
+    """Review r2 (04_review_WP-3_neon_r2, written by Codex): each finding reproduced in-process first, then fixed."""
+
+    def setUp(self):
+        self.mod = _load("tb_mcp", "cera_tb_mcp_wp3r2")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def tools(self, conn, sid=None):
+        from types import SimpleNamespace
+        return self.mod.Tools(SimpleNamespace(ctx=SimpleNamespace(HOME=Path(self.tmp.name)), conn=lambda site: (conn, sid),
+                                              board_id=lambda c, s, b: "b1"))
+
+    @staticmethod
+    def box(i, x=0, y=0, **kw):
+        return {"id": i, "type": "rectangle", "x": x, "y": y, "width": 40, "height": 30, "angle": 0, "strokeWidth": 2, "version": 1,
+                "versionNonce": 7, "isDeleted": False, **kw}
+
+    def test_r2_truncated_tab_png_falls_back(self):
+        """R1-01: a tab answering only the first 33 bytes of a good PNG (IHDR, no IDAT/IEND) is not passed on."""
+        els = [self.box("a1")]
+        conn = FakeBoardConn(self.mod, els, tab=lambda a, e: _tab_data(a, e, png=RS.render(e, max_edge=256)["png"][:33]))
+        text, img = self.tools(conn).board_snapshot({"ids": ["a1"]})
+        self.assertIn("renderer: server", text)
+        self.assertTrue(RS.png_complete(img.png))
+
+    def test_r2_refetch_after_tag_mismatch_stays_in_the_deadline(self):
+        """R1-03: when the tags differ the board is read again — that read must end within the tab deadline, not after 30 s."""
+        self.mod.SNAP_TAB_WAIT = 2.0
+        els = [self.box("a1")]
+        conn = FakeBoardConn(self.mod, els, tab=lambda a, e: _tab_data(a, e, tag="1-00000000"), delays={"board2": 5})
+        t = time.time()
+        text, _ = self.tools(conn).board_snapshot({"ids": ["a1"]})
+        self.assertLess(time.time() - t, 3.0)
+        self.assertIn("renderer: server", text)
+
+    def test_r2_presence_query_counts_against_the_deadline(self):
+        """R1-03: the presence query happens inside the tab deadline (a slow poll does not add to it)."""
+        self.mod.SNAP_TAB_WAIT = 2.0
+        conn = FakeBoardConn(self.mod, [self.box("a1")], tab=None, delays={"poll": 1.5})
+        t = time.time()
+        text, _ = self.tools(conn).board_snapshot({"ids": ["a1"]})
+        self.assertLess(time.time() - t, 2.8)
+        self.assertIn("renderer: server", text)
+
+    def test_r2_page_filter_uses_the_page_not_rounded_pixels(self):
+        """R1-05: a page 80.2 wide drawn at 4x is 321 px (80.25 units); text starting at 80.21 lies outside the page and is not described."""
+        page = {"id": "tbpage-1", "type": "frame", "x": 0, "y": 0, "width": 80.2, "height": 80, "angle": 0, "version": 1, "versionNonce": 1,
+                "isDeleted": False, "customData": {"tbPage": 1}}
+        txt = {"id": "tin", "type": "text", "x": 10, "y": 10, "width": 30, "height": 14, "text": "inside", "originalText": "inside",
+               "fontSize": 14, "frameId": "tbpage-1", "version": 1, "versionNonce": 1, "isDeleted": False, "angle": 0}
+        off = {**txt, "id": "toff", "x": 80.21, "text": "offpage", "originalText": "offpage"}
+        conn = FakeBoardConn(self.mod, [page, txt, off], presence=False)
+        text, img = self.tools(conn).board_snapshot({"page": 1, "render": "server"})
+        self.assertIn("4", re.search(r"py/([\d.]+)\)", text).group(1))
+        self.assertIn('"inside"', text)
+        self.assertNotIn("offpage", text)
+
+    def test_r2_remote_prefix_cannot_be_a_local_site_id(self):
+        """new: a personal site id may look like remote-<hash> (lowercase, digits, '-'); remote snapshots must not share its names."""
+        import hashlib
+        from types import SimpleNamespace
+        conn = SimpleNamespace(base="https://example.invalid", client="x")
+        local = "remote-" + hashlib.sha256(conn.base.encode()).hexdigest()[:8]
+        t = self.tools(conn)
+        p_local = t._save_snapshot(local, conn, "abcdefgh", b"L")
+        p_remote = t._save_snapshot(None, conn, "abcdefgh", b"R")
+        pat = re.escape(local) + r"-[A-Za-z0-9_]{1,64}-\d+\.png"   # bin/cera cmd_delete
+        self.assertTrue(re.fullmatch(pat, p_local.name))
+        self.assertIsNone(re.fullmatch(pat, p_remote.name), p_remote.name)
+
+    def test_r2_many_ids_still_reach_the_tab(self):
+        """new: 2000 uuid-length ids (valid input; most not on the board) must not make the tab job 413."""
+        import uuid
+        els = [self.box("a1")]
+        conn = FakeBoardConn(self.mod, els, tab=lambda a, e: _tab_data(a, e))
+        ids = ["a1"] + [str(uuid.UUID(int=i)) for i in range(1999)]
+        text, _ = self.tools(conn).board_snapshot({"ids": ids, "render": "tab"})
+        self.assertIn("renderer: tab", text)
 
 
 def _load(name, mod_name):

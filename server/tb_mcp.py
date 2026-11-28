@@ -71,6 +71,7 @@ SNAP_TAB_WAIT_FORCED = 15.0   # render:"tab" (the job itself expires after 20 s)
 SNAP_KEEP = 50                # snapshots kept per site in $CERA_HOME/snapshots
 SNAP_LINES = 80               # summary lines in a snapshot / selection result
 SNAP_RASTER_S = 4.0           # time budget of one server raster (pure Python holds the GIL)
+JOB_ARGS_MAX = 64 * 1024      # server.py: job args over this are refused (413)
 IMAGE_MAX_BYTES = 2_600_000   # PNG bytes in one image block (base64 ≈ 3.5 MB, under Claude's 5 MB per-image limit)
 _SNAP_LOCK = threading.Lock()
 
@@ -442,8 +443,8 @@ def _copy(e):
     return copy.deepcopy(e)
 
 
-def _fetch(c: Conn, bid: str) -> dict:
-    d = c.ok("GET", f"/api/whiteboard/boards/{bid}")
+def _fetch(c: Conn, bid: str, timeout: float = 30) -> dict:
+    d = c.ok("GET", f"/api/whiteboard/boards/{bid}", timeout=timeout)
     if not isinstance(d, dict):
         raise ToolError(T("보드를 읽지 못했다", "Could not read the board"))
     return d
@@ -1591,11 +1592,11 @@ class Tools:
             rows = exact or [r for r in rows if w.lower() in r["user"].lower()]
         return rows
 
-    def _humans(self, c: Conn, bid: str, d: dict) -> List[dict]:
+    def _humans(self, c: Conn, bid: str, d: dict, timeout: float = 3) -> List[dict]:
         """People's edit tabs on the board now (agents and view-only excluded) — a render job is only worth sending if one is there."""
         q = urllib.parse.urlencode({"since": d.get("seq") or 0, "epoch": d.get("epoch") or "", "client": c.client, "pver": -1, "wait": 0.1})
         try:
-            code, r = c.req("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=3)
+            code, r = c.req("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=max(0.5, min(3.0, timeout)))
         except ToolError:
             return []
         if code != 200 or not isinstance(r, dict):
@@ -1631,7 +1632,7 @@ class Tools:
         except (ValueError, TypeError):
             png = b""
         size = rs.png_size(png)
-        if not size:
+        if not size or not rs.png_complete(png):
             return None, T("탭 결과가 온전한 PNG 가 아님", "the tab's result is not a complete PNG")
         if max(size) > args["max_edge"] or len(png) > IMAGE_MAX_BYTES:
             return None, T(f"탭 그림이 상한을 넘음({size[0]}×{size[1]} px · {len(png) // 1024} KB)",
@@ -1654,7 +1655,9 @@ class Tools:
             os.chmod(d, 0o700)
         except OSError:
             pass
-        site = sid or ("remote-" + hashlib.sha256(c.base.encode()).hexdigest()[:8])
+        # remote: "remote_<hash>" — '_' never appears in a local site id (personal: [a-z0-9-], temporary: mmdd-HHMM-hex), so `cera delete <id>`
+        # can never pick a remote board's pictures
+        site = sid or ("remote_" + hashlib.sha256(c.base.encode()).hexdigest()[:8])
         board = bid if re.fullmatch(r"[A-Za-z0-9_]{1,64}", bid) else "b" + hashlib.sha256(bid.encode()).hexdigest()[:12]
         pat = re.compile(re.escape(site) + r"-[A-Za-z0-9_]{1,64}-(\d+)\.png$")
 
@@ -1765,19 +1768,23 @@ class Tools:
         want = min(4.0, max(0.25, SNAP_LETTER_PX / ch)) if ch else None
         out, why, renderer, notes = None, "", "server", []
         if mode != "server":
-            humans = self._humans(c, bid, d)
+            deadline = time.time() + (SNAP_TAB_WAIT if mode == "auto" else SNAP_TAB_WAIT_FORCED)   # the presence query counts too
+            humans = self._humans(c, bid, d, deadline - time.time())
             if humans:
-                deadline = time.time() + (SNAP_TAB_WAIT if mode == "auto" else SNAP_TAB_WAIT_FORCED)
                 job = {"max_edge": max_edge, "mono": mono, "pad": pad}
                 if want:
                     job["scale"] = want
-                if ids is not None:
-                    job["ids"] = ids
+                if ids is not None:   # only ids on the board (missing ones would only make the job bigger; the tab re-expands bound text etc.)
+                    gone = set(missing)
+                    job["ids"] = [i for i in ids if i not in gone]
                 elif region is not None:
                     job["region"] = {"x": region[0], "y": region[1], "w": region[2], "h": region[3]}
                 elif frame is not None:
                     job["page"] = frame["id"]
-                out, why = self._tab_render(c, bid, job, deadline, cancelled)
+                if len(json.dumps(job, ensure_ascii=False).encode("utf-8")) > JOB_ARGS_MAX - 512:
+                    out, why = None, T("id 가 너무 많아 탭 작업에 담기지 않음", "too many ids for a tab job")
+                else:
+                    out, why = self._tab_render(c, bid, job, deadline, cancelled)
                 if out is None and why.startswith(("탭 그림이 상한", "the tab's picture is over")):   # too big: once more, smaller
                     if deadline - time.time() > 1.0:
                         job["max_edge"] = max(256, int(max_edge * 0.6))
@@ -1787,7 +1794,9 @@ class Tools:
                 if out is not None and out.get("tag") != rs.scene_tag(picked):
                     # the tab drew a different scene (someone edited in between, or the tab is behind): read the board again once
                     try:
-                        d2 = _fetch(c, bid)
+                        if deadline - time.time() < 0.3:
+                            raise ToolError("deadline")
+                        d2 = _fetch(c, bid, timeout=max(0.3, min(5.0, deadline - time.time())))   # within the tab deadline
                         els2, frame2, picked2, missing2 = scene(d2)
                     except ToolError:
                         picked2 = []
@@ -1811,6 +1820,12 @@ class Tools:
         path = self._save_snapshot(sid, c, bid, out["png"])
         s, x0, y0 = out["scale"], out["x0"], out["y0"]
         view = (x0, y0, out["width"] / s, out["height"] / s)   # the board rectangle the picture shows
+        want_box = ((rs._f(frame.get("x")), rs._f(frame.get("y")), rs._f(frame.get("width")), rs._f(frame.get("height"))) if frame is not None
+                    else region)
+        if want_box is not None:   # never past the page / region asked for (pixel rounding can add a fraction of a unit)
+            vx0, vy0 = max(view[0], want_box[0]), max(view[1], want_box[1])
+            vx1, vy1 = min(view[0] + view[2], want_box[0] + want_box[2]), min(view[1] + view[3], want_box[1] + want_box[3])
+            view = (vx0, vy0, max(0.0, vx1 - vx0), max(0.0, vy1 - vy0))
         shown = [e for e in picked if (lambda b: b is not None and rs._overlaps(b, view))(rs.element_box(e))]
         lines = [T(f"스냅샷 renderer: {renderer}", f"Snapshot renderer: {renderer}") +
                  (T(" (사람 화면과 같은 그림" + (f", {_clip(out['by'], 40)} 의 탭" if out.get("by") else "") + ")",

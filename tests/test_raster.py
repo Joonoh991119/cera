@@ -199,8 +199,54 @@ class RasterR1(unittest.TestCase):
 
     def test_scene_tag_matches_js(self):
         """web/tests/jobs.test.mjs computes the same value."""
-        self.assertEqual(rs.scene_tag([{"id": "b", "version": 3}, {"id": "a", "version": 12}, {"id": "c"}, {"id": "한", "version": 2.0}]),
-                         "4-e914a571")
+        self.assertEqual(rs.scene_tag([{"id": "b", "version": 3, "versionNonce": 9}, {"id": "a", "version": 12}, {"id": "c"}, {"id": "한", "version": 2.0}]),
+                         "4-2db59f12")
+
+
+class RasterR2(unittest.TestCase):
+    """Review r2 (04_review_WP-3_neon_r2, written by Codex) — each one reproduced first."""
+
+    def test_r2_truncated_png_is_not_complete(self):
+        """R1-01: the first 33 bytes of a good PNG (IHDR only, no IDAT/IEND) must not count as a picture."""
+        good = rs.png_bytes(3, 2, bytes([255]) * 6)
+        self.assertTrue(rs.png_complete(good))
+        self.assertFalse(rs.png_complete(good[:33]))
+        self.assertFalse(rs.png_complete(good[:-1]))                     # IEND cut
+        bad = bytearray(good); bad[40] ^= 1
+        self.assertFalse(rs.png_complete(bytes(bad)))                    # IDAT CRC broken
+
+    def test_r2_scene_tag_sees_version_nonce(self):
+        """R1-02: same id and version, different versionNonce (two people edited at once) -> different tags."""
+        a = [{"id": "x", "version": 5, "versionNonce": 111, "text": "A"}]
+        b = [{"id": "x", "version": 5, "versionNonce": 222, "text": "B"}]
+        self.assertNotEqual(rs.scene_tag(a), rs.scene_tag(b))
+
+    def test_r2_budget_is_checked_inside_one_stroke(self):
+        """new: one 60-point line with a 3 ms budget must time out, not return a PNG after ~15 ms."""
+        line = el(id="l", type="line", x=0, y=0, strokeWidth=4, points=[[k * 20.0, (k % 2) * 300.0] for k in range(60)])
+        with self.assertRaises(rs.RasterTimeout):
+            rs.render([line], max_edge=1568, scale=4, budget_s=0.003)
+
+
+class RasterR3(unittest.TestCase):
+    """Review r3 (04_review_WP-3_neon_r3): the budget is checked by time, not by element / segment counts."""
+
+    def test_r3_budget_inside_text_bars(self):
+        """one rotated text with 5000 lines: past the budget it stops soon, it does not draw every bar first."""
+        t = el(id="t", type="text", x=0, y=0, width=1500, height=1500, angle=math.pi / 4, text="a\n" * 5000, fontSize=20)
+        t0 = time.time()
+        with self.assertRaises(rs.RasterTimeout):
+            rs.render([t], max_edge=1568, scale=4, budget_s=0.05)
+        self.assertLess(time.time() - t0, 0.5)
+
+    def test_r3_budget_with_few_short_heavy_strokes(self):
+        """15 thick strokes of 15 segments each (no count-based check ever fires): still stops near the budget."""
+        heavy = [el(id="h%d" % i, type="freedraw", x=0, y=i * 2, strokeWidth=64, points=[[k * 4.0, (k % 2) * 60.0] for k in range(16)])
+                 for i in range(15)]
+        t0 = time.time()
+        with self.assertRaises(rs.RasterTimeout):
+            rs.render(heavy, max_edge=1568, scale=4, budget_s=0.05)
+        self.assertLess(time.time() - t0, 0.5)
 
 
 if __name__ == "__main__":

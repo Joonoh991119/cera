@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import "./_lang-ko.mjs";
-import { claimPrio, claimDelay, DELAYS, executeJob, applyChanged, withTimeout, renderArgs, monoElements, renderScale, pngBase64, mathPlan, mathCustom, mermaidOrigin, sceneTag, regionPlan, FULL_MAX } from "../src/features/jobs/jobs.js";
+import { claimPrio, claimDelay, DELAYS, executeJob, applyChanged, withTimeout, renderArgs, monoElements, renderScale, pngBase64, mathPlan, mathCustom, mermaidOrigin, sceneTag, regionPlan, inkMargin, growBounds, cropFrame, blankPixels } from "../src/features/jobs/jobs.js";
 import { pickElements } from "../src/features/jobs/pick.js";
 
 test("visible desktop > hidden desktop > phone", () => {
@@ -192,14 +192,51 @@ test("WP-3 r1: regionPlan crops to region and scales the crop; sceneTag matches 
   assert.deepEqual(p.crop, { x: 100, y: -10, w: 100, h: 120 });
   assert.equal(p.scale, 2);
   assert.equal(regionPlan([0, 0, 10, 10], { x: 500, y: 500, w: 5, h: 5 }, 0, 1024), null);
-  const huge = regionPlan([0, 0, 100000, 10], { x: 0, y: 0, w: 10, h: 10 }, 0, 1024, 4);
-  assert.ok(huge.scale * 100000 <= FULL_MAX + 1e-6);
+  assert.deepEqual([p.width, p.height], [200, 240]);   // the crop's own pixel size
   // same value as tests/test_raster.py test_scene_tag_matches_js
-  assert.equal(sceneTag([{ id: "b", version: 3 }, { id: "a", version: 12 }, { id: "c" }, { id: "한", version: 2.0 }]), "4-" + sceneTagRef());
+  assert.equal(sceneTag([{ id: "b", version: 3, versionNonce: 9 }, { id: "a", version: 12 }, { id: "c" }, { id: "한", version: 2.0 }]), "4-" + sceneTagRef());
 });
 
-function sceneTagRef() {   // the Python side computes the same: FNV-1a over "a:12\nb:3\nc:0\n한:2"
-  const s = "a:12\nb:3\nc:0\n한:2"; let h = 0x811c9dc5;
+function sceneTagRef() {   // the Python side computes the same: FNV-1a over "a:12:0\nb:3:9\nc:0:0\n한:2:0"
+  const s = "a:12:0\nb:3:9\nc:0:0\n한:2:0"; let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
   return h.toString(16).padStart(8, "0");
 }
+
+// Review r2 (04_review_WP-3_neon_r2, written by Codex): each reproduced first.
+test("WP-3 r2: a rotated line is picked by the region it is drawn through (same as raster.py pick)", () => {
+  const line = { id: "l", type: "line", x: 0, y: 40, points: [[0, 0], [100, 0]], angle: Math.PI / 2, width: 100, strokeWidth: 1 };
+  assert.deepEqual(pickElements([line], renderArgs({ region: { x: 49, y: 39, w: 2, h: 2 } })).elements.map((e) => e.id), ["l"]);
+  assert.deepEqual(pickElements([line], renderArgs({ region: { x: 5, y: 39, w: 2, h: 2 } })).elements, []);
+});
+
+test("WP-3 r2: a small crop of a very long stroke keeps its resolution (no full-export cap)", () => {
+  const p = regionPlan([0, 0, 100000, 10], { x: 50000, y: 0, w: 10, h: 10 }, 0, 1024, 4);
+  assert.equal(p.scale, 4);
+});
+
+test("WP-3 r2: sceneTag sees versionNonce (same version, different edit)", () => {
+  assert.notEqual(sceneTag([{ id: "x", version: 5, versionNonce: 111 }]), sceneTag([{ id: "x", version: 5, versionNonce: 222 }]));
+});
+
+// Review r3 (04_review_WP-3_neon_r3): ink of a stroke reaching into the region (its center line just outside) must be drawn; a blank result is not ok.
+test("WP-3 r3: the crop frame reaches past the region by the stroke margin; the canvas covers only margin + crop", () => {
+  const els = [{ type: "freedraw", strokeWidth: 4 }, { type: "arrow", strokeWidth: 2 }];
+  const m = inkMargin(els);
+  assert.ok(m >= 4 * 2 + 25, m);                        // stroke half-width and an arrowhead
+  assert.ok(inkMargin([{ type: "freedraw", strokeWidth: 1e9 }]) <= 64 * 4 + 40);   // capped like raster.py MAX_STROKE
+  // pen at y=100 (bounds height 0), region y=102..122, pad 0: still a plan (the bounds grow by the margin)
+  const p = regionPlan(growBounds([0, 100, 200, 100], m), { x: 10, y: 102, w: 50, h: 20 }, 0, 1024, 4);
+  assert.ok(p, "region plan with pad 0");
+  const f = cropFrame(p, m);
+  assert.deepEqual([f.frame.x, f.frame.y, f.frame.width, f.frame.height], [p.crop.x - m, p.crop.y - m, p.crop.w + 2 * m, p.crop.h + 2 * m]);
+  assert.deepEqual([f.sx, f.sy], [Math.round(m * p.scale), Math.round(m * p.scale)]);
+  assert.deepEqual([f.width, f.height], [f.sx + p.width, f.sy + p.height]);
+});
+
+test("WP-3 r3: blankPixels — an all-white picture is blank, one dark pixel is not", () => {
+  const w = new Uint8ClampedArray(4 * 9).fill(255);
+  assert.equal(blankPixels(w), true);
+  w[4 * 5] = 30;
+  assert.equal(blankPixels(w), false);
+});

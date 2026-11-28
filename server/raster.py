@@ -53,15 +53,34 @@ def png_size(data: bytes) -> Optional[Tuple[int, int]]:
     return (w, h) if w > 0 and h > 0 else None
 
 
+def png_complete(data: bytes) -> bool:
+    """Every chunk whole with a matching CRC, IHDR first, at least one IDAT, and IEND as the last bytes (a cut-off PNG shows nothing)."""
+    if png_size(data) is None:
+        return False
+    i, idat = 8, False
+    while i + 12 <= len(data):
+        n = struct.unpack(">I", data[i:i + 4])[0]
+        if i + 12 + n > len(data):
+            return False
+        t = data[i + 4:i + 8]
+        if struct.unpack(">I", data[i + 8 + n:i + 12 + n])[0] != zlib.crc32(data[i + 4:i + 8 + n]) & 0xFFFFFFFF:
+            return False
+        i += 12 + n
+        if t == b"IDAT":
+            idat = True
+        elif t == b"IEND":
+            return idat and i == len(data)
+    return False
+
+
 def scene_tag(elements: Iterable[dict]) -> str:
-    """Same as web/src/features/jobs/jobs.js sceneTag: count + FNV-1a 32 over the UTF-16 code units of the sorted "id:version" lines.
+    """Same as web/src/features/jobs/jobs.js sceneTag: count + FNV-1a 32 over the UTF-16 code units of the sorted "id:version:versionNonce" lines
+    (versionNonce: two edits of the same version are told apart — the server keeps the lower nonce, server.py wins).
     A tab render is described with the MCP's elements only when the tags match (the picture and the words show the same scene)."""
     els = list(elements)
-    lines = []
-    for e in els:
-        v = e.get("version")
-        v = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
-        lines.append("%s:%d" % (e.get("id"), v))
+    def num(v):
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
+    lines = ["%s:%d:%d" % (e.get("id"), num(e.get("version")), num(e.get("versionNonce"))) for e in els]
     text = "\n".join(sorted(lines))
     h = 0x811C9DC5
     for unit in struct.unpack("<%dH" % (len(text.encode("utf-16-le")) // 2), text.encode("utf-16-le")):
@@ -285,9 +304,10 @@ def _thin(pts: List[Pt], step: float = 1.0) -> List[Pt]:
 
 
 class Canvas:
-    def __init__(self, w: int, h: int):
+    def __init__(self, w: int, h: int, tick=None):
         self.w, self.h = w, h
         self.buf = bytearray(b"\xff" * (w * h))
+        self.tick = tick or (lambda: None)   # called before every span-filling shape (render's time budget / cancel check); may raise
 
     def _span(self, j: int, lo: float, hi: float, g: int):
         i0, i1 = max(0, int(math.floor(lo + 0.5))), min(self.w, int(math.floor(hi + 0.5)))
@@ -311,6 +331,7 @@ class Canvas:
         """Fill a convex polygon."""
         if len(pts) < 3:
             return
+        self.tick()
         ys = [p[1] for p in pts]
         j0, j1 = max(0, int(math.floor(min(ys)))), min(self.h - 1, int(math.ceil(max(ys))))
         n = len(pts)
@@ -330,6 +351,7 @@ class Canvas:
 
     def capsule(self, a: Pt, b: Pt, r: float, g: int):
         """Segment a-b with round caps, radius r (pixels). Row by row: the capsule is convex, so each row is one span."""
+        self.tick()
         (ax, ay), (bx, by) = a, b
         j0 = max(0, int(math.floor(min(ay, by) - r)))
         j1 = min(self.h - 1, int(math.ceil(max(ay, by) + r)))
@@ -404,13 +426,16 @@ def render(elements: Sequence[dict], max_edge: int = 1024, scale: Optional[float
     W, H = max(1, min(max_edge, int(round(bw * s)))), max(1, min(max_edge, int(round(bh * s))))
     if W * H > MAX_PIXELS:
         raise ValueError("image too large")
-    cv = Canvas(W, H)
+    def check():
+        if time.monotonic() > t_end or cancelled():
+            raise RasterTimeout("render took longer than %.1f s" % budget_s if not cancelled() else "cancelled")
+    cv = Canvas(W, H, tick=check)
     ordered = [e for e in els if e.get("type") in ("frame", "magicframe", "image")] + \
               [e for e in els if e.get("type") not in ("frame", "magicframe", "image")]
-    for k, e in enumerate(ordered):
-        if k % 16 == 0 and (time.monotonic() > t_end or cancelled()):
-            raise RasterTimeout("render took longer than %.1f s" % budget_s if not cancelled() else "cancelled")
+    for e in ordered:   # time-based: check() runs before every element, every op and (Canvas.tick) every filled shape
+        check()
         for op in shapes_of(e, mono):
+            check()
             pts = [((px - x0) * s, (py - y0) * s) for px, py in op[1]]
             if op[0] == "line":
                 pts = _thin(pts)
@@ -418,7 +443,10 @@ def render(elements: Sequence[dict], max_edge: int = 1024, scale: Optional[float
                 cv.poly(pts, op[2])
             else:
                 cv.polyline(pts, max(0.8, op[3] * s), op[2])
-    return {"png": png_bytes(W, H, cv.buf), "width": W, "height": H, "scale": s, "x0": x0, "y0": y0, "count": len(els)}
+    check()
+    png = png_bytes(W, H, cv.buf)
+    check()   # the encoding itself counts too: past the budget nothing is returned
+    return {"png": png, "width": W, "height": H, "scale": s, "x0": x0, "y0": y0, "count": len(els)}
 
 
 def char_height(elements: Iterable[dict]) -> Optional[float]:
