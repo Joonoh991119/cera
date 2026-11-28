@@ -124,6 +124,48 @@ JOB_KEEP_COUNT = 16      # ... but at most this many finished jobs per board
 JOB_KEEP_BYTES = 24 * 1024 * 1024   # ... and at most this many result bytes per board (oldest dropped first)
 JOB_ID = re.compile(r"^[a-f0-9]{12}$")
 SEL_KEEP = 60.0          # how long the last non-empty selection of each connection is remembered (board_selection)
+# 'Ask the AI' requests (WP-5, B1 · B8): board meta, not elements, so they never mix with export, undo, dragging or erasing
+REQ_KINDS = ("auto", "text", "math", "diagram", "graph", "tidy")
+REQ_HUMAN = {"cancelled": ("open", "working"), "done": ("proposed", "failed", "declined", "interrupted")}   # status a person may set -> from which
+REQ_AGENT = {"working": ("open", "working", "interrupted"), "proposed": ("open", "working", "interrupted"),
+             "failed": ("open", "working", "interrupted"), "declined": ("open", "working", "interrupted")}   # status an agent token may set -> from which
+REQ_LIVE = ("open", "working", "proposed", "failed", "declined", "interrupted")   # shown as a chip until a person closes it (done / cancelled)
+REQ_META = ("requests", "request_n")   # meta keys that never leave the server as meta (requests go out only through req_public)
+REQ_NOTE_MAX = 200       # characters of a request note / agent reply (longer -> 400)
+REQ_MAX_OPEN = 20        # open + working + proposed requests per board (21st -> 429)
+REQ_GAP = 3.0            # one new request per connection per this many seconds (429)
+REQ_TARGETS_MAX = 500
+REQ_KEEP = 86400.0       # requests are kept 24 h ...
+REQ_KEEP_COUNT = 50      # ... and at most this many per board (finished ones dropped first)
+REQ_GONE_S = 60.0        # working, but the agent that took it has had no presence for this long -> interrupted
+REQ_ID = re.compile(r"^[a-f0-9]{10}$")
+PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
+
+
+def clean_note(v):
+    """Request note / agent reply: a str of at most REQ_NOTE_MAX characters; control and bidi characters become spaces. -> str, or None if not acceptable."""
+    if v is None:
+        return ""
+    if not isinstance(v, str) or len(v) > REQ_NOTE_MAX:
+        return None
+    return re.sub(r" {2,}", " ", _CTRL.sub(" ", v)).strip()
+
+
+def element_box(e):
+    """Scene box (x1, y1, x2, y2) of one element, ignoring rotation. Lines and strokes use their points. None if it has no usable numbers."""
+    try:
+        x, y = float(e.get("x") or 0), float(e.get("y") or 0)
+        pts = e.get("points")
+        if isinstance(pts, list) and pts and all(isinstance(p, (list, tuple)) and len(p) >= 2 for p in pts):
+            xs, ys = [float(p[0]) for p in pts], [float(p[1]) for p in pts]
+            box = (x + min(xs), y + min(ys), x + max(xs), y + max(ys))
+        else:
+            w, h = float(e.get("width") or 0), float(e.get("height") or 0)
+            box = (min(x, x + w), min(y, y + h), max(x, x + w), max(y, y + h))
+    except (TypeError, ValueError):
+        return None
+    return box if all(math.isfinite(n) and abs(n) <= VIEW_LIMIT for n in box) else None
 VIEW_LIMIT = 1e7   # scene-coordinate limit; a view range larger than this is treated as a bad value
 
 
@@ -290,6 +332,10 @@ class Board:
         self._pdirty = set()    # connections that changed or left since the last broadcast; sent to clients that receive only changes (pd=1)
         self.jobs = {}          # jid -> job dict (tab render queue; memory only, never saved)
         self.last_sel = {}      # client -> {client, user, ids, at}: last non-empty selection of a person, for SEL_KEEP s
+        self.agent_seen = {}    # agent client -> last presence time (requests: a working request whose agent is gone becomes interrupted)
+        self.req_last = {}      # client -> time of its last new request (REQ_GAP)
+        self.loaded_at = time.time()   # after a restart, a working request gets REQ_GONE_S from now before it counts as interrupted
+        self.on_requests = None        # called (outside the lock) after requests change: the store rewrites pending.json
         self.meta, self.elements = {}, {}
         p = root / "board.json"
         if p.is_file():
@@ -474,6 +520,7 @@ class Board:
                 p["summon"], p["_s"] = summon, last
             if agent:
                 p["agent"] = True
+                self.agent_seen[client] = time.time()
             elif isinstance(data.get("selected"), dict):
                 ids = [k for k, v in data["selected"].items() if v and isinstance(k, str) and 0 < len(k) <= 64][:500]
                 if ids:
@@ -551,6 +598,182 @@ class Board:
     def _sweep_sel(self, t):
         for k in [k for k, v in self.last_sel.items() if t - v["at"] > SEL_KEEP]:
             self.last_sel.pop(k, None)
+
+    # ---------- 'Ask the AI' requests (WP-5) ----------
+    # Kept in meta["requests"] (saved with the board, survives a restart). The list and its dicts are never changed in place - each change
+    # stores a new list - because save() serializes a shallow copy of meta outside the lock.
+    def _reqs(self):
+        r = self.meta.get("requests")
+        return r if isinstance(r, list) else []
+
+    def meta_public(self):
+        """meta for answers and the meta event: without the requests (they carry private fields and can be large)."""
+        with self.lock:
+            return {k: v for k, v in self.meta.items() if k not in REQ_META}
+
+    @staticmethod
+    def req_public(r):
+        return {k: v for k, v in r.items() if not k.startswith("_")}
+
+    def requests(self, all_=False):
+        with self.lock:
+            changed = self._sweep_requests(time.time())
+            out = [self.req_public(r) for r in self._reqs() if all_ or r.get("status") in REQ_LIVE]
+        if changed:
+            self._requests_changed()
+        return out
+
+    def _requests_changed(self):
+        cb = self.on_requests
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:   # noqa: BLE001 — the hook file is best effort, never a reason to fail a request
+                print("pending.json:", type(e).__name__, e, file=sys.stderr)
+
+    def _page_of(self, box):
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        for e in self.elements.values():
+            cd = e.get("customData") if isinstance(e, dict) else None
+            if e.get("type") != "frame" or e.get("isDeleted") or not isinstance(cd, dict) or not isinstance(cd.get("tbPage"), (int, float)):
+                continue
+            fb = element_box(e)
+            if fb and fb[0] <= cx <= fb[2] and fb[1] <= cy <= fb[3]:
+                k = float(cd["tbPage"])
+                return int(k) if k.is_integer() else k
+        return None
+
+    def request_create(self, by, client, kind, note, ids):
+        """A person's new request on the elements `ids` (only live ones are kept, with their current version). -> (status, body)"""
+        t = time.time()
+        with self.lock:
+            changed = self._sweep_requests(t)
+            code, body = self._request_new(t, by, client, kind, note, ids)
+        if changed or code == 201:
+            self._requests_changed()
+        return code, body
+
+    def _request_new(self, t, by, client, kind, note, ids):
+        if t - self.req_last.get(client, 0.0) < REQ_GAP:
+            return 429, {"error": T("요청은 3초에 하나씩", "one request every 3 seconds"),
+                         "retry_ms": int((REQ_GAP - (t - self.req_last[client])) * 1000) + 20}
+        if sum(1 for r in self._reqs() if r.get("status") in ("open", "working", "proposed")) >= REQ_MAX_OPEN:
+            return 429, {"error": T(f"열린 요청이 많다(최대 {REQ_MAX_OPEN}) — 끝난 것을 닫아 주세요",
+                                    f"too many open requests (max {REQ_MAX_OPEN}) - close finished ones")}
+        targets, boxes, seen = [], [], set()
+        for i in ids:
+            e = self.elements.get(i)
+            if i in seen or not isinstance(e, dict) or e.get("isDeleted"):
+                continue
+            seen.add(i)
+            try:
+                v = int(e.get("version") or 0)
+            except (TypeError, ValueError):
+                v = 0
+            targets.append({"id": i, "v": v})
+            bx = element_box(e)
+            if bx:
+                boxes.append(bx)
+        if not targets or not boxes:
+            return 400, {"error": T("고른 것이 보드에 없다", "the selected elements are not on the board")}
+        box = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+        n = int(self.meta.get("request_n") or 0) + 1
+        ms = int(t * 1000)
+        r = {"rid": secrets.token_hex(5), "n": n, "by": by, "kind": kind, "note": note, "targets": targets,
+             "bbox": {"x": round(box[0], 1), "y": round(box[1], 1), "w": round(box[2] - box[0], 1), "h": round(box[3] - box[1], 1)},
+             "page": self._page_of(box), "status": "open", "agent": None, "reply": "", "pid": None, "created": ms, "updated": ms,
+             "_by_client": client}
+        self.meta["requests"] = self._reqs() + [r]
+        self.meta["request_n"] = n
+        self.dirty = True
+        self.req_last = {k: v for k, v in self.req_last.items() if t - v < REQ_GAP}
+        self.req_last[client] = t
+        self.publish("request", self.req_public(r))
+        return 201, self.req_public(r)
+
+    def request_update(self, rid, status, by, client, agent, reply=None, pid=None):
+        """Status change: a person (cancelled · done) or an agent token (working · proposed · failed · declined), each only from the states in
+        REQ_HUMAN / REQ_AGENT. A request another agent is still working on gets 409. -> (status, body)"""
+        t = time.time()
+        with self.lock:
+            swept = self._sweep_requests(t)
+            lst = self._reqs()
+            i = next((k for k, r in enumerate(lst) if r.get("rid") == rid), None)
+            if i is None:
+                code, body = 404, {"error": "no request"}
+            else:
+                r = lst[i]
+                rule = REQ_AGENT if agent else REQ_HUMAN
+                other = r.get("_agent_client")
+                if r.get("status") not in rule[status]:
+                    code, body = 409, {"error": T(f"지금 상태({r.get('status')})에서는 {status} 로 못 바꾼다", f"cannot go from {r.get('status')} to {status}"),
+                                       "status": r.get("status")}
+                elif agent and r.get("status") == "working" and other and other != client and \
+                        t - max(self.agent_seen.get(other, 0.0), self.loaded_at, (r.get("updated") or 0) / 1000) < REQ_GONE_S:   # same grace as _sweep_requests
+                    code, body = 409, {"error": T(f"{r.get('agent')} 가 작업 중", f"{r.get('agent')} is working on it"), "status": "working"}
+                else:
+                    new = dict(r, status=status, updated=int(t * 1000))
+                    if agent:
+                        new["agent"], new["_agent_client"] = by, client
+                        self.agent_seen[client] = t
+                    if reply is not None:
+                        new["reply"] = reply
+                    if pid is not None:
+                        new["pid"] = pid
+                    self.meta["requests"] = lst[:i] + [new] + lst[i + 1:]
+                    self.dirty = True
+                    self.publish("request", self.req_public(new))
+                    code, body, swept = 200, self.req_public(new), True
+        if swept:
+            self._requests_changed()
+        return code, body
+
+    def sweep_requests(self):
+        with self.lock:
+            changed = self._sweep_requests(time.time())
+        if changed:
+            self._requests_changed()
+
+    def _sweep_requests(self, t):
+        """Under the lock: working requests whose agent has been gone REQ_GONE_S become interrupted; requests older than REQ_KEEP are dropped and at
+        most REQ_KEEP_COUNT are kept (finished ones first). -> True if anything changed."""
+        lst, changed, out = self._reqs(), False, []
+        for r in lst:
+            if not isinstance(r, dict) or not isinstance(r.get("rid"), str):
+                changed = True
+                continue
+            if t * 1000 - (r.get("created") or 0) > REQ_KEEP * 1000:
+                changed = True
+                continue
+            if r.get("status") == "working":
+                last = max(self.agent_seen.get(r.get("_agent_client"), 0.0), self.loaded_at, (r.get("updated") or 0) / 1000)
+                if t - last > REQ_GONE_S:
+                    r = dict(r, status="interrupted", updated=int(t * 1000),
+                             reply=T("에이전트 연결이 끊겼다", "the agent disconnected"))
+                    self.publish("request", self.req_public(r))
+                    changed = True
+            out.append(r)
+        if len(out) > REQ_KEEP_COUNT:
+            done = sorted((r for r in out if r.get("status") not in REQ_LIVE), key=lambda r: r.get("updated") or 0)
+            drop = {id(r) for r in done[:len(out) - REQ_KEEP_COUNT]}
+            out = [r for r in out if id(r) not in drop]
+            if len(out) > REQ_KEEP_COUNT:
+                out = sorted(out, key=lambda r: r.get("created") or 0)[-REQ_KEEP_COUNT:]
+            changed = True
+        if changed:
+            self.meta["requests"] = out
+            self.dirty = True
+        for k in [k for k, v in self.agent_seen.items() if t - v > 2 * REQ_GONE_S]:
+            self.agent_seen.pop(k, None)
+        return changed
+
+    def pending_entries(self):
+        """Requests waiting for an agent (open · interrupted), for the UserPromptSubmit hook's pending.json."""
+        with self.lock:
+            title = self.meta.get("title") or ""
+            return [{"board": self.id, "title": title, "rid": r["rid"], "n": r.get("n"), "kind": r.get("kind"), "note": r.get("note") or "",
+                     "by": r.get("by"), "status": r.get("status"), "created": r.get("created")}
+                    for r in self._reqs() if r.get("status") in ("open", "interrupted")]
 
     # ---------- tab render queue ----------
     @staticmethod
@@ -831,6 +1054,10 @@ class Store:
         self.boards, self.lock = {}, threading.Lock()
         self.colors_path = data / "colors.json"
         self.colors = json.loads(self.colors_path.read_text(encoding="utf-8")) if self.colors_path.is_file() else {}
+        # $CERA_HOME/sites/<id>/pending.json (0600): requests waiting for an agent, read by `cera pending --hook` (WP-8) without the network.
+        # Only for the site layout (data dir named 'data'); a bare --data dir has no site.
+        self.pending_path = data.parent / "pending.json" if data.name == "data" else None
+        self.pending_lock = threading.Lock()
 
     def color_for(self, name):
         """A fixed color per person with no overlap: one palette color each, in order of first arrival. Two people never share a color."""
@@ -853,6 +1080,7 @@ class Store:
                 if not (root / "board.json").is_file():
                     return None
                 self.boards[bid] = Board(root, bid)
+                self.boards[bid].on_requests = self.write_pending
             return self.boards[bid]
 
     def create(self, title, user):
@@ -861,6 +1089,7 @@ class Store:
         b.meta = {"id": bid, "title": title[:80] or T("새 보드", "New board"), "created_by": user["name"], "created_at": now(), "updated_at": now()}
         b.dirty = True
         b.save()
+        b.on_requests = self.write_pending
         with self.lock:
             self.boards[bid] = b
         return b
@@ -880,7 +1109,7 @@ class Store:
             if b:
                 with b.lock:
                     n = sum(1 for e in b.elements.values() if not e.get("isDeleted"))
-                out.append({**b.meta, "elements": n, "online": len(b.presence_list())})
+                out.append({**b.meta_public(), "elements": n, "online": len(b.presence_list())})
         out.sort(key=lambda m: m.get("updated_at", ""), reverse=True)
         return out
 
@@ -891,6 +1120,30 @@ class Store:
             b.save()
             b.sweep_presence()
             b.sweep_jobs()
+            b.sweep_requests()
+
+    def write_pending(self):
+        """Rewrite pending.json from the loaded boards; entries of boards not loaded since a restart are kept from the old file."""
+        if self.pending_path is None:
+            return
+        with self.pending_lock:
+            with self.lock:
+                boards = dict(self.boards)
+            entries = []
+            for b in boards.values():
+                entries += b.pending_entries()
+            try:
+                old = json.loads(self.pending_path.read_text(encoding="utf-8")).get("requests") or []
+                entries += [r for r in old if isinstance(r, dict) and r.get("board") not in boards]
+            except (OSError, ValueError, AttributeError):
+                pass
+            body = json.dumps({"site": self.pending_path.parent.name, "updated": int(time.time() * 1000), "requests": entries}, ensure_ascii=False)
+            tmp = self.pending_path.with_name("pending.json.tmp")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)   # an older tmp file may have other bits
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.replace(str(tmp), str(self.pending_path))
 
     def close_streams(self, predicate=None):
         """Close open WebSocket / SSE streams. Without a predicate, close all of them (on an invite-key change; waiting long-polls are woken too),
@@ -1334,7 +1587,7 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 with b.lock:
                     els = list(b.elements.values())
                 files = sorted(p.name for p in (b.root / "files").glob("*")) if (b.root / "files").is_dir() else []
-                return self.send(200, {"meta": b.meta, "elements": els, "files": files, "seq": b.seq, "pver": b.pver, "epoch": EPOCH})
+                return self.send(200, {"meta": b.meta_public(), "elements": els, "files": files, "seq": b.seq, "pver": b.pver, "epoch": EPOCH})
             if sub == "/poll":
                 try:
                     since = int((q.get("since") or ["0"])[0])
@@ -1365,6 +1618,8 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.events(b, (q.get("client") or [""])[0][:40])
             if sub == "/selection":   # last selections of people (WP-3 board_selection); same data the presence list already shows everyone
                 return self.send(200, {"selections": b.selections()})
+            if sub == "/requests":   # 'Ask the AI' requests (WP-5): live ones, or every kept one with ?all=1. Everyone with the board may read them
+                return self.send(200, {"requests": b.requests(all_=(q.get("all") or [""])[0] == "1")})
             if sub == "/jobs":   # open tab-render jobs: for a person's edit tab that just opened the board
                 if role != "edit" or self.user().get("agent"):
                     return self.send(403, {"error": "edit tab only"})
@@ -1551,9 +1806,12 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.send(400, {"error": "bad json or too large"})
             if path == "/api/whiteboard/boards":
                 b = store.create(str(data.get("title", "")).strip(), usr)
-                return self.send(201, b.meta)
+                return self.send(201, b.meta_public())
             if path == "/api/whiteboard/boards/import":   # import into a new board
                 return self.do_import(None, data, "new", usr, client=str(data.get("client", ""))[:40])
+            rm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/requests(?:/([A-Za-z0-9]{1,40}))?$", path)
+            if rm:
+                return self.do_request(rm, data, usr)
             jm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/jobs(?:/([a-f0-9]{12})/(claim|result))?$", path)
             if jm:
                 return self.do_job(jm, data, usr)
@@ -1593,9 +1851,58 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 with b.lock:
                     b.meta["title"] = str(data.get("title", "")).strip()[:80] or b.meta.get("title")
                     b.dirty = True
-                b.publish("meta", b.meta)
-                return self.send(200, b.meta)
+                b.publish("meta", b.meta_public())
+                return self.send(200, b.meta_public())
             return self.send(404, {"error": "not found"})
+
+        def do_request(self, rm, data, usr):
+            """'Ask the AI' requests (view links were already refused). New: a person's edit connection only {client, kind, note, ids}.
+            Status: {status, reply?, pid?, client} - people may set cancelled · done, agent tokens working · proposed · failed · declined."""
+            b = store.get(rm.group(1))
+            if not b:
+                return self.send(404, {"error": "no board"})
+            if not isinstance(data, dict):
+                return self.send(400, {"error": "body must be an object"})
+            agent = bool(usr.get("agent"))
+            client = str(data.get("client", ""))[:40]
+            if not CLIENT_ID.match(client):
+                return self.send(400, {"error": "client"})
+            if rm.group(2) is None:
+                if agent:
+                    return self.send(403, {"error": "a person's edit connection only"})
+                kind = data.get("kind", "auto")
+                if not isinstance(kind, str) or kind not in REQ_KINDS:
+                    return self.send(400, {"error": "kind", "allowed": list(REQ_KINDS)})
+                note = clean_note(data.get("note"))
+                if note is None:
+                    return self.send(400, {"error": T(f"메모는 {REQ_NOTE_MAX}자까지", f"note: up to {REQ_NOTE_MAX} characters")})
+                ids = data.get("ids")
+                if not isinstance(ids, list) or not ids or len(ids) > REQ_TARGETS_MAX or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids):
+                    return self.send(400, {"error": T(f"ids 는 요소 id 목록(1–{REQ_TARGETS_MAX}개)", f"ids: a list of element ids (1-{REQ_TARGETS_MAX})")})
+                code, out = b.request_create(usr["name"], client, kind, note, ids)
+                return self.send(code, out)
+            rid, status = rm.group(2), data.get("status")
+            if not REQ_ID.match(rid):
+                return self.send(404, {"error": "no request"})
+            if not isinstance(status, str) or (status not in REQ_HUMAN and status not in REQ_AGENT):
+                return self.send(400, {"error": "status", "allowed": sorted(set(REQ_HUMAN) | set(REQ_AGENT))})
+            if (status in REQ_AGENT) != agent:
+                return self.send(403, {"error": T("에이전트 토큰만" if status in REQ_AGENT else "사람 편집 연결만",
+                                                  "agent token only" if status in REQ_AGENT else "a person's edit connection only")})
+            reply = pid = None
+            if "reply" in data:
+                if not agent:
+                    return self.send(400, {"error": "reply: agent only"})
+                reply = clean_note(data.get("reply"))
+                if reply is None:
+                    return self.send(400, {"error": T(f"reply 는 {REQ_NOTE_MAX}자까지", f"reply: up to {REQ_NOTE_MAX} characters")})
+            if data.get("pid") is not None:
+                if not agent or not isinstance(data["pid"], str) or not PID_RE.match(data["pid"]):
+                    return self.send(400, {"error": "pid"})
+                pid = data["pid"]
+            by = re.sub(r"\s*·\s*AI$", "", usr["name"]) if agent else usr["name"]
+            code, out = b.request_update(rid, status, by, client, agent, reply, pid)
+            return self.send(code, out)
 
         def do_job(self, jm, data, usr):
             """Tab render queue (edit permission is already checked). Agents create jobs; a person's edit tab claims one and posts the result."""
@@ -1664,7 +1971,7 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 print("import:", type(e).__name__, str(e)[:300], file=sys.stderr)
                 return self.send(400, {"error": T(f"가져오지 못했다({type(e).__name__})", f"Import failed ({type(e).__name__})")})
             if mode == "new":
-                res["meta"] = b.meta
+                res["meta"] = b.meta_public()
             return self.send(201 if mode == "new" else 200, res)
 
 

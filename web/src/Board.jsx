@@ -31,6 +31,10 @@ import useImportDrop from "./features/import/useImportDrop.js";
 import { ACCEPT as IMPORT_ACCEPT, takePendingToast } from "./features/import/importFile.js";
 import { tr, lang, setLang, excalidrawLang } from "./i18n.js";   // screen language (Korean / English)
 import useAgentJobs from "./features/jobs/useAgentJobs.js";   // tab render queue: agents borrow this tab for render / MathJax / mermaid (runners are lazy chunks)
+import useRequests from "./features/ask/useRequests.js";   // 'Ask the AI': selection -> request (server meta), chips over the board for everyone
+import AskButton from "./features/ask/AskButton.jsx";
+import AskSheet from "./features/ask/AskSheet.jsx";
+import RequestLayer from "./features/ask/RequestLayer.jsx";
 
 
 const PUSH_MS = 80;        // interval for batching and sending changed elements
@@ -180,6 +184,8 @@ export default function Board({ id, me }) {
   const drawing = useRef(false);
   const holdRef = useRef(null);          // holds a formula that someone else is editing (features/math/hold.js)
   const agentJobs = useAgentJobs({ excal, id, client, viewOnly: me.role === "view", coarse });
+  const ask = useRequests({ id, client, viewOnly: me.role === "view", toast: (message) => excal && excal.setToast({ message, duration: 3000 }) });
+  const [asking, setAsking] = useState(null);   // ask window {ids, over, at}
 
 
   // Initial load: if it fails, retry after a moment (never leave the screen blank)
@@ -251,9 +257,11 @@ export default function Board({ id, me }) {
       else if (event === "file") { uploaded.current.add(data.id); hold.onFile(data.id); fetchMissingFiles(excal, excal.getSceneElements()); }
       else if (event === "meta") setMeta(data);
       else if (event === "job") agentJobs.notify(data);
+      else if (event === "request") ask.notify(data);
     };
     const onReset = async (given) => {   // the server restarted or its log was trimmed: fetch the full state and merge, and resend my elements that the server lacks
       const d = given ? { elements: given } : await api.board(id);
+      ask.refresh();   // requests are not in the event replay after a reset
       onElements(d.elements);
       // Resend elements that the server lacks, or where mine wins (is newer) than the server's, both edits and deletions (the case where the server died before saving)
       const server = new Map(d.elements.map((e) => [e.id, e]));
@@ -580,7 +588,7 @@ export default function Board({ id, me }) {
   useEffect(() => {
     const onKey = (e) => {
       const tgt = e.target;
-      if (document.querySelector(".wb-export-back, .wb-import-back")) return;   // when the export or import dialog is open, the dialog receives the keys
+      if (document.querySelector(".wb-export-back, .wb-import-back, .wb-ask-back")) return;   // when the export, import or ask dialog is open, the dialog receives the keys
       if (tgt && (tgt.tagName === "TEXTAREA" || tgt.tagName === "INPUT" || tgt.isContentEditable)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       // with a Korean IME active, e.key comes as e.g. 'ㅅ', so use the physical key position (e.code)
@@ -812,7 +820,12 @@ export default function Board({ id, me }) {
       )}
       {excal && <PageBar pages={pages} viewOnly={viewOnly} mobile={mobile} />}
       {excal && <FollowLayer f={follow} me={me} others={others} />}
-      {!viewOnly && excal && <QuickConnect excal={excal} touch={coarse} blocked={!!sheet || !!math || saving || !!importing || menu || fontPop || moreInk || deskOpen || follow.menu} />}
+      {!viewOnly && excal && <QuickConnect excal={excal} touch={coarse} blocked={!!sheet || !!math || saving || !!importing || menu || fontPop || moreInk || deskOpen || follow.menu || !!asking} />}
+      {excal && <RequestLayer excal={excal} list={ask.list} touch={coarse} viewOnly={viewOnly} onAction={ask.act} />}
+      {!viewOnly && excal && <AskButton excal={excal} touch={coarse} onOpen={setAsking} blocked={!!sheet || !!math || saving || !!importing || menu || fontPop || moreInk || deskOpen || follow.menu || !!asking} />}
+      {asking && <AskSheet mobile={mobile} touch={coarse} at={asking.at} count={asking.ids.length} over={asking.over}
+        onClose={() => { setAsking(null); setTimeout(refocus, 0); }}
+        onSend={async ({ kind, note }) => { await ask.create({ kind, note, ids: asking.ids }); setAsking(null); setTimeout(refocus, 0); }} />}
       {saving && excal && <ExportSheet excal={excal} theme={theme} title={meta && meta.title} viewOnly={viewOnly} onClose={() => { setSaving(false); setTimeout(refocus, 0); }} />}
       {!viewOnly && <input ref={importInput} type="file" multiple hidden accept={coarse ? undefined : IMPORT_ACCEPT} aria-hidden="true" tabIndex={-1}
         onChange={(e) => { const fs = Array.from(e.target.files || []); if (fs.length) queueImport(fs); }} />}{/* phones (iOS) do not let you pick unfamiliar extensions in accept, so it is omitted; validate after picking */}

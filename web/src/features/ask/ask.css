@@ -1,0 +1,52 @@
+/* 'Ask the AI' (WP-5): the button by the selection, the ask window / phone sheet, and the request chips layer. Colors come from .wb-board (--dk-*) */
+.wb-ask-btn { position: fixed; z-index: 16; display: inline-flex; align-items: center; justify-content: center; padding: 0 10px; border-radius: 999px;
+  border: 2px solid var(--dk-onfg); background: var(--dk-bg); color: var(--dk-onfg); font: inherit; font-size: 13.5px; font-weight: 700; white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(20, 24, 40, .18); cursor: pointer; touch-action: manipulation; }
+.wb-ask-btn.wb-ask-touch { font-size: 15px; }
+@media (hover: hover) { .wb-ask-btn:hover { background: var(--dk-on); } }
+.wb-ask-btn:focus-visible, .wb-ask-kind:focus-visible, .wb-ask-act:focus-visible, .wb-ask-unfold:focus-visible { outline: 3px solid var(--dk-onfg); outline-offset: 1px; }
+
+.wb-ask-back { position: fixed; inset: 0; z-index: 50; }
+.wb-ask-sheet { position: fixed; width: 320px; box-sizing: border-box; display: grid; gap: 10px; padding: 12px; border-radius: 14px;
+  background: var(--dk-bg); color: var(--dk-fg); border: 1px solid var(--dk-line); box-shadow: 0 10px 30px rgba(0, 0, 0, .25); }
+.wb-ask-bottom { left: 0; right: 0; bottom: 0; top: auto; width: auto; border-radius: 18px 18px 0 0;
+  padding: 14px max(14px, env(safe-area-inset-left, 0px)) max(14px, env(safe-area-inset-bottom, 0px)); }
+.wb-ask-head { margin: 0; font-weight: 700; font-size: 14.5px; }
+.wb-ask-head small { font-weight: 500; color: var(--dk-mut); }
+.wb-ask-kinds { display: flex; flex-wrap: wrap; gap: 6px; }
+.wb-ask-kind { min-height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--dk-line); background: transparent; color: inherit;
+  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+.wb-ask-touch .wb-ask-kind, .wb-ask-touch .wb-ask-unfold { min-height: 44px; padding: 0 14px; }
+.wb-ask-kind.on { background: var(--dk-on); color: var(--dk-onfg); border-color: var(--dk-onfg); }
+.wb-ask-unfold { justify-self: start; min-height: 36px; padding: 0 12px; border: 0; border-radius: 10px; background: transparent; color: var(--dk-onfg); font: inherit; font-weight: 700; cursor: pointer; }
+.wb-ask-note { width: 100%; box-sizing: border-box; min-height: 40px; max-height: 20vh; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--dk-line);
+  background: var(--dk-bg); color: var(--dk-fg); font: inherit; font-size: 15px; resize: none; }
+.wb-ask-bottom .wb-ask-note { font-size: 16px; }   /* iOS zooms the page on inputs under 16px */
+/* folded (phone): still in the page so it can take focus inside the tap that unfolds it */
+.wb-ask-note.folded { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; min-height: 0; padding: 0; border: 0; opacity: 0; pointer-events: none; }
+.wb-ask-err { margin: 0; color: #c92a2a; font-size: 13.5px; }
+.wb-ask-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.wb-ask-actions button { min-width: 88px; }
+
+/* chips layer: lets presses through, only the chip buttons take them; below the tool bar and app windows */
+.wb-ask-layer { position: fixed; inset: 0; z-index: 14; pointer-events: none; overflow: hidden; }
+.wb-ask-area { position: absolute; box-sizing: border-box; border: 2px dashed var(--ask, #2b45c7); border-radius: 10px; }
+.wb-ask-chip { position: absolute; box-sizing: border-box; display: grid; align-content: center; gap: 2px; overflow: hidden; padding: 4px 6px 4px 10px; border-radius: 12px;
+  background: var(--dk-bg); color: var(--dk-fg); border: 2px solid var(--ask, #2b45c7); box-shadow: 0 2px 10px rgba(20, 24, 40, .16); pointer-events: auto; }
+.wb-ask-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wb-ask-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 700; }
+.wb-ask-sub { line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--dk-mut); }
+.wb-ask-order { flex: 0 0 auto; display: grid; place-items: center; min-width: 20px; height: 20px; border-radius: 10px; background: var(--ask, #2b45c7); color: #fff; font-size: 12px; }
+.wb-ask-act { flex: 0 0 auto; height: 26px; padding: 0 10px; border: 0; border-radius: 8px; background: var(--dk-on); color: var(--dk-onfg); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+.wb-ask-chip.wb-ask-touch { padding: 4px 4px 4px 12px; }
+.wb-ask-touch .wb-ask-text { font-size: 14.5px; }
+.wb-ask-touch .wb-ask-act { height: 44px; padding: 0 12px; font-size: 14px; }
+.wb-ask-open { --ask: #2b45c7; }
+.wb-ask-working { --ask: #7b61ff; }
+.wb-ask-proposed { --ask: #1d8a5b; }
+.wb-ask-failed, .wb-ask-declined { --ask: #c92a2a; }
+.wb-ask-interrupted { --ask: #a16207; }
+.wb-ask-area.wb-ask-working { animation: wb-ask-pulse 1.4s ease-in-out infinite; }
+@keyframes wb-ask-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .wb-ask-area.wb-ask-working { animation: none; } }
+.wb-sheeting .wb-ask-layer, .wb-sheeting .wb-ask-btn { display: none; }

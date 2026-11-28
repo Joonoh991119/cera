@@ -676,5 +676,212 @@ class Jobs(unittest.TestCase):
         st, d = self.call("GET", self.base + "/selection", self.agent())
         self.assertEqual((st, d["selections"][0]["ids"], d["selections"][0]["current"]), (200, ["a"], False))
 
+
+class Requests(unittest.TestCase):
+    """'Ask the AI' request queue (WP-5): permissions, limits, events, interruption, survival across a restart, pending.json for the hook."""
+    EK, VK, TOK = Jobs.EK, Jobs.VK, Jobs.TOK
+    person, agent, call, tearDown = Jobs.person, Jobs.agent, Jobs.call, Jobs.tearDown
+
+    def setUp(self):
+        Jobs.setUp(self)
+        self.els([{"id": f"s{i}", "type": "freedraw", "x": 10 * i, "y": 20, "width": 30, "height": 10, "points": [[0, 0], [30, 10]],
+                   "version": 3, "versionNonce": i} for i in range(3)] +
+                 [{"id": "t1", "type": "text", "x": 200, "y": 100, "width": 50, "height": 20, "text": "A", "version": 2, "versionNonce": 9}])
+
+    def els(self, elements):
+        st, _ = self.call("POST", self.base + "/elements", self.person(), {"client": "seed", "elements": elements})
+        self.assertEqual(st, 200)
+
+    def ask(self, client="c1", name="민수", **body):
+        return self.call("POST", self.base + "/requests", self.person(name), {"client": client, "kind": "diagram", "ids": ["s0", "s1", "t1"], **body})
+
+    def upd(self, rid, status, who="agent", client="ag-j1", **body):
+        h = self.agent() if who == "agent" else self.person()
+        return self.call("POST", f"{self.base}/requests/{rid}", h, {"client": client, "status": status, **body})
+
+    def test_create_gives_targets_bbox_and_an_event_for_everyone(self):
+        b = self.store.get(self.bid)
+        seq0 = b.seq
+        st, r = self.ask(note="흐름도로")
+        self.assertEqual(st, 201, r)
+        self.assertEqual((r["status"], r["by"], r["kind"], r["note"], r["n"]), ("open", "민수", "diagram", "흐름도로", 1))
+        self.assertEqual(r["targets"], [{"id": "s0", "v": 3}, {"id": "s1", "v": 3}, {"id": "t1", "v": 2}])
+        self.assertEqual(r["bbox"], {"x": 0.0, "y": 20.0, "w": 250.0, "h": 100.0})
+        self.assertFalse(any(k.startswith("_") for k in r))
+        evs = [(e, d["rid"], d["status"]) for (n, frm, e, d) in b.log if n > seq0 and e == "request"]
+        self.assertEqual(evs, [("request", r["rid"], "open")])
+        self.assertIsNone([frm for (n, frm, e, d) in b.log if n > seq0 and e == "request"][0], "만든 사람 탭도 받는다(skip 없음)")
+        st, d = self.call("GET", self.base + "/requests", self.person("보기", self.VK))
+        self.assertEqual((st, [x["rid"] for x in d["requests"]]), (200, [r["rid"]]), "보기 전용도 칩을 본다")
+        self.assertNotIn("requests", self.call("GET", "/api/whiteboard/boards", self.person())[1][0], "보드 목록에는 안 실린다")
+
+    def test_permissions_and_limits(self):
+        """Criterion 5: view key create -> 403, agent create -> 403, person -> working 403, note 201 -> 400, 21st open -> 429."""
+        self.assertEqual(self.call("POST", self.base + "/requests", self.person("보기", self.VK), {"client": "v1", "kind": "auto", "ids": ["s0"]})[0], 403)
+        self.assertEqual(self.call("POST", self.base + "/requests", self.agent(), {"client": "ag-j1", "kind": "auto", "ids": ["s0"]})[0], 403)
+        self.assertEqual(self.ask(note="가" * 201)[0], 400)
+        self.assertEqual(self.ask(client="c2", note="가" * 200)[0], 201)
+        self.assertEqual(self.ask(client="c3", kind="shell")[0], 400)
+        self.assertEqual(self.ask(client="c3", ids=["nope"])[0], 400)
+        self.assertEqual(self.ask(client="c3", ids=["s0"] * 501)[0], 400)
+        st, r = self.ask(client="c4")
+        self.assertEqual(st, 201)
+        self.assertEqual(self.upd(r["rid"], "working", who="person")[0], 403, "사람이 working")
+        self.assertEqual(self.upd(r["rid"], "cancelled")[0], 403, "에이전트가 취소")
+        self.assertEqual(self.upd(r["rid"], "done")[0], 403)
+        self.assertEqual(self.upd(r["rid"], "bogus")[0], 400)
+        self.assertEqual(self.upd(r["rid"], "working", reply="가" * 201)[0], 400)
+        self.assertEqual(self.upd(r["rid"], "working", who="person", client="c4", reply="x")[0], 403)
+        self.assertEqual(self.call("POST", f"{self.base}/requests/{r['rid']}", self.person("보기", self.VK), {"client": "v1", "status": "cancelled"})[0], 403)
+        self.assertEqual(self.ask(client="c4")[0], 429, "같은 연결 3초에 하나")
+        for i in range(srv.REQ_MAX_OPEN - 2):
+            self.assertEqual(self.ask(client=f"k{i}")[0], 201)
+        st, d = self.ask(client="last")
+        self.assertEqual(st, 429, d)
+
+    def test_note_is_cleaned(self):
+        st, r = self.ask(note="a\x00b\u202ec\n  d")
+        self.assertEqual((st, r["note"]), (201, "a b c d"))
+
+    def test_status_flow_and_conflicts(self):
+        _, r = self.ask()
+        rid = r["rid"]
+        st, w = self.upd(rid, "working")
+        self.assertEqual((st, w["status"], w["agent"]), (200, "working", "Claude"))
+        b = self.store.get(self.bid)
+        self.assertEqual(self.call("POST", f"{self.base}/requests/{rid}", self.agent(), {"client": "ag-other", "status": "proposed"})[0], 409,
+                         "다른 에이전트가 살아 있는 작업을 가로채지 못한다")
+        st, p = self.upd(rid, "proposed", reply="둘째 줄이 불확실", pid="p_1")
+        self.assertEqual((st, p["status"], p["reply"], p["pid"]), (200, "proposed", "둘째 줄이 불확실", "p_1"))
+        self.assertEqual(self.upd(rid, "working")[0], 409, "제안 뒤 다시 working 안 됨")
+        self.assertEqual(self.upd(rid, "cancelled", who="person", client="c1")[0], 409)
+        st, d = self.upd(rid, "done", who="person", client="c1")
+        self.assertEqual((st, d["status"]), (200, "done"))
+        self.assertEqual(self.call("GET", self.base + "/requests", self.agent())[1]["requests"], [], "끝난 것은 기본 목록에 없다")
+        self.assertEqual(len(self.call("GET", self.base + "/requests?all=1", self.agent())[1]["requests"]), 1)
+        _, f = self.ask(client="c9")
+        st, d = self.upd(f["rid"], "failed", reply="2번째 줄을 못 읽음")
+        self.assertEqual((st, d["status"], d["reply"]), (200, "failed", "2번째 줄을 못 읽음"))
+        with b.lock:
+            vers = {e["id"]: e["version"] for e in b.elements.values()}
+        self.assertEqual(vers, {"s0": 3, "s1": 3, "s2": 3, "t1": 2}, "요청은 요소를 건드리지 않는다")
+
+    def test_interrupted_when_the_agent_is_gone(self):
+        """Criterion 4 (server side): working + no agent presence for 60 s -> interrupted, announced; target versions unchanged."""
+        _, r = self.ask()
+        self.call("POST", self.base + "/presence", self.agent(), {"client": "ag-j1", "pointer": None})
+        self.upd(r["rid"], "working")
+        b = self.store.get(self.bid)
+        seq0 = b.seq
+        b.sweep_requests()
+        self.assertEqual(b.requests()[0]["status"], "working")
+        with b.lock:
+            b.agent_seen["ag-j1"] -= 61
+            b.loaded_at -= 61
+            b.meta["requests"] = [dict(x, updated=x["updated"] - 61000) for x in b.meta["requests"]]
+        b.sweep_requests()   # the 0.5 s flusher calls this
+        got = b.requests()[0]
+        self.assertEqual((got["status"], bool(got["reply"])), ("interrupted", True))
+        self.assertEqual([(e, d["status"]) for (n, _, e, d) in b.log if n > seq0 and e == "request"], [("request", "interrupted")])
+        st, d = self.upd(r["rid"], "working", client="ag-new")
+        self.assertEqual((st, d["status"]), (200, "working"), "나중에 켠 세션이 이어받는다")
+
+    def test_heartbeat_keeps_it_working(self):
+        _, r = self.ask()
+        self.upd(r["rid"], "working")
+        b = self.store.get(self.bid)
+        with b.lock:
+            b.loaded_at -= 61
+            b.meta["requests"] = [dict(x, updated=x["updated"] - 61000) for x in b.meta["requests"]]
+        self.call("POST", self.base + "/presence", self.agent(), {"client": "ag-j1"})   # MCP heartbeat (every 10 s)
+        b.sweep_requests()
+        self.assertEqual(b.requests()[0]["status"], "working")
+
+    def test_kept_24h_and_50(self):
+        b = self.store.get(self.bid)
+        with b.lock:
+            now = int(__import__("time").time() * 1000)
+            b.meta["requests"] = [{"rid": f"{i:010x}", "status": "done", "created": now - i, "updated": now - i} for i in range(60)] + \
+                [{"rid": "aaaaaaaaaa", "status": "open", "created": now - 86_401_000, "updated": now}]
+        b.sweep_requests()
+        rs = b.requests(all_=True)
+        self.assertEqual(len(rs), 50)
+        self.assertNotIn("aaaaaaaaaa", [x["rid"] for x in rs], "24시간 지난 것은 버린다")
+        self.assertIn("0000000000", [x["rid"] for x in rs], "새것이 남는다")
+
+    def test_survives_restart_and_writes_pending_json(self):
+        """Criterion 6: open requests survive a server restart. pending.json (0600) lists open ones for the hook."""
+        import stat
+        _, r = self.ask(note='"; rm -rf ~')
+        _, r2 = self.ask(client="c2")
+        self.upd(r2["rid"], "working")
+        pend = Path(self.tmp.name) / "s1" / "pending.json"
+        d = json.loads(pend.read_text())
+        self.assertEqual(stat.S_IMODE(pend.stat().st_mode), 0o600)
+        self.assertEqual((d["site"], [(x["rid"], x["note"], x["board"]) for x in d["requests"]]), ("s1", [(r["rid"], '"; rm -rf ~', self.bid)]))
+        b = self.store.get(self.bid)
+        b.save()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd, self.store = srv.build(Path(self.tmp.name) / "s1" / "data", DIST, access=srv.Access(self.EK, self.VK, site="s1"), save_interval=0.2, revalidate_interval=0)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        st, d = self.call("GET", self.base + "/requests", self.person())
+        self.assertEqual((st, sorted((x["rid"], x["status"]) for x in d["requests"])), (200, sorted([(r["rid"], "open"), (r2["rid"], "working")])))
+        self.assertEqual(self.ask(client="c3")[0], 201, "번호는 이어진다")
+        self.assertEqual(self.call("GET", self.base + "/requests", self.person())[1]["requests"][-1]["n"], 3)
+
+    # ---- review r1 (04_review_WP-5_neon_r1 · opus_r1): each finding reproduced here first
+    def test_r1_failed_and_declined_stay_listed(self):
+        """A reloaded tab or a phone joining later must still see 'failed: reason [retry][close]'."""
+        _, a = self.ask()
+        _, b = self.ask(client="c2")
+        self.upd(a["rid"], "failed", reply="못 읽음")
+        self.upd(b["rid"], "declined", reply="터미널에서")
+        st, d = self.call("GET", self.base + "/requests", self.person())
+        self.assertEqual(sorted(x["status"] for x in d["requests"]), ["declined", "failed"])
+        self.upd(a["rid"], "done", who="person", client="c1")
+        self.assertEqual([x["status"] for x in self.call("GET", self.base + "/requests", self.person())[1]["requests"]], ["declined"])
+
+    def test_r1_bad_json_is_a_400(self):
+        _, r = self.ask()
+        self.assertEqual(self.call("POST", f"{self.base}/requests/{r['rid']}", self.agent(), {"client": "ag-1", "status": ["working"]})[0], 400)
+        self.assertEqual(self.call("POST", f"{self.base}/requests/{r['rid']}", self.agent(), {"client": "ag-1", "status": {"a": 1}})[0], 400)
+        self.assertEqual(self.call("POST", self.base + "/requests", self.person(), [])[0], 400)
+        self.assertEqual(self.call("POST", self.base + "/requests", self.person(), "x")[0], 400)
+        self.assertEqual(self.call("POST", self.base + "/requests", self.person(), {"client": "c5", "kind": ["auto"], "ids": ["s0"]})[0], 400)
+
+    def test_r1_meta_never_carries_requests(self):
+        """GET /boards/<id> (view key too), the title answer and the meta event carry no requests (and so no _by_client / _agent_client)."""
+        _, r = self.ask()
+        self.upd(r["rid"], "working")
+        b = self.store.get(self.bid)
+        seq0 = b.seq
+        st, d = self.call("GET", self.base, self.person("보기", self.VK))
+        self.assertEqual(st, 200)
+        self.assertNotIn("requests", d["meta"])
+        st, t = self.call("POST", self.base + "/title", self.person(), {"title": "새 이름"})
+        self.assertEqual((st, t["title"]), (200, "새 이름"))
+        self.assertNotIn("requests", t)
+        ev = [d for (n, _, e, d) in b.log if n > seq0 and e == "meta"]
+        self.assertEqual(len(ev), 1)
+        self.assertNotIn("requests", ev[0])
+        self.assertNotIn("_by_client", json.dumps(d) + json.dumps(t) + json.dumps(ev))
+        with b.lock:
+            self.assertEqual(len(b.meta["requests"]), 1, "저장되는 meta 에는 그대로 남는다")
+
+    def test_r1_working_not_taken_right_after_a_restart(self):
+        _, r = self.ask()
+        self.upd(r["rid"], "working", client="ag-owner")
+        self.store.get(self.bid).save()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd, self.store = srv.build(Path(self.tmp.name) / "s1" / "data", DIST, access=srv.Access(self.EK, self.VK, site="s1"), save_interval=0.2, revalidate_interval=0)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.assertEqual(self.upd(r["rid"], "working", client="ag-intruder")[0], 409)
+        self.assertEqual(self.upd(r["rid"], "proposed", client="ag-owner")[0], 200)
+
+
 if __name__ == "__main__":
     unittest.main()
