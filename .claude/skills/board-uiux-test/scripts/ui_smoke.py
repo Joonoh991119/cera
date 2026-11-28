@@ -22,7 +22,7 @@ with sync_playwright() as p:
         try: b = getattr(p, eng).launch()
         except Exception as e: report.append({"case": tag, "skip": str(e)[:80]}); continue
         opt = p.devices[dev] if dev else {"viewport": {"width": 1280, "height": 800}}
-        errs = []; A = join(b.new_context(**opt), "A", errs); B = join(b.new_context(**opt), "B", errs)
+        errs = []; A = join(b.new_context(locale="ko-KR", **opt), "A", errs); B = join(b.new_context(locale="ko-KR", **opt), "B", errs)
         mobile = bool(dev)
         A.evaluate("window.__wbapi.setActiveTool({type:'freedraw'})")
         if mobile:

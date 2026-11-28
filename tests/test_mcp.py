@@ -2223,7 +2223,9 @@ class Wp5Heartbeat(unittest.TestCase):
         s.lock, s.hb, s.hb_thread, s.hb_stop, s.closed = threading.Lock(), {}, None, threading.Event(), False
         c = C()
         s.heartbeat(c, "b1", "r1", True)
-        time.sleep(0.3)
+        t0 = time.time()   # wait for three beats rather than a fixed 0.3 s: a loaded CI runner (macOS) got only two in that time
+        while len(posts) < 3 and time.time() - t0 < 10:
+            time.sleep(0.02)
         n = len(posts)
         self.assertGreaterEqual(n, 3)
         self.assertEqual(posts[0], ("POST", "/api/whiteboard/boards/b1/presence", {"client": "ag-1"}))
