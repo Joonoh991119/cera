@@ -19,7 +19,8 @@ Work toward "rough sketch → concrete with your agent". Branch `feat/rough-to-c
 
 1. **Smoke and measurement** — four-device smoke, end-to-end measurement on the fixed sketch set (round trip, tool calls, recognition), first-time-user review.
 2. **Human UX check** before merging and releasing (real MathJax and mermaid rendering, phone layout at 360–375 px, real iOS keyboard, WebKit and Firefox, exports without proposal cards).
-3. **Recognition loop** (proposal, not scoped yet) — one-shot read with kind + text/LaTeX + uncertain spots and alternatives, fix-before-replace on the card, opt-in local correction log, a scoring CLI.
+3. **Snapshots of thick strokes** — a tab draws strokes at their real width, so thick-pen formulas blob (stroke ≈ 0.7 × letter height) and `max_edge` cannot enlarge them; the server's thin centre-line render reads fine. Pick the thin render automatically when strokes are thick relative to the letters, or say so in the result text. Measured: thick-pen formulas 2/4 with the default snapshot, 4/4 with `render:"server"`.
+4. **Recognition loop** (proposal, not scoped yet) — one-shot read with kind + text/LaTeX + uncertain spots and alternatives, fix-before-replace on the card, opt-in local correction log, a scoring CLI.
 
 ## Known limits
 

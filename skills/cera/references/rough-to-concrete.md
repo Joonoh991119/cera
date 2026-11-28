@@ -25,7 +25,8 @@ board_snapshot {"request": "3fa9c01b7e"}
 ```
 - Returns an image plus text: which renderer drew it (a person's tab = exactly what people see; otherwise the server raster, where text is a grey bar and its words are in the text), the **pixel → board coordinate formula**, every text element with its position, and the PNG path.
 - No image in the result → open the PNG path with your image tool (Claude Code: Read; Codex: view_image). Still nothing → `board_read` gives shapes, text and positions; say "could not see the picture" in the proposal note.
-- One snapshot is usually enough (≈ 0.1–1.4k tokens; letters are scaled to about 56 px). `max_edge` up to 1568 for small writing; `selection:true`, `ids`, `region` or `page` for other targets.
+- One snapshot is usually enough (≈ 0.1–1.4k tokens; letters are scaled to about 56 px). `max_edge` only caps the size, it does not enlarge; `selection:true`, `ids`, `region` or `page` for other targets.
+- Strokes run together (a thick pen)? Take it once more with `"render": "server"`: the server draws thin centre lines, which reads better than a larger picture.
 - Frames (pages) among the targets are left out of the originals: the proposal never replaces a page.
 
 ## 4. Read
@@ -82,6 +83,7 @@ A ToolError means nothing was added — fix the field it names and call again.
 
 ## 6. Check
 - `math` with a person's tab open: the tab typesets it within about 5 s. A LaTeX error there makes `board_add` fail ("the proposal was taken back — nothing was left" + the error) and the request stays `working` — fix the LaTeX and call `board_add {"items": [{"kind": "math", "latex": "…"}], "proposal": {"request": "<rid>"}}` again, or end with `board_request_update {"rid": "<rid>", "status": "failed", "reply": "<why>"}`.
+- Do not take a proposal back only to tidy it (for example to drop an `uncertain` mark after a second look): the person can fix one character faster than you can propose twice. Take it back for an error.
 - An error you notice later (no tab was open; `board_read` reports a LaTeX error on the formula): `board_request_update {"rid": "<rid>", "status": "working", "withdraw": "<pid>"}` takes that card and its result back; then place a fixed one as above. Or take it back and end at once: `{"rid": "<rid>", "status": "failed", "reply": "<why>", "withdraw": "<pid>"}`. Without `withdraw`, for another request's card, or once a person has chosen or edited the result, you get 409 and nothing is taken back — leave it and tell the user.
 - A proposal placed from chat with `proposal:{sources}` (no request): a later error → `board_delete {"ids": [{"id": "prop-<pid>"}]}` (no version needed) takes the card and result back together; then fix it and call `board_add {"items": […], "proposal": {"sources": […]}}` again.
 - The reply lists what was added with positions, the proposal `pid`, and how many changes people made on the originals since the request, if any (the card shows "changed after reading N" too).
