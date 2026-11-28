@@ -57,7 +57,16 @@ export function elementBox(e) {
   if (Array.isArray(e.points) && e.points.length) {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const [px, py] of e.points) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
-    const pad = (e.strokeWidth || 1) * 2;
+    const pad = Math.min(64, e.strokeWidth || 1) * 2;   // same cap as server/raster.py element_box (MAX_STROKE)
+    if (e.angle) {   // rotated line / stroke: the box of the drawn (rotated) points, as raster.py
+      const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, c = Math.cos(e.angle), s = Math.sin(e.angle);
+      let a0 = Infinity, b0 = Infinity, a1 = -Infinity, b1 = -Infinity;
+      for (const [px, py] of e.points) {
+        const rx = cx + (px - cx) * c - (py - cy) * s, ry = cy + (px - cx) * s + (py - cy) * c;
+        a0 = Math.min(a0, rx); b0 = Math.min(b0, ry); a1 = Math.max(a1, rx); b1 = Math.max(b1, ry);
+      }
+      x0 = a0; y0 = b0; x1 = a1; y1 = b1;
+    }
     return { x: e.x + x0 - pad, y: e.y + y0 - pad, w: x1 - x0 + 2 * pad, h: y1 - y0 + 2 * pad };
   }
   const w = e.width || 0, h = e.height || 0;

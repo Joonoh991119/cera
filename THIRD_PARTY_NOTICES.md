@@ -105,8 +105,8 @@ Gaegu, Noto Sans KR, Nanum Pen Script, Black Han Sans, Nanum Gothic Coding, Jua,
 | chokidar | 3.6.0 | MIT |
 | clsx | 1.1.1 | MIT |
 | commander | 13.1.0 | MIT |
+| commander | 15.1.0 | MIT |
 | commander | 7.2.0 | MIT |
-| commander | 8.3.0 | MIT |
 | cose-base | 1.0.3 | MIT |
 | cose-base | 2.2.0 | MIT |
 | crc-32 | 0.3.0 | Apache-2.0 |
@@ -180,12 +180,12 @@ Gaegu, Noto Sans KR, Nanum Pen Script, Black Han Sans, Nanum Gothic Coding, Jua,
 | isexe | 2.0.0 | ISC |
 | jotai | 2.11.0 | MIT |
 | jotai-scope | 0.7.2 | MIT |
-| katex | 0.16.47 | MIT |
+| katex | 0.19.1 | MIT |
 | khroma | 2.1.0 | MIT (from the license file) |
 | langium | 3.3.1 | MIT |
 | layout-base | 1.0.2 | MIT |
 | layout-base | 2.0.1 | MIT |
-| lodash-es | 4.17.21 | MIT |
+| lodash-es | 4.18.1 | MIT |
 | lodash.debounce | 4.0.8 | MIT |
 | lodash.throttle | 4.1.1 | MIT |
 | marked | 16.4.2 | MIT |
@@ -194,8 +194,8 @@ Gaegu, Noto Sans KR, Nanum Pen Script, Black Han Sans, Nanum Gothic Coding, Jua,
 | mhchemparser | 4.2.1 | Apache-2.0 |
 | mj-context-menu | 0.6.1 | Apache-2.0 |
 | multimath | 2.0.0 | MIT |
-| nanoid | 3.3.3 | MIT |
-| nanoid | 4.0.2 | MIT |
+| nanoid | 3.3.20 | MIT |
+| nanoid | 5.1.16 | MIT |
 | normalize-path | 3.0.0 | MIT |
 | object-assign | 4.1.1 | MIT |
 | open-color | 1.9.1 | MIT |
@@ -941,7 +941,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### commander@13.1.0, commander@7.2.0, commander@8.3.0
+### commander@13.1.0, commander@15.1.0, commander@7.2.0
 
 ```text
 (The MIT License)
@@ -2903,7 +2903,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### katex@0.16.47
+### katex@0.19.1
 
 ```text
 The MIT License (MIT)
@@ -3002,7 +3002,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### lodash-es@4.17.21
+### lodash-es@4.18.1
 
 ```text
 Copyright OpenJS Foundation and other contributors <https://openjsf.org/>
@@ -3419,12 +3419,37 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### nanoid@3.3.3, nanoid@4.0.2
+### nanoid@3.3.20
 
 ```text
 The MIT License (MIT)
 
 Copyright 2017 Andrey Sitnik <andrey@sitnik.ru>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### nanoid@5.1.16
+
+```text
+The MIT License (MIT)
+
+Copyright 2017 Andrey Sitnik <andrey@sitnik.es>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in

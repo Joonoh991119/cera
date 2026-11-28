@@ -25,6 +25,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import signal
@@ -43,13 +44,57 @@ from typing import Dict, List, Optional, Tuple
 HERE = Path(__file__).resolve().parent
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26")
 LATEST = PROTOCOLS[0]
-WAIT_MAX = 60
+WAIT_DEFAULT = 60             # board_wait timeout_s when omitted (still capped per client below)
+WAIT_SCHEMA_MAX = 600
+WAIT_CAPS = {"claude-code": 600, "codex-mcp-client": 50}   # exact clientInfo.name → most seconds one board_wait may block (Codex tool_timeout_sec default 60)
+WAIT_CAP_OTHER = 55          # anything else (Antigravity etc., names unconfirmed) — under a 60 s tool timeout
+WAIT_PROGRESS_S = 20         # notifications/progress interval while waiting, when the request carried a progressToken
+ECHO_S = 2.0                 # a stroke re-written by the same person this soon after it was reported is the smoothing echo, not news
+ITEM_FIELDS = {              # board_add: fields each kind accepts — anything else is refused (nothing is added)
+    "text": ("kind", "ref", "text", "x", "y", "size", "color", "width"),
+    "box": ("kind", "ref", "shape", "label", "text", "x", "y", "w", "h", "fill", "color"),
+    "arrow": ("kind", "ref", "from", "to", "label", "dashed", "color", "head"),
+    "line": ("kind", "ref", "points", "dashed", "color"),
+    "frame_page": ("kind", "title", "x", "y"),
+    "image": ("kind", "ref", "path", "w", "x", "y"),
+    "math": ("kind", "ref", "latex", "size", "color", "x", "y"),
+    "flow": ("kind", "dir", "layout", "nodes", "edges"),
+    "mermaid": ("kind", "source"),
+}
+FLOW_NODE_FIELDS = ("id", "label", "shape", "at")
+FLOW_EDGE_FIELDS = ("from", "to", "label", "head")
+FLOW_HEADS = {"end": (None, "arrow"), "none": (None, None), "both": ("arrow", "arrow")}
+FLOW_SHAPE = {"box": "rectangle", "round": "rectangle", "ellipse": "ellipse", "diamond": "diamond"}
+FLOW_EDGES_MAX = 200
+MATH_WAIT = 5.0               # board_add math: with a person's tab open, wait this long for it to typeset (B5)
+MERMAID_WAIT = 18.0           # board_add mermaid: wait this long for a tab to convert (the job itself expires after 20 s)
+MERMAID_MAX = 20_000          # mermaid source bytes
+HEX = re.compile(r"^#[0-9a-fA-F]{3,8}$")
 IMAGE_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
              ".svg": "image/svg+xml"}
 MAX_FILE = 10 * 1024 * 1024   # server /files cap (data URL length)
 ELEMENTS_BYTES = 45_000        # cap on element JSON per board_read(elements) call — beyond it, continue reading with offset
 READ_LIMIT = 120              # board_read default line / element count — so summary text + structured fit within MAX_RESPONSE
 MAX_RESPONSE = 60_000          # cap in bytes on a tool response (text + structured) — stays within the Claude Code default MCP output cap (25k tokens) even when filled with Korean (3 bytes · about 1 token per character)
+SNAP_EDGE = 1024               # board_snapshot default longest side (256-1568)
+SNAP_LETTER_PX = 56           # scale so a typical letter is about this tall (B4), within max_edge
+SNAP_TAB_WAIT = 6.0           # render:"auto" waits this long for a person's tab before the server raster
+SNAP_TAB_WAIT_FORCED = 15.0   # render:"tab" (the job itself expires after 20 s)
+SNAP_KEEP = 50                # snapshots kept per site in $CERA_HOME/snapshots
+SNAP_LINES = 80               # summary lines in a snapshot / selection result
+SNAP_RASTER_S = 4.0           # time budget of one server raster (pure Python holds the GIL)
+JOB_ARGS_MAX = 64 * 1024      # server.py: job args over this are refused (413)
+IMAGE_MAX_BYTES = 2_600_000   # PNG bytes in one image block (base64 ≈ 3.5 MB, under Claude's 5 MB per-image limit)
+_SNAP_LOCK = threading.Lock()
+
+
+class ImageResult:
+    """A tool's second return value when the result carries a PNG: content = [text, image], **no structuredContent** (Codex drops
+    content[] when structuredContent is present — openai/codex#10334) and the 60 KB text cap is not applied to the image block."""
+
+    def __init__(self, png: bytes):
+        self.png = png
+
 _INSTRUCTIONS_KO = (
     "Cera 는 여러 사람이 같이 보는 화이트보드다. 보드는 지금 다른 사람이 보고 있을 수 있다.\n"
     "- 지우기(board_delete) · 공개 터널 열기(site_open tunnel:\"cloudflared\") 전에는 사용자에게 먼저 묻는다.\n"
@@ -100,6 +145,9 @@ def T(ko, en):
 ak = _sibling("agentkit")
 agents = _sibling("agents")
 importers = _sibling("importers")   # board_import
+rs = _sibling("raster")   # board_snapshot (server raster)
+lay = _sibling("layout")   # board_add kind:"flow"
+gio = _sibling("graphio")   # board_read format:"mermaid", board_export format:"drawio"
 
 
 def log(*a):
@@ -108,6 +156,17 @@ def log(*a):
 
 class ToolError(Exception):
     """Tool execution error — returned as an isError:true result (so the model can fix it and call again)."""
+
+
+def wait_cap(client_name: Optional[str]) -> int:
+    """Most seconds one board_wait may block for this client (B7). CERA_WAIT_MAX overrides (1-3600)."""
+    env = _sibling("i18n").env("WAIT_MAX")
+    if env and env.strip():
+        try:
+            return int(min(3600, max(1, float(env))))
+        except ValueError:
+            log("CERA_WAIT_MAX is not a number:", env[:20])
+    return WAIT_CAPS.get((client_name or "").strip().lower(), WAIT_CAP_OTHER)   # exact names only: an unknown 'claude-code-x' gets 55
 
 
 def agent_name_for(client_name: Optional[str]) -> str:
@@ -122,6 +181,34 @@ def agent_name_for(client_name: Optional[str]) -> str:
     if n.startswith("antigravity") or n in ("agy",) or n.startswith("agy-") or n.startswith("agy "):
         return "Antigravity"
     return agents.clean_name(client_name) if client_name else "Agent"
+
+
+# Hides the agent cursor if this process dies without cleaning up (SIGKILL, crash): a tiny separate process reads one line per
+# board the cursor was shown on; when the pipe hits EOF without a "done" line, it posts pointer:null for each. Standard library only.
+_WATCHDOG = r"""
+import json, sys, urllib.parse, urllib.request
+boards = {}
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("done"):
+        sys.exit(0)
+    boards[(d["base"], d["bid"])] = d
+for d in boards.values():
+    h = {"X-Whiteboard": "1", "Content-Type": "application/json"}
+    h.update(d.get("extra") or {})
+    if d.get("token"):
+        h["Authorization"] = "Bearer " + d["token"]
+    local = (urllib.parse.urlsplit(d["base"]).hostname or "") in ("127.0.0.1", "localhost", "::1")
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({})) if local else urllib.request.build_opener()
+    body = json.dumps({"client": d["client"], "pointer": None, "button": "up"}).encode()
+    try:
+        op.open(urllib.request.Request(d["base"] + "/api/whiteboard/boards/" + d["bid"] + "/presence", data=body, headers=h, method="POST"), timeout=2).read()
+    except Exception:
+        pass
+"""
 
 
 # ------------------------------------------------------------------ HTTP
@@ -187,6 +274,11 @@ class Session:
         self.tokens: Dict[str, dict] = {}         # sid → the token entry I created (id, expires_at)
         self.remote = None
         self.remote_error = None
+        self.pointed: Dict[Tuple[str, str], "Conn"] = {}   # (server, board) → Conn where this agent's cursor is shown
+        self.recent_ink: Dict[str, tuple] = {}   # stroke id → (connection id, element as reported added, when)
+        self.seen: Dict[Tuple[str, str], List[tuple]] = {}   # (server, board) → [(epoch, seq, {id: element})] — the board as last seen at a seq
+        self.closed = False
+        self.watchdog = None
         env = _sibling("i18n").env   # CERA_* first, then the old TEMPBOARD_* names
         url, tok = env("URL"), env("TOKEN") or None
         cid = os.environ.get("CF_ACCESS_CLIENT_ID") or env("CF_CLIENT_ID")
@@ -265,7 +357,77 @@ class Session:
             except Exception as e:   # noqa: BLE001
                 log("revoke failed", sid, e)
 
+    def remember(self, base_url: str, bid: str, epoch: str, seq, els):
+        """Keep the board as seen at seq (board_read / board_wait results) so a later board_wait since_seq=seq compares correctly."""
+        if not isinstance(seq, int):
+            return
+        snap = dict(els) if isinstance(els, dict) else {e["id"]: e for e in els or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        with self.lock:
+            lst = [x for x in self.seen.get((base_url, bid), []) if x[1] != seq][-3:]
+            lst.append((epoch, seq, snap))
+            self.seen[(base_url, bid)] = lst
+
+    def note_own(self, base_url: str, bid: str, els):
+        """This agent's own writes never come back from /poll — put them into every remembered snapshot of the board,
+        so a later board_wait(since_seq) sees a person moving / deleting them as a move / delete, not as 'added' / nothing."""
+        with self.lock:
+            for _, _, snap in self.seen.get((base_url, bid), []):
+                for e in els:
+                    if isinstance(e, dict) and isinstance(e.get("id"), str):
+                        snap[e["id"]] = copy.deepcopy(e)
+
+    def forget(self, base_url: str, bid: str):
+        with self.lock:
+            self.seen.pop((base_url, bid), None)
+
+    def seen_at(self, base_url: str, bid: str, epoch: str, seq: int) -> Optional[dict]:
+        with self.lock:
+            for ep, sq, snap in self.seen.get((base_url, bid), []):
+                if sq == seq and ep == epoch:
+                    return dict(snap)
+        return None
+
+    def pointed_at(self, c: "Conn", bid: str):
+        """Record a board where this agent's cursor is shown, and tell the watchdog (started on first use)."""
+        with self.lock:
+            first = (c.base, bid) not in self.pointed
+            self.pointed[(c.base, bid)] = c
+            if not first or self.closed:
+                return
+            try:
+                if self.watchdog is None:
+                    self.watchdog = subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG], stdin=subprocess.PIPE,
+                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                line = json.dumps({"base": c.base, "bid": bid, "client": c.client, "token": c.token, "extra": c.extra})
+                self.watchdog.stdin.write((line + "\n").encode())
+                self.watchdog.stdin.flush()
+            except (OSError, ValueError) as e:
+                log("cursor watchdog unavailable:", e)
+
+    def clear_pointers(self):
+        """Hide this agent's cursor on every board it pointed at (before the token is revoked) — so it does not cover the drawing."""
+        with self.lock:
+            items = list(self.pointed.items())
+            self.pointed.clear()
+        for (_, bid), c in items:
+            try:
+                c.req("POST", f"/api/whiteboard/boards/{bid}/presence", {"client": c.client, "pointer": None, "button": "up"}, timeout=1.5)
+            except Exception as e:   # noqa: BLE001 — leaving anyway
+                log("pointer clear failed", bid, e)
+
     def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        self.clear_pointers()
+        wd, self.watchdog = self.watchdog, None
+        if wd is not None:   # cleaned up normally — the watchdog leaves without doing anything
+            try:
+                wd.stdin.write(b'{"done": true}\n')
+                wd.stdin.close()
+            except (OSError, ValueError):
+                pass
         for sid in list(self.tokens):
             self.drop(sid)
 
@@ -295,8 +457,8 @@ def _copy(e):
     return copy.deepcopy(e)
 
 
-def _fetch(c: Conn, bid: str) -> dict:
-    d = c.ok("GET", f"/api/whiteboard/boards/{bid}")
+def _fetch(c: Conn, bid: str, timeout: float = 30) -> dict:
+    d = c.ok("GET", f"/api/whiteboard/boards/{bid}", timeout=timeout)
     if not isinstance(d, dict):
         raise ToolError(T("보드를 읽지 못했다", "Could not read the board"))
     return d
@@ -306,6 +468,10 @@ def _num(v, name, lo=-1e7, hi=1e7):
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= v <= hi):
         raise ToolError(T(f"{name} 는 {lo}..{hi} 사이의 수", f"{name} must be a number between {lo} and {hi}"))
     return float(v)
+
+
+def _clip(v, n: int) -> str:
+    return ak._clip(str(v), n)
 
 
 def _str(v, name, n=4000, allow_empty=False):
@@ -346,6 +512,8 @@ def _kind_word(e) -> str:
         return T("라벨", "label") if e.get("containerId") else T("글", "text")
     if t == "arrow":
         return T("연결", "arrow")
+    if t == "line":
+        return T("선", "line")
     if t == "freedraw":
         return T("손글씨 획", "ink stroke")
     if t == "image":
@@ -353,6 +521,39 @@ def _kind_word(e) -> str:
     if t == "frame":
         return T("장", "page") if cd.get("tbPage") is not None else T("틀", "frame")
     return str(t)
+
+
+WAIT_KINDS = ("ink", "text", "shape", "any")
+
+
+def _wait_kind(e) -> str:
+    t = e.get("type")
+    return "ink" if t == "freedraw" else ("text" if t == "text" else "shape")
+
+
+def _math_rendered(prev: Optional[dict], el: dict) -> bool:
+    """The write of a math job: the same formula (same latex, place) went from render "pending" to "done" / "error"."""
+    def cera(e):
+        cd = e.get("customData") if isinstance(e, dict) else None
+        c = cd.get("cera") if isinstance(cd, dict) else None
+        return (cd or {}), (c if isinstance(c, dict) else {})
+    if not isinstance(prev, dict) or el.get("isDeleted") or el.get("type") != "image":
+        return False
+    (pcd, pc), (cd, c) = cera(prev), cera(el)
+    return pc.get("render") == "pending" and c.get("render") in ("done", "error") and pcd.get("latex") == cd.get("latex") and \
+        prev.get("x") == el.get("x") and prev.get("y") == el.get("y")
+
+
+def _is_echo(prev: dict, el: dict) -> bool:
+    """el re-writes stroke prev without moving it, within ECHO_S by the element's own 'updated' clock (the app's smoothing pass)."""
+    if not (isinstance(prev, dict) and el.get("type") == "freedraw" and not el.get("isDeleted")):
+        return False
+    if el.get("x") != prev.get("x") or el.get("y") != prev.get("y"):
+        return False
+    u0, u1 = prev.get("updated"), el.get("updated")
+    if not all(isinstance(u, (int, float)) and not isinstance(u, bool) for u in (u0, u1)):
+        return False
+    return 0 <= u1 - u0 <= ECHO_S * 1000
 
 
 def _txt(e) -> str:
@@ -576,7 +777,10 @@ class Tools:
         if ids is not None and (not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or len(ids) > 2000):
             raise ToolError(T("ids 는 글 목록(2000개까지)", "ids must be a list of strings (up to 2000)"))
         meta = {"board": bid, "title": (d.get("meta") or {}).get("title"), "seq": d.get("seq"), "epoch": d.get("epoch")}
+        self.s.remember(c.base, bid, d.get("epoch") or "", d.get("seq"), els)
         by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
+        if fmt == "mermaid":
+            return self._read_mermaid(bid, els, ids, page)
         if fmt == "elements" or ids:
             text, st = ak.describe(els, page)
             want = set(ids or [])
@@ -609,7 +813,7 @@ class Tools:
                           ". Points were left out of lines / ink with many points (points_n; pass points:true if needed)")
             return head + "\n" + json.dumps(res, ensure_ascii=False), None   # only one copy (text) — do not carry the same JSON twice
         if fmt != "summary":
-            raise ToolError(T('format 은 "summary" 또는 "elements"', 'format must be "summary" or "elements"'))
+            raise ToolError(T('format 은 "summary" · "elements" · "mermaid"', 'format must be "summary", "elements" or "mermaid"'))
         text, st = ak.describe(els, page)
         for it in st["items"]:
             e = by_id.get(it["id"]) or {}
@@ -638,28 +842,337 @@ class Tools:
             st["truncated"] = cut
         return head + "\n" + "\n".join(lines), st
 
+    def _read_mermaid(self, bid: str, els, ids, page):
+        """format:"mermaid": flow nodes (customData.cera.graph) and shapes joined by both-ends-bound arrows → a mermaid flowchart (U4)."""
+        live = _live(els)
+        ids = ids or None   # ids:[] from the caller = no filter, as in the other formats
+        if page is not None:   # the same page membership as board_read page:N (frameId, or drawn inside the page's area)
+            if not any(e.get("id") == ak.page_id(page) for e in live):
+                raise ToolError(T(f"장 {page} 가 없다", f"Page {page} does not exist"))
+            on = {i["id"] for i in ak.describe(live, page)[1]["items"]}
+            ids = [i for i in ids if i in on] if ids is not None else sorted(on)   # may be [] — then the diagram is empty
+        g = gio.graph_from_elements(live, ids)
+        if not g["nodes"]:
+            return T(f"보드 {bid}: mermaid 로 꺼낼 도식이 없다(흐름도 노드나, 화살표로 양끝이 이어진 상자가 없다).",
+                     f"Board {bid}: nothing to export as mermaid (no flow nodes and no shapes joined by arrows at both ends)."), \
+                {"board": bid, "mermaid": "", "nodes": 0, "edges": 0}
+        src = gio.to_mermaid(g)
+        if len(src.encode("utf-8")) > 25_000:   # text + structured both carry it — stays within MAX_RESPONSE
+            raise ToolError(T("도식이 너무 크다 — ids · page 로 좁히거나 board_export format:\"drawio\" 로 꺼낸다",
+                              "The diagram is too large — narrow with ids / page or use board_export format:\"drawio\""))
+        keys = {n["key"]: n["id"] for n in g["nodes"]}
+        return T(f"보드 {bid} 의 도식(노드 {len(g['nodes'])} · 간선 {len(g['edges'])}) — mermaid flowchart:",
+                 f"Diagram on board {bid} (nodes {len(g['nodes'])} · edges {len(g['edges'])}) — mermaid flowchart:") + \
+            "\n```mermaid\n" + src + "```", {"board": bid, "mermaid": src, "nodes": len(g["nodes"]), "edges": len(g["edges"]), "key_to_id": keys}
+
     # ---- Writing
+    def _own(self, c: Conn, bid: str, ids, written=()):
+        """Record what this agent just wrote (see Session.note_own). written: elements sent as is; ids: patched — read back their state."""
+        if not self.s.seen.get((c.base, bid)):
+            return
+        els = list(written)
+        ids = [i for i in ids if i not in {e.get("id") for e in els}]
+        if ids:
+            try:
+                cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
+                els += [cur[i] for i in ids if i in cur]
+            except ToolError:
+                self.s.forget(c.base, bid)   # unknown state → board_wait falls back to comparing with the current board (and says so)
+                return
+        self.s.note_own(c.base, bid, els)
+
     def _pointer(self, c: Conn, bid: str, items):
+        """Show where the agent worked — just outside the top-left of the group (24 px), not over the drawing."""
         bb = ak.scene_bbox(items)
         if not bb:
             return
         try:
             c.req("POST", f"/api/whiteboard/boards/{bid}/presence",
-                  {"client": c.client, "pointer": {"x": (bb[0] + bb[2]) / 2, "y": (bb[1] + bb[3]) / 2, "tool": "pointer"},
+                  {"client": c.client, "pointer": {"x": bb[0] - 24, "y": bb[1] - 24, "tool": "pointer"},
                    "button": "up", "selected": {}}, timeout=5)
+            self.s.pointed_at(c, bid)
         except ToolError:
             pass
+
+    def _flow(self, it: dict, n: int, by: str, fid: Optional[str], ox: float, oy: float) -> Tuple[List[dict], Dict[str, dict], str]:
+        """kind:"flow" → boxes (+ labels) and both-ends-bound arrows, laid out by server/layout.py (B6). Every mistake names the field to fix
+        and nothing is written. -> (elements, {node id: box}, note)."""
+        pre = f"items[{n}]"
+        direction = it.get("dir", "TD")
+        if direction not in ("TD", "LR"):
+            raise ToolError(T(f'{pre}.dir 는 "TD"(위→아래) 또는 "LR"(왼→오)', f'{pre}.dir must be "TD" (top-down) or "LR" (left-right)'))
+        mode = it.get("layout", "keep")
+        if mode not in ("keep", "layered"):
+            raise ToolError(T(f'{pre}.layout 은 "keep"(읽은 자리 지킴) 또는 "layered"(층 배치)', f'{pre}.layout must be "keep" (keep the positions read) or "layered"'))
+        nodes, edges = it.get("nodes"), it.get("edges", [])
+        if not isinstance(nodes, list) or not 1 <= len(nodes) <= lay.MAX_NODES:
+            raise ToolError(T(f"{pre}.nodes 는 노드 1–{lay.MAX_NODES}개 목록", f"{pre}.nodes must be a list of 1-{lay.MAX_NODES} nodes"))
+        if not isinstance(edges, list) or len(edges) > FLOW_EDGES_MAX:
+            raise ToolError(T(f"{pre}.edges 는 간선 {FLOW_EDGES_MAX}개까지의 목록", f"{pre}.edges must be a list of up to {FLOW_EDGES_MAX} edges"))
+        ids: List[str] = []
+        spec: Dict[str, dict] = {}
+        for i, nd in enumerate(nodes):
+            p = f"{pre}.nodes[{i}]"
+            if not isinstance(nd, dict):
+                raise ToolError(T(f"{p} 는 객체 {{id, label, shape, at}}", f"{p} must be an object {{id, label, shape, at}}"))
+            extra = sorted(str(k) for k in nd if k not in FLOW_NODE_FIELDS)
+            if extra:
+                raise ToolError(T(f"{p} 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: {', '.join(FLOW_NODE_FIELDS)}",
+                                  f"{p} has unknown field(s): {', '.join(extra)} — allowed: {', '.join(FLOW_NODE_FIELDS)}"))
+            nid = nd.get("id")
+            if not isinstance(nid, str) or not nid.strip() or len(nid) > 40:
+                raise ToolError(T(f"{p}.id 는 1–40자 글", f"{p}.id must be text of 1-40 characters"))
+            if nid in spec:
+                raise ToolError(T(f"{p}.id = {nid!r} 가 겹친다 — 노드 id 는 서로 달라야 한다", f"{p}.id = {nid!r} is used twice — node ids must differ"))
+            shape = nd.get("shape", "box")
+            if shape not in FLOW_SHAPE:
+                raise ToolError(T(f"{p}.shape 는 box · round · ellipse · diamond", f"{p}.shape must be box, round, ellipse or diamond"))
+            label = _str(nd["label"], f"{p}.label", 400, allow_empty=True) if "label" in nd else nid
+            at_ = None
+            if nd.get("at") is not None:
+                if not isinstance(nd["at"], dict):
+                    raise ToolError(T(f"{p}.at 는 {{x, y}}(노드 가운데, 보드 좌표)", f"{p}.at must be {{x, y}} (node centre, board coordinates)"))
+                at_ = (_num(nd["at"].get("x"), f"{p}.at.x"), _num(nd["at"].get("y"), f"{p}.at.y"))
+            ids.append(nid)
+            spec[nid] = {"label": label, "shape": shape, "at": at_}
+        pairs: List[Tuple[str, str, str, str]] = []
+        for j, ed in enumerate(edges):
+            p = f"{pre}.edges[{j}]"
+            if not isinstance(ed, dict):
+                raise ToolError(T(f"{p} 는 객체 {{from, to, label, head}}", f"{p} must be an object {{from, to, label, head}}"))
+            extra = sorted(str(k) for k in ed if k not in FLOW_EDGE_FIELDS)
+            if extra:
+                raise ToolError(T(f"{p} 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: {', '.join(FLOW_EDGE_FIELDS)}",
+                                  f"{p} has unknown field(s): {', '.join(extra)} — allowed: {', '.join(FLOW_EDGE_FIELDS)}"))
+            for side in ("from", "to"):
+                if ed.get(side) not in spec:
+                    have = ", ".join(ids[:20]) + (", …" if len(ids) > 20 else "")
+                    raise ToolError(T(f"{p}.{side} = {ed.get(side)!r} 없음 — 있는 id: {have}. 아무것도 넣지 않았다.",
+                                      f"{p}.{side} = {ed.get(side)!r} does not exist — node ids: {have}. Nothing was added."))
+            if ed["from"] == ed["to"]:
+                raise ToolError(T(f"{p} 는 자기 자신으로 가는 간선 — 지원하지 않는다", f"{p} goes from a node to itself — not supported"))
+            head = ed.get("head", "end")
+            if head not in FLOW_HEADS:
+                raise ToolError(T(f'{p}.head 는 "end"(기본) · "none"(방향 없음) · "both"', f'{p}.head must be "end" (default), "none" (undirected) or "both"'))
+            lab = _str(ed["label"], f"{p}.label", 200, allow_empty=True) if ed.get("label") is not None else ""
+            pairs.append((ed["from"], ed["to"], lab, head))
+        note = ""
+        given = [k for k in ids if spec[k]["at"] is not None]
+        if mode == "keep" and not given:
+            mode = "layered"
+            note = T(f"{pre}: 노드에 at 이 없어 layered 로 배치했다.", f"{pre}: no node has at, so it was laid out as layered.")
+        elif mode == "keep" and len(given) < len(ids):
+            miss = [k for k in ids if spec[k]["at"] is None]
+            raise ToolError(T(f"{pre}: layout:\"keep\" 은 모든 노드에 at 이 필요하다 — 없는 노드: {', '.join(miss[:20])}. 아니면 layout:\"layered\".",
+                              f"{pre}: layout:\"keep\" needs at on every node — missing on: {', '.join(miss[:20])}. Or use layout:\"layered\"."))
+        g = ak.new_id()[:12]
+        boxes: Dict[str, dict] = {}
+        made: Dict[str, list] = {}
+        for k in ids:
+            sp = spec[k]
+            els_ = ak.make_box(FLOW_SHAPE[sp["shape"]], sp["label"], 0, 0, by=by, frame_id=fid)
+            if sp["shape"] == "box":
+                els_[0]["roundness"] = None
+            boxes[k], made[k] = els_[0], els_
+        for shp in set(spec[k]["shape"] for k in ids):   # one size per shape — a tidy diagram (the largest label decides)
+            grp = [k for k in ids if spec[k]["shape"] == shp]
+            w = max(boxes[k]["width"] for k in grp)
+            h = max(boxes[k]["height"] for k in grp)
+            for k in grp:
+                boxes[k]["width"], boxes[k]["height"] = w, h
+        sizes = {k: (boxes[k]["width"], boxes[k]["height"]) for k in ids}
+        vias: List[list] = [[] for _ in pairs]
+        if mode == "keep":
+            centres = lay.keep({k: spec[k]["at"] for k in ids}, sizes)
+        else:
+            centres, vias = lay.layered_routes(ids, [(p[0], p[1]) for p in pairs], sizes, direction)
+            x0 = min(centres[k][0] - sizes[k][0] / 2 for k in ids)
+            y0 = min(centres[k][1] - sizes[k][1] / 2 for k in ids)
+            centres = {k: (v[0] - x0 + ox, v[1] - y0 + oy) for k, v in centres.items()}
+            vias = [[(p[0] - x0 + ox, p[1] - y0 + oy) for p in v] for v in vias]
+        out: List[dict] = []
+        for k in ids:
+            b = boxes[k]
+            b["x"], b["y"] = centres[k][0] - b["width"] / 2, centres[k][1] - b["height"] / 2
+            ak.tag_graph(b, g, k, direction)
+            for t in made[k][1:]:
+                ak._center_label(b, t)
+            out.extend(made[k])
+        for (fr, to, lab, head), via in zip(pairs, vias):
+            sh, eh = FLOW_HEADS[head]
+            arr = ak.make_arrow(boxes[fr], boxes[to], lab or None, by=by, frame_id=fid, start_head=sh, end_head=eh)
+            ak.tag_graph(arr[0], g, f"{fr}>{to}")
+            if via:   # bend around boxes; applied again after the group is placed (board_add), since placing re-routes straight
+                arr[0]["_via"] = (boxes[fr], boxes[to], boxes[fr]["x"], boxes[fr]["y"], via, arr[1] if len(arr) > 1 else None)
+                ak.route_via(arr[0], boxes[fr], boxes[to], via, arr[1] if len(arr) > 1 else None)
+            out.extend(arr)
+        if mode == "layered" and len(ids) > 20:
+            note = (note + " " if note else "") + T("노드가 많다 — 배치가 어수선하면 board_export format:\"drawio\" 로 꺼내 draw.io 에서 정리한다.",
+                                                   "Many nodes — if the layout looks crowded, export with board_export format:\"drawio\" and tidy it in draw.io.")
+        return out, boxes, note
+
+    def _job_wait(self, c: Conn, bid: str, jid: str, deadline: float) -> Optional[dict]:
+        """Long-poll a job until it ends or `deadline`. -> the job (any state) or None if it could not be read."""
+        j = None
+        first = True
+        while first or time.time() < deadline - 0.1:   # at least one look (wait=0 when out of time): an earlier job may have used the time up
+            first = False
+            w = max(0.0, min(deadline - time.time() - 0.1, 20.0))
+            try:
+                code, j = c.req("GET", f"/api/whiteboard/boards/{bid}/jobs/{jid}?wait={w:.2f}", timeout=w + 3)
+            except ToolError:
+                return j if isinstance(j, dict) else None
+            if code != 200 or not isinstance(j, dict) or j.get("state") in ("done", "failed", "expired"):
+                break
+        return j if isinstance(j, dict) else None
+
+    def _math_jobs(self, c: Conn, bid: str, d: dict, maths: List[dict]) -> Tuple[List[str], List[dict]]:
+        """One math job per placeholder (B5). With a person's edit tab open, wait up to MATH_WAIT s for the results; otherwise the jobs wait
+        on the server (24 h) for the next tab. Updates the placeholders' customData.cera.render in place to what is known now."""
+        tab = bool(self._humans(c, bid, d))
+        jobs = []
+        for el in maths:
+            cd = el["customData"]
+            args = {"id": el["id"], "latex": cd["latex"], "size": cd["size"], "color": cd["color"]}
+            try:
+                code, r = c.req("POST", f"/api/whiteboard/boards/{bid}/jobs", {"kind": "math", "args": args}, timeout=5)
+            except ToolError as e:
+                code, r = 0, str(e)
+            ok = code in (200, 201) and isinstance(r, dict) and r.get("jid")
+            jobs.append((el, r["jid"] if ok else None, None if ok else (r.get("error") if isinstance(r, dict) else r)))
+        deadline = time.time() + MATH_WAIT
+        got = {jid: self._job_wait(c, bid, jid, deadline) for _, jid, _ in jobs if jid and tab}
+        cur = None
+        if any((j or {}).get("state") == "failed" for j in got.values()):
+            try:
+                cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
+            except ToolError:
+                cur = {}
+        lines, st = [], []
+        for el, jid, err in jobs:
+            cera = el["customData"]["cera"]
+            j = got.get(jid) or {}
+            if not jid:
+                msg = T(f"수식 [{el['id']}]: 렌더 작업을 못 만듦({str(err)[:120]}) — 보드에는 LaTeX 원문 자리 그림이 남는다",
+                        f"math [{el['id']}]: could not create the render job ({str(err)[:120]}) — the board keeps the LaTeX source placeholder")
+                state = "pending"
+            elif j.get("state") == "done":
+                if (j.get("data") or {}).get("skipped"):
+                    msg, state = T(f"수식 [{el['id']}]: 그리기 전에 사람이 고쳤다 — 그대로 둠", f"math [{el['id']}]: a person changed it before it was drawn — left as is"), "changed"
+                else:
+                    msg, state = T(f"수식 [{el['id']}]: 렌더됨", f"math [{el['id']}]: rendered"), "done"
+                    cera["render"] = "done"
+            elif j.get("state") == "failed":
+                now = (cur or {}).get(el["id"]) or {}
+                ncera = ((now.get("customData") or {}).get("cera") or {}) if isinstance((now.get("customData") or {}).get("cera"), dict) else {}
+                why = str(ncera.get("message") or j.get("error") or "")[:300]
+                if ncera.get("render") == "error":
+                    msg = T(f"수식 [{el['id']}]: LaTeX 오류 — {why}. 고치려면 이 요소를 지우고(board_delete) 고친 latex 로 다시 넣는다",
+                            f"math [{el['id']}]: LaTeX error — {why}. To fix it, delete this element (board_delete) and add the corrected latex")
+                    cera.update(render="error", message=why)
+                    state = "error"
+                else:
+                    msg, state = T(f"수식 [{el['id']}]: 렌더 실패({why}) — 자리 그림이 남는다", f"math [{el['id']}]: render failed ({why}) — the placeholder stays"), "failed"
+            elif tab:
+                msg, state = T(f"수식 [{el['id']}]: 렌더 대기 — 탭이 {int(MATH_WAIT)}초 안에 못 그렸다(그리면 바뀐다, board_read 로 확인)",
+                               f"math [{el['id']}]: render pending — no tab drew it within {int(MATH_WAIT)} s (it changes when drawn; check with board_read)"), "pending"
+            else:
+                msg, state = T(f"수식 [{el['id']}]: 렌더 대기(화면이 열리면 그린다)", f"math [{el['id']}]: render pending (drawn when a screen opens)"), "pending"
+            lines.append(msg)
+            st.append({"id": el["id"], "render": state, **({"message": cera.get("message")} if state == "error" else {})})
+        return lines, st
+
+    def _add_mermaid(self, a, it):
+        """kind:"mermaid": a person's tab converts it with the same converter as 'Flowchart from text' (WP-2 mermaid job) into editable
+        shapes and arrows. No tab → isError that suggests kind:"flow" (with the converted flow when the small parser understands it)."""
+        extra = sorted(str(k) for k in it if k not in ITEM_FIELDS["mermaid"])
+        if extra:
+            raise ToolError(T(f"items[0] (mermaid) 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: kind, source",
+                              f"items[0] (mermaid) has unknown field(s): {', '.join(extra)} — allowed: kind, source"))
+        src = it.get("source")
+        if not isinstance(src, str) or not src.strip():
+            raise ToolError(T("items[0].source 는 mermaid 글", "items[0].source must be mermaid text"))
+        if len(src.encode("utf-8")) > MERMAID_MAX:
+            raise ToolError(T(f"items[0].source 는 {MERMAID_MAX // 1000} KB 까지", f"items[0].source is limited to {MERMAID_MAX // 1000} KB"))
+        if a.get("page") is not None:
+            raise ToolError(T("mermaid 는 page 와 함께 쓰지 않는다 — 자리는 at:{x,y} 로", "mermaid does not take page — give the position with at:{x,y}"))
+        at = a.get("at", "right")
+        if at not in ("right",) and not isinstance(at, dict):
+            raise ToolError(T('mermaid 의 at 은 "right"(기본) 또는 {x, y}', 'at for mermaid must be "right" (default) or {x, y}'))
+        args = {"source": src}
+        if isinstance(at, dict):
+            args["at"] = {"x": _num(at.get("x"), "at.x"), "y": _num(at.get("y"), "at.y")}
+        c, sid = self.s.conn(a.get("site"))
+        bid = self.s.board_id(c, sid, a.get("board"))
+        d = _fetch(c, bid)
+        if not self._humans(c, bid, d):
+            hint = ""
+            try:
+                g = gio.parse_mermaid(src)
+                flow = {"kind": "flow", "dir": g["dir"], "layout": "layered",
+                        "nodes": [{"id": x["key"], "label": x["label"], "shape": x["shape"]} for x in g["nodes"]],
+                        "edges": [{"from": e["from"], "to": e["to"], **({"label": e["label"]} if e["label"] else {}), "head": e["head"]}
+                                  for e in g["edges"]]}
+                try:   # offer it only if board_add would take it as is (node count, ids, self-loops, labels)
+                    self._flow(flow, 0, "x", None, 0.0, 0.0)
+                    hint = json.dumps(flow, ensure_ascii=False)
+                except ToolError:
+                    hint = ""
+                hint = T(f"\n이 원문을 바꾼 항목(그대로 board_add items 에 넣으면 된다): {hint}", f"\nThis source as a flow item (put it in board_add items as is): {hint}") \
+                    if hint and len(hint) <= 6000 else ""
+            except gio.MermaidError:
+                pass
+            raise ToolError(T("mermaid 는 사람 화면(편집 탭)이 열려 있어야 그린다 — 지금 열린 탭이 없다. 대신 kind:\"flow\" 로 노드 · 간선을 준다"
+                              "(서버가 배치한다). 아무것도 넣지 않았다." + hint,
+                              "mermaid needs a person's screen (edit tab) open to draw — none is open now. Give nodes and edges with kind:\"flow\" "
+                              "instead (the server lays them out). Nothing was added." + hint))
+        try:
+            code, r = c.req("POST", f"/api/whiteboard/boards/{bid}/jobs", {"kind": "mermaid", "args": args}, timeout=5)
+        except ToolError as e:
+            raise ToolError(T(f"mermaid 작업을 만들지 못했다({str(e)[:160]})", f"could not create the mermaid job ({str(e)[:160]})"))
+        if code not in (200, 201) or not isinstance(r, dict) or not r.get("jid"):
+            msg = (r or {}).get("error") if isinstance(r, dict) else r
+            raise ToolError(T(f"mermaid 작업을 만들지 못했다(HTTP {code}: {str(msg)[:160]})", f"could not create the mermaid job (HTTP {code}: {str(msg)[:160]})"))
+        j = self._job_wait(c, bid, r["jid"], time.time() + MERMAID_WAIT) or {}
+        if j.get("state") == "failed":
+            raise ToolError(T(f"탭이 mermaid 를 그리지 못했다: {str(j.get('error') or '')[:300]}. 아무것도 넣지 않았다 — 원문을 고치거나 kind:\"flow\" 로.",
+                              f"The tab could not draw the mermaid: {str(j.get('error') or '')[:300]}. Nothing was added — fix the source or use kind:\"flow\"."))
+        if j.get("state") != "done":
+            raise ToolError(T(f"탭이 {int(MERMAID_WAIT)}초 안에 그리지 못했다({j.get('state') or '-'}). 늦게 나타날 수 있으니 board_read 로 확인한 뒤 다시 하거나 kind:\"flow\" 로.",
+                              f"No tab drew it within {int(MERMAID_WAIT)} s ({j.get('state') or '-'}). It may still appear — check with board_read before retrying, or use kind:\"flow\"."))
+        ids = [i for i in ((j.get("data") or {}).get("ids") or []) if isinstance(i, str)]
+        els = [e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict) and e.get("id") in set(ids) and not e.get("isDeleted")]
+        self._own(c, bid, [], els)
+        self._pointer(c, bid, els)
+        text, st = ak.describe(els)
+        pics = sum(1 for e in els if e.get("type") == "image")
+        head = T(f"보드 {bid} 에 mermaid 로 {len(els)}개를 넣었다(그린 탭: {(j.get('claimer') or {}).get('user') or '-'}).",
+                 f"Added {len(els)} item(s) from mermaid to board {bid} (drawn by the tab of {(j.get('claimer') or {}).get('user') or '-'}).")
+        if pics:
+            head += T(f" 그림(image) {pics}개 — flowchart 가 아닌 종류는 그림이 된다(편집하려면 kind:\"flow\").",
+                      f" {pics} picture(s) (image) — kinds other than flowchart become a picture (for editable shapes use kind:\"flow\").")
+        lines = annotate(text.split("\n")[1:], {e["id"]: e for e in els}, _labels(els))
+        return head + "\n" + "\n".join(lines), {"board": bid, "ids": [e["id"] for e in els], "items": st["items"], "links": st["links"]}
 
     def board_add(self, a):
         items_in = a.get("items")
         if not isinstance(items_in, list) or not items_in or len(items_in) > 300:
             raise ToolError(T("items 는 1–300개 목록", "items must be a list of 1-300"))
-        for it in items_in:
-            if isinstance(it, dict) and it.get("kind") in ("math", "mermaid"):
-                raise ToolError(T("수식(math) · mermaid 흐름도는 아직 MCP 로 넣을 수 없다 — 사람에게 화면의 수식 · 흐름도 도구"
-                                  "(메뉴 '글로 흐름도 만들기')를 쓰라고 안내하거나, 상자 · 화살표로 그린다.",
-                                  "Math and mermaid flowcharts cannot be added through MCP yet — tell the person to use the on-screen math / flowchart tool "
-                                  "(menu 'Make a flowchart from text'), or draw with boxes and arrows."))
+        for n, it in enumerate(items_in):
+            if isinstance(it, dict) and it.get("kind") in ITEM_FIELDS:
+                extra = sorted(str(k) for k in it if k not in ITEM_FIELDS[it["kind"]])
+                if extra:   # a wrong field name must not be silently ignored (e.g. heads:"none" drew an arrowhead)
+                    raise ToolError(T(f"items[{n}] ({it['kind']}) 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: "
+                                      f"{', '.join(ITEM_FIELDS[it['kind']])}. 아무것도 넣지 않았다.",
+                                      f"items[{n}] ({it['kind']}) has unknown field(s): {', '.join(extra)} — allowed: "
+                                      f"{', '.join(ITEM_FIELDS[it['kind']])}. Nothing was added."))
+                if it["kind"] == "arrow" and "head" in it and it["head"] not in ak.ARROW_HEADS:   # head:null is refused too (it is not "none")
+                    raise ToolError(T(f'items[{n}].head 는 "end" · "start" · "both" · "none"', f'items[{n}].head must be "end", "start", "both" or "none"'))
+            if isinstance(it, dict) and it.get("kind") == "mermaid" and len(items_in) != 1:
+                raise ToolError(T("mermaid 는 혼자 넣는다(items 에 그 하나만). 다른 항목은 다음 호출로.",
+                                  "mermaid goes alone (only that one item in items). Add the other items in another call."))
+        if isinstance(items_in[0], dict) and items_in[0].get("kind") == "mermaid":
+            return self._add_mermaid(a, items_in[0])
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
         d = _fetch(c, bid)
@@ -683,6 +1196,8 @@ class Tools:
         new: List[dict] = []
         touched_existing: Dict[str, List[str]] = {}   # existing element id → ids of arrows connecting to it (to add to boundElements)
         files = []
+        maths: List[dict] = []   # formula placeholders — a person's tab typesets them after the write (B5)
+        notes: List[str] = []
         cx = 0.0   # where items without coordinates are laid out in a row (inside the group)
         cy = 0.0
         for n, it in enumerate(items_in):
@@ -721,17 +1236,28 @@ class Tools:
                     v = it.get(side)
                     if isinstance(v, dict):
                         ends.append((_num(v.get("x"), side + ".x"), _num(v.get("y"), side + ".y")))
-                    elif isinstance(v, str) and v in refs:
-                        ends.append(refs[v])
-                    elif isinstance(v, str) and v in live:
-                        ends.append(_copy(live[v]))   # existing element — use a copy only to compute the route; the connection is made via patch(add_bound)
+                    elif isinstance(v, str) and (v in refs or v in live):
+                        tgt = refs[v] if v in refs else live[v]
+                        if tgt.get("type") in ("arrow", "line", "freedraw"):   # arrows bind only to shapes, text, images, frames
+                            raise ToolError(T(f"items[{n}].{side} = {v!r} 는 {tgt.get('type')} — 화살표는 선 · 화살표 · 손글씨에 붙지 않는다. {{x, y}} 로 준다",
+                                              f"items[{n}].{side} = {v!r} is a {tgt.get('type')} — arrows do not attach to lines, arrows or ink; give {{x, y}}"))
+                        ends.append(tgt if v in refs else _copy(tgt))   # existing element — use a copy only to compute the route; the connection is made via patch(add_bound)
                     else:
                         raise ToolError(T(f"items[{n}].{side} = {v!r} — 이번 items 의 ref 나 보드의 요소 id, 또는 {{x, y}}",
                                       f"items[{n}].{side} = {v!r} — must be a ref from this items list, an element id on the board, or {{x, y}}"))
-                made = ak.make_arrow(ends[0], ends[1], it.get("label"), color=color, dashed=bool(it.get("dashed")), by=by, frame_id=fid)
+                sh, eh = ak.ARROW_HEADS[it.get("head") or "end"]
+                made = ak.make_arrow(ends[0], ends[1], it.get("label"), color=color, dashed=bool(it.get("dashed")), by=by, frame_id=fid,
+                                     start_head=sh, end_head=eh)
                 for e in ends:
                     if isinstance(e, dict) and e["id"] in live:
                         touched_existing.setdefault(e["id"], []).append(made[0]["id"])
+            elif kind == "line":
+                pts = it.get("points")
+                if not isinstance(pts, list) or not 2 <= len(pts) <= 500 or \
+                        not all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts):
+                    raise ToolError(T(f"items[{n}].points 는 [x, y] 점 2–500개(묶음 안 자리)", f"items[{n}].points must be 2-500 [x, y] points (positions within the group)"))
+                made = ak.make_line([(_num(p[0], f"items[{n}].points"), _num(p[1], f"items[{n}].points")) for p in pts],
+                                    color=color, dashed=bool(it.get("dashed")), by=by, frame_id=fid)
             elif kind == "image":
                 if not it.get("path"):
                     raise ToolError(T("image 는 path(이 컴퓨터의 그림 파일)", "image needs path (an image file on this computer)"))
@@ -740,13 +1266,40 @@ class Tools:
                 h = w * h0 / w0 if w0 else w * 0.75
                 files.append({"id": file_id, "dataURL": url, "mimeType": mime})
                 made = [ak.make_image(file_id, w, h, x, y, by=by, frame_id=fid)]
+            elif kind == "math":
+                latex = _str(it.get("latex"), f"items[{n}].latex", 4000)
+                bad = re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", latex)
+                if bad:   # "\frac" written in JSON as "\f" + "rac": a form feed, not a backslash
+                    raise ToolError(T(f"items[{n}].latex 에 제어 문자 U+{ord(bad.group()):04X} 가 있다 — JSON 에서 역슬래시는 두 번(\\\\frac) 쓴다. 아무것도 넣지 않았다.",
+                                      f"items[{n}].latex contains control character U+{ord(bad.group()):04X} — in JSON write a backslash twice (\\\\frac). Nothing was added."))
+                size = _num(it.get("size", 32), f"items[{n}].size", 8, 200)
+                mcol = it.get("color", ak.INK)
+                if not isinstance(mcol, str) or not HEX.match(mcol):
+                    raise ToolError(T(f"items[{n}].color 는 #rgb · #rrggbb 꼴", f"items[{n}].color must be #rgb or #rrggbb"))
+                svg, w, h = ak.math_placeholder_svg(latex, size, mcol)
+                file_id = hashlib.sha1(svg.encode("utf-8")).hexdigest()[:40]
+                if file_id not in {f["id"] for f in files}:
+                    files.append({"id": file_id, "dataURL": "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii"),
+                                  "mimeType": "image/svg+xml"})
+                el = ak.make_image(file_id, w, h, x, y, latex=latex, by=by, frame_id=fid)
+                el["customData"].update(size=size, color=mcol, cera={"render": "pending"})
+                maths.append(el)
+                made = [el]
+            elif kind == "flow":
+                made, nodes_, note = self._flow(it, n, by, fid, cx, cy)
+                for k, box in nodes_.items():
+                    if k in refs:
+                        raise ToolError(T(f"items[{n}].nodes 의 id {k!r} 가 이번 호출의 다른 ref 와 겹친다", f"items[{n}].nodes id {k!r} clashes with another ref in this call"))
+                    refs[k] = box
+                if note:
+                    notes.append(note)
             else:
-                raise ToolError(T(f"items[{n}].kind = {kind!r} — text · box · arrow · frame_page · image",
-                                  f"items[{n}].kind = {kind!r} — must be text, box, arrow, frame_page or image"))
+                raise ToolError(T(f"items[{n}].kind = {kind!r} — text · box · arrow · line · frame_page · image · math · flow · mermaid",
+                                  f"items[{n}].kind = {kind!r} — must be text, box, arrow, line, frame_page, image, math, flow or mermaid"))
             if it.get("ref"):
                 refs[str(it["ref"])] = made[0]
             new.extend(made)
-            if not has_xy and kind != "arrow":
+            if not has_xy and kind not in ("arrow", "line"):
                 bb = ak.scene_bbox(made)
                 if bb:
                     cx = bb[2] + 80
@@ -767,6 +1320,12 @@ class Tools:
             ak.place(els, new, at=(fx + 80, (ib[3] + 60) if ib else fy + 120))
         else:
             ak.place(els, new, at=at)
+        for e in new:   # flow edges with bend points: placing moved the group and drew them straight — bend them again, shifted
+            v = e.pop("_via", None)
+            if v:
+                a_, b_, x0_, y0_, via, labl = v
+                dx, dy = a_["x"] - x0_, a_["y"] - y0_
+                ak.route_via(e, a_, b_, [(p[0] + dx, p[1] + dy) for p in via], labl)
         for f in files:
             c.ok("POST", f"/api/whiteboard/boards/{bid}/files", {"client": c.client, **f}, want=(200, 201))
         for i in range(0, len(new), 2000):
@@ -785,15 +1344,25 @@ class Tools:
                         fix.append({"id": e["id"], "set": sets})
                 if fix:
                     c.ok("POST", f"/api/whiteboard/boards/{bid}/patch", {"client": c.client, "changes": fix})
+        self._own(c, bid, list(touched_existing) + [e["id"] for e in new if e.get("type") == "arrow"] if touched_existing else [], new)
         self._pointer(c, bid, new)
+        math_lines, math_st = self._math_jobs(c, bid, d, maths) if maths else ([], [])
+        if any(m["render"] != "pending" for m in math_st):   # a tab changed those formulas (version, size): describe them as they are now
+            try:
+                cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
+                new = [cur.get(e["id"], e) if e.get("type") == "image" else e for e in new]
+            except ToolError:
+                pass
         text, st = ak.describe(new + [live[i] for i in touched_existing])
         created = {k: v["id"] for k, v in refs.items()}
         res = {"board": bid, "created": created, "ids": [e["id"] for e in new], "items": st["items"], "links": st["links"]}
+        if math_st:
+            res["math"] = math_st
         nb = {e["id"]: e for e in new}
         lines = annotate(text.split("\n")[1:], nb, _labels(new))
         return T(f"보드 {bid} 에 {len(new)}개를 넣었다.", f"Added {len(new)} item(s) to board {bid}.") + \
             (f" ref→id: {json.dumps(created, ensure_ascii=False)}" if created else "") + \
-            "\n" + "\n".join(lines), res
+            "".join("\n" + x for x in notes + math_lines) + "\n" + "\n".join(lines), res
 
     def _relabel(self, c_el: dict, lab: Optional[dict], text: str) -> Tuple[dict, dict, Optional[dict]]:
         """Change the text label of a box / arrow → (box set, label set, new label element | None)."""
@@ -838,6 +1407,7 @@ class Tools:
         by_id = {e["id"]: e for e in _live(els) if isinstance(e.get("id"), str)}
         labels = _labels(els)
         results, touched = [], []
+        own_ids: List[str] = []
         for n, ch in enumerate(changes):
             if not isinstance(ch, dict) or not isinstance(ch.get("id"), str):
                 raise ToolError(T(f"changes[{n}] 에 id 가 없다", f"changes[{n}] has no id"))
@@ -963,10 +1533,13 @@ class Tools:
                 continue
             if new_label is not None:
                 c.ok("POST", f"/api/whiteboard/boards/{bid}/elements", {"client": c.client, "elements": [new_label]})
+            own_ids += list(sets) + ([new_label["id"]] if new_label is not None else [])
             vers = {x["id"]: x["version"] for x in r.get("applied", [])}   # entries not changed (check only) keep their version
             results.append({"id": eid, "status": "ok", "version": vers.get(target["id"], target.get("version")),
                             "label_version": vers.get(lab["id"], lab.get("version")) if lab is not None else (new_label or {}).get("version")})
             touched.append(cur)
+        if own_ids:
+            self._own(c, bid, own_ids)
         if touched:
             self._pointer(c, bid, touched)
         lines = []
@@ -1031,6 +1604,7 @@ class Tools:
         labels = _labels(els)
         results = []
         n_del = n_clean = 0
+        own_del: List[str] = []
         for n, it in enumerate(ids):
             if isinstance(it, str):
                 it = {"id": it}
@@ -1088,6 +1662,7 @@ class Tools:
                 results.append(res)
                 continue
             dels = sorted(i for i, v in changes.items() if v["set"].get("isDeleted"))
+            own_del += list(changes)
             n_del += len(dels)
             n_clean += len(changes) - len(dels)
             results.append({"id": eid, "status": "ok", "deleted": dels,
@@ -1114,108 +1689,586 @@ class Tools:
                                f'[{r["id"]}] not deleted — the label is deleted with it, so also pass label_base_version (the M of "label vM" at the end of the line).'))
             else:
                 lines.append(T(f'[{r["id"]}] 실패: {r.get("rejected") or r.get("missing")}', f'[{r["id"]}] failed: {r.get("rejected") or r.get("missing")}'))
+        if own_del:
+            self._own(c, bid, own_del)
         if n_clean:
             lines.append(T(f"이어진 {n_clean}개의 바인딩 · 장 연결을 정리했다.", f"Cleaned up {n_clean} connected binding(s) / page link(s)."))
         deleted = [i for r in results if r["status"] == "ok" for i in r["deleted"]]
         return "\n".join(lines), {"board": bid, "results": results, "deleted": deleted,
                                   "missing": [r["id"] for r in results if r["status"] == "missing"]}
 
-    def board_wait(self, a, cancelled=lambda: False):
+    def board_wait(self, a, cancelled=lambda: False, progress=None):
+        """Wait for people's edits. idle_ms > 0: after the first change keep collecting until nobody changed anything for idle_ms
+        (a person drawing 18 strokes wakes the agent once). kinds filters what counts (ink · text · shape · any).
+        Other agents' writes and non-board events (tab-render jobs) never count.
+        progress(done, total, message): called every WAIT_PROGRESS_S from a ticker thread (when the client sent a progressToken)."""
+        t0 = time.time()   # the cap counts from the call, not from after the connection is set up (the client's timer started already)
+        cap = wait_cap(self.s.client_name)
+        timeout = min(float(cap), _num(a.get("timeout_s", min(WAIT_DEFAULT, cap)), "timeout_s", 1, 3600))
+        idle = _num(a.get("idle_ms", 0), "idle_ms", 0, 30000) / 1000.0
+        kinds = a.get("kinds", ["any"])
+        if isinstance(kinds, str):
+            kinds = [kinds]
+        if not isinstance(kinds, list) or not kinds or any(k not in WAIT_KINDS for k in kinds):
+            raise ToolError(T(f"kinds 는 {' · '.join(WAIT_KINDS)} 중에서 고른 목록", f"kinds must be a list chosen from {', '.join(WAIT_KINDS)}"))
+        kinds = set(kinds)
+        deadline = t0 + timeout
+        stop = threading.Event()
+        if progress is not None:
+            def tick():
+                n = 1
+                while not stop.wait(max(0.0, t0 + n * WAIT_PROGRESS_S - time.time())):
+                    if time.time() >= deadline:
+                        return
+                    try:
+                        progress(n * WAIT_PROGRESS_S, int(timeout), T("보드를 지켜보는 중", "watching the board"))
+                    except Exception:   # noqa: BLE001 — progress is best effort
+                        return
+                    n += 1
+            threading.Thread(target=tick, daemon=True).start()
+        try:
+            return self._wait(a, kinds, idle, timeout, deadline, cancelled)
+        finally:
+            stop.set()
+
+    def _wait(self, a, kinds, idle, timeout, deadline, cancelled):
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
-        timeout = min(float(WAIT_MAX), _num(a.get("timeout_s", WAIT_MAX), "timeout_s", 1, 3600))
-        d = _fetch(c, bid)
-        base = {e["id"]: e for e in d.get("elements") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        d = c.ok("GET", f"/api/whiteboard/boards/{bid}", timeout=max(1.0, min(30.0, deadline - time.time())))   # bounded by the cap too
+        if not isinstance(d, dict):
+            raise ToolError(T("보드를 읽지 못했다", "Could not read the board"))
+        now_seq = int(d.get("seq") or 0)
         epoch = d.get("epoch") or ""
         since = a.get("since_seq")
-        since = int(_num(since, "since_seq", 0, 1e15)) if since is not None else int(d.get("seq") or 0)
-        from_old = since < int(d.get("seq") or 0)
-        pver, names = -1, {}
-        deadline = time.time() + timeout
+        since = int(_num(since, "since_seq", 0, 1e15)) if since is not None else now_seq
+        base = None
+        from_old = False
+        if since < now_seq:   # replaying from an older seq: compare with the board as this session saw it at that seq
+            base = self.s.seen_at(c.base, bid, epoch, since)
+            from_old = base is None
+        if base is None:
+            base = {e["id"]: e for e in d.get("elements") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        pver, names, agents_ = -1, {}, set()
+        acc: Dict[str, list] = {}   # id → [latest element, first who, other editors]
+        other: List[str] = []
+        last_change = 0.0
         while True:
-            left = deadline - time.time()
-            if left <= 0 or cancelled():
-                return T(f"{int(timeout)}초 동안 바뀐 것이 없다.", f"Nothing changed for {int(timeout)} seconds."), {"board": bid, "seq": since, "epoch": epoch, "changes": [], "timeout": True}
-            q = urllib.parse.urlencode({"since": since, "client": c.client, "pver": pver, "epoch": epoch, "wait": round(min(left, 20), 2)})
-            r = c.ok("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=min(left, 20) + 10)
+            now = time.time()
+            left = deadline - now
+            if cancelled():
+                left = 0
+            if acc or other:
+                if idle <= 0 or now - last_change >= idle or left <= 0:
+                    res = self._wait_result(c, bid, since, epoch, base, acc, other, from_old, unsettled=idle > 0 and now - last_change < idle)
+                    if res is not None:
+                        return res
+                    acc, other = {}, []   # only things that cancel out (added then deleted) — keep waiting
+                    continue
+                span = min(left, idle - (now - last_change))
+            elif left <= 0:
+                self.s.remember(c.base, bid, epoch, since, base)
+                return T(f"{int(timeout)}초 동안 바뀐 것이 없다.", f"Nothing changed for {int(timeout)} seconds."), \
+                    {"board": bid, "seq": since, "epoch": epoch, "changes": [], "timeout": True}
+            else:
+                span = left
+            span = max(0.05, min(span, 20))
+            q = urllib.parse.urlencode({"since": since, "client": c.client, "pver": pver, "epoch": epoch, "wait": round(span, 2)})
+            try:   # the HTTP timeout never runs past the deadline by more than a moment (a stuck server must not break the client's tool timeout)
+                r = c.ok("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=max(0.5, min(span + 10, deadline - time.time() + 1.0)))
+            except ToolError:
+                if time.time() < deadline - 0.5:
+                    raise
+                r = {}
             for p in r.get("presence") or []:
                 names[p.get("client")] = p.get("user")
+                if p.get("agent"):
+                    agents_.add(p.get("client"))
             pver = r.get("pver", pver)
             if r.get("reset"):
                 d2 = _fetch(c, bid)
                 text, st = ak.describe(d2.get("elements") or [])
                 return T("보드를 처음부터 다시 받았다(서버가 다시 켜졌거나 기록이 밀렸다).\n", "Re-fetched the board from scratch (the server restarted or the log was pushed out).\n") + text, \
                     {"board": bid, "seq": d2.get("seq"), "epoch": d2.get("epoch"), "reset": True, "changes": []}
-            evs = [e for e in r.get("events") or [] if e.get("event") in ("elements", "meta", "file")]
             since = int(r.get("seq", since))
-            if not evs:
-                continue
-            last: Dict[str, Tuple[dict, str]] = {}
-            other = []
-            for ev in evs:
-                if ev["event"] == "elements":
+            now = time.time()
+            for ev in r.get("events") or []:   # only board events: elements / meta. 'job' (tab render queue) and anything else is ignored
+                if ev.get("event") == "elements":
                     data = ev.get("data") or {}
-                    who = names.get(data.get("from")) or T("누군가", "someone")
+                    frm = data.get("from")
+                    who = names.get(frm) or T("누군가", "someone")
                     for el in data.get("elements") or []:
-                        if isinstance(el, dict) and isinstance(el.get("id"), str):
-                            last[el["id"]] = (el, who)
-                elif ev["event"] == "meta":
+                        if not isinstance(el, dict) or not isinstance(el.get("id"), str):
+                            continue
+                        eid = el["id"]
+                        if frm in agents_ or (isinstance(frm, str) and frm.startswith("ag-")):
+                            if eid not in acc:
+                                base[eid] = el   # another agent's write — not a person's edit
+                            elif not el.get("isDeleted"):
+                                acc[eid][0] = el
+                            continue
+                        if eid not in acc and self._echo(eid, el, frm):
+                            base[eid] = el   # smoothing re-write of a stroke already reported — not news
+                            continue
+                        old_ = base.get(eid)
+                        if eid not in acc and not from_old and isinstance(old_, dict) and old_.get("version") == el.get("version") and \
+                                old_.get("versionNonce") == el.get("versionNonce"):
+                            continue   # exactly what this session already has (e.g. the shapes a tab wrote for this agent's mermaid job)
+                        if eid not in acc and _math_rendered(base.get(eid), el):
+                            base[eid] = el   # a person's tab typeset an agent's formula placeholder (math job) — not a person's edit
+                            continue
+                        if "any" not in kinds and _wait_kind(el) not in kinds:
+                            if eid not in acc:
+                                base[eid] = el
+                            continue
+                        ent = acc.get(eid)
+                        if ent is None:
+                            acc[eid] = [el, who, frm, []]
+                        else:
+                            prev = ent[0]
+                            if frm != ent[2] and who not in ent[3] and who != ent[1]:
+                                ent[3].append(who)
+                            ent[0] = el
+                            if frm == ent[2] and _is_echo(prev, el):
+                                continue   # the smoothing pass inside the window does not extend it
+                        last_change = now
+                elif ev.get("event") == "meta" and "any" in kinds:
                     other.append(T(f'보드 이름이 "{(ev.get("data") or {}).get("title")}" 로 바뀌었다',
                                    f'The board title changed to "{(ev.get("data") or {}).get("title")}"'))
-            out, lines = [], []
-            for eid, (el, who) in last.items():
-                old = base.get(eid)
-                kind = _kind_word(el)
-                if el.get("isDeleted"):
-                    if old is None or old.get("isDeleted"):
-                        continue
-                    act = "지움"
-                    line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""} 를 지움',
-                             f'{who} deleted [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""}')
-                elif old is None or old.get("isDeleted"):
-                    act = "추가"
-                    line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""} 를 넣음',
-                             f'{who} added [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""}')
-                elif el.get("type") == "text" and _txt(el) != _txt(old):
-                    act = "글 고침"
-                    tgt = T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])') if el.get("containerId") else ""
-                    line = T(f'{who} 가 [{eid}] {kind}{tgt} 를 "{_txt(old)}" → "{_txt(el)}" 로 고침',
-                             f'{who} changed [{eid}] {kind}{tgt} from "{_txt(old)}" to "{_txt(el)}"')
-                elif any(el.get(k) != old.get(k) for k in ("x", "y")):
-                    act = "옮김"
-                    line = T(f'{who} 가 [{eid}] {kind} 를 옮김', f'{who} moved [{eid}] {kind}')
-                elif any(el.get(k) != old.get(k) for k in ("width", "height")):
-                    act = "크기"
-                    line = T(f'{who} 가 [{eid}] {kind} 크기를 바꿈', f'{who} resized [{eid}] {kind}')
-                else:
-                    act = "고침"
-                    line = T(f'{who} 가 [{eid}] {kind} 를 고침', f'{who} edited [{eid}] {kind}')
-                    if from_old and _txt(el):   # if since_seq is old, it is already in the comparison baseline (the current board) — show the current text
-                        line += T(f' — 지금 "{_txt(el)}"', f' — now "{_txt(el)}"')
-                        if el.get("containerId"):
-                            line += T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])')
-                if el.get("type") == "freedraw" and act == "추가":
-                    continue   # handwriting strokes are counted together below
-                lines.append(line)
-                out.append({"id": eid, "type": el.get("type"), "action": ACT_WORD(act), "by": who,
-                            "text": _txt(el) if el.get("type") == "text" else None})
-            strokes = [eid for eid, (el, _) in last.items() if el.get("type") == "freedraw" and not el.get("isDeleted") and eid not in base]
-            if strokes:
-                lines.append(T(f"손글씨 획 {len(strokes)}개가 늘었다(글로 읽을 수 없음)", f"{len(strokes)} ink stroke(s) were added (not readable as text)"))
-                out.append({"action": ACT_WORD("손글씨"), "count": len(strokes), "ids": strokes})
-            lines += other
-            if not lines:   # only my own changes or things already known — keep waiting
-                for eid, (el, _) in last.items():
-                    base[eid] = el
+                    last_change = now
+
+    def _echo(self, eid: str, el: dict, frm) -> bool:
+        """The stroke was reported as added (same connection), and this re-write is the app's smoothing pass:
+        same position, at most ECHO_S later by the element's own clock (not when we happen to read it)."""
+        rec = self.s.recent_ink.get(eid)
+        return bool(rec and rec[0] == frm and _is_echo(rec[1], el))
+
+    def _wait_result(self, c, bid, since, epoch, base, acc, other, from_old, unsettled=False):
+        """Lines for the collected changes, or None when nothing is left to report (base is then updated)."""
+        out, lines = [], []
+        per: Dict[str, Dict[str, int]] = {}   # who → counts for the first line
+        boxes = []
+        strokes: List[str] = []
+        stroke_els: List[dict] = []
+        for eid, (el, who, frm, others) in acc.items():
+            old = base.get(eid)
+            kind = _kind_word(el)
+            cnt = per.setdefault(who, {})
+            also = T(f" (뒤에 {', '.join(others)} 가 고침)", f" (then edited by {', '.join(others)})") if others else ""
+            if el.get("isDeleted"):
+                if old is None or old.get("isDeleted"):
+                    continue
+                act = "지움"
+                line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""} 를 지움',
+                         f'{who} deleted [{eid}] {kind}{" " + chr(34) + _txt(old) + chr(34) if _txt(old) else ""}')
+                boxes.append(old)
+            elif old is None or old.get("isDeleted"):
+                act = "추가"
+                line = T(f'{who} 가 [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""} 를 넣음',
+                         f'{who} added [{eid}] {kind}{" " + chr(34) + _txt(el) + chr(34) if _txt(el) else ""}') + also
+                boxes.append(el)
+            elif el.get("type") == "text" and _txt(el) != _txt(old):
+                act = "글 고침"
+                tgt = T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])') if el.get("containerId") else ""
+                line = T(f'{who} 가 [{eid}] {kind}{tgt} 를 "{_txt(old)}" → "{_txt(el)}" 로 고침',
+                         f'{who} changed [{eid}] {kind}{tgt} from "{_txt(old)}" to "{_txt(el)}"') + also
+                boxes.append(el)
+            elif any(el.get(k) != old.get(k) for k in ("x", "y")):
+                act = "옮김"
+                line = T(f'{who} 가 [{eid}] {kind} 를 옮김', f'{who} moved [{eid}] {kind}') + also
+                boxes.append(el)
+            elif any(el.get(k) != old.get(k) for k in ("width", "height")):
+                act = "크기"
+                line = T(f'{who} 가 [{eid}] {kind} 크기를 바꿈', f'{who} resized [{eid}] {kind}') + also
+                boxes.append(el)
+            else:
+                act = "고침"
+                line = T(f'{who} 가 [{eid}] {kind} 를 고침', f'{who} edited [{eid}] {kind}') + also
+                if from_old and _txt(el):   # no record of the board at since_seq: compared with the current board — show the current text
+                    line += T(f' — 지금 "{_txt(el)}"', f' — now "{_txt(el)}"')
+                    if el.get("containerId"):
+                        line += T(f' ([{el["containerId"]}] 의 라벨)', f' (label of [{el["containerId"]}])')
+                boxes.append(el)
+            if act == "추가":
+                k = _wait_kind(el)
+                cnt[k] = cnt.get(k, 0) + 1
+            else:
+                cnt[act] = cnt.get(act, 0) + 1
+            if el.get("type") == "freedraw" and act == "추가" and not others:
+                strokes.append(eid)
+                stroke_els.append(el)
+                continue   # handwriting strokes are counted together below
+            lines.append(line)
+            out.append({"id": eid, "type": el.get("type"), "action": ACT_WORD(act), "by": who,
+                        "text": _txt(el) if el.get("type") == "text" else None})
+        for eid, ent in acc.items():
+            base[eid] = ent[0]
+        if strokes:
+            bb = ak.scene_bbox(stroke_els)
+            lines.append(T(f"손글씨 획 {len(strokes)}개가 늘었다 {ak.at_text(bb)} — 글로 읽을 수 없음, board_snapshot 으로 본다",
+                           f"{len(strokes)} ink stroke(s) were added {ak.at_text(bb)} — not readable as text, look with board_snapshot"))
+            out.append({"action": ACT_WORD("손글씨"), "count": len(strokes), "ids": strokes, "bbox": ak._fmt_box(bb) if bb else None})
+            now = time.time()
+            for eid in strokes:
+                self.s.recent_ink[eid] = (acc[eid][2], acc[eid][0], now)
+            self.s.recent_ink = {k: v for k, v in self.s.recent_ink.items() if now - v[2] <= 600}
+        lines += other
+        if not lines:
+            return None
+        if from_old:
+            lines.insert(0, T("(since_seq 때의 보드를 이 세션이 모른다 — 지금 보드와 비교했다. 그사이 바뀐 것은 '고침' 으로 보일 수 있다)",
+                              "(this session has no record of the board at since_seq — compared with the current board; changes in between may show as 'edited')"))
+        heads = []
+        for who, cnt in per.items():
+            add = [(T("획", "ink"), cnt.get("ink", 0)), (T("글", "text"), cnt.get("text", 0)), (T("도형", "shape"), cnt.get("shape", 0))]
+            add_s = " · ".join(f"{w} {n}" for w, n in add if n)
+            edit_n = sum(v for k, v in cnt.items() if k not in ("ink", "text", "shape", "지움"))
+            parts = []
+            if add_s:
+                parts.append(T(f"{add_s} 을 더함", f"added {add_s}"))
+            if edit_n:
+                parts.append(T(f"{edit_n}개 고침", f"edited {edit_n}"))
+            if cnt.get("지움"):
+                parts.append(T(f"{cnt['지움']}개 지움", f"deleted {cnt['지움']}"))
+            if parts:
+                heads.append(T(f"{who} 가 ", f"{who}: ") + ", ".join(parts))
+        bb = ak.scene_bbox(boxes)
+        summary = " / ".join(heads) + (" " + ak.at_text(bb) if bb else "")
+        tail = T(f"\n(seq {since} — 이어서 기다리려면 since_seq 로 준다)", f"\n(seq {since} — to keep waiting, pass it as since_seq)")
+        if unsettled:
+            tail = T(f"\n(시간 상한에 닿았다 — 아직 그리는 중일 수 있다. 이어서 기다리려면 since_seq={since} 로 — 위 변경은 다시 알리지 않는다)",
+                     f"\n(the time cap was reached — the person may still be drawing; to keep waiting pass since_seq={since} — the changes above are not repeated)") + tail
+        self.s.remember(c.base, bid, epoch, since, base)
+        st = {"board": bid, "seq": since, "epoch": epoch, "changes": out, "summary": summary or None,
+              "bbox": ak._fmt_box(bb) if bb else None}
+        if unsettled:
+            st["settled"] = False
+        return (summary + "\n" if heads else "") + "\n".join(lines) + tail, st
+
+    # ---- Seeing (WP-3): snapshot · selection
+    def _selections(self, c: Conn, bid: str, who) -> List[dict]:
+        """People's last selections, newest first. who: an exact name (or connection id) wins; only without one, a part of a name."""
+        rows = (c.ok("GET", f"/api/whiteboard/boards/{bid}/selection") or {}).get("selections") or []
+        rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("ids"), list) and isinstance(r.get("user"), str)]
+        if who is not None:
+            w = _str(who, "who", 80).strip()
+            exact = [r for r in rows if r["user"].lower() == w.lower() or r.get("client") == w]
+            rows = exact or [r for r in rows if w.lower() in r["user"].lower()]
+        return rows
+
+    def _humans(self, c: Conn, bid: str, d: dict, timeout: float = 3) -> List[dict]:
+        """People's edit tabs on the board now (agents and view-only excluded) — a render job is only worth sending if one is there."""
+        q = urllib.parse.urlencode({"since": d.get("seq") or 0, "epoch": d.get("epoch") or "", "client": c.client, "pver": -1, "wait": 0.1})
+        try:
+            code, r = c.req("GET", f"/api/whiteboard/boards/{bid}/poll?{q}", timeout=max(0.5, min(3.0, timeout)))
+        except ToolError:
+            return []
+        if code != 200 or not isinstance(r, dict):
+            return []
+        return [p for p in r.get("presence") or [] if isinstance(p, dict) and not p.get("agent") and p.get("role") == "edit"]
+
+    def _tab_render(self, c: Conn, bid: str, args: dict, deadline: float, cancelled) -> Tuple[Optional[dict], str]:
+        """Render job for a person's tab (WP-2). Every request is bounded by `deadline` (a read timeout is a miss, not an error).
+        -> (data with png bytes, "") or (None, why). The PNG must be complete (CRC-checked IHDR), within max_edge and IMAGE_MAX_BYTES."""
+        def left():
+            return deadline - time.time()
+        try:
+            code, r = c.req("POST", f"/api/whiteboard/boards/{bid}/jobs", {"kind": "render", "args": args}, timeout=max(0.5, min(5.0, left())))
+            if code not in (200, 201) or not isinstance(r, dict) or not r.get("jid"):
+                msg = (r or {}).get("error") if isinstance(r, dict) else r
+                return None, T(f"작업을 만들지 못함(HTTP {code}: {str(msg)[:120]})", f"could not create the job (HTTP {code}: {str(msg)[:120]})")
+            jid, j = r["jid"], None
+            while left() > 0.2 and not cancelled():
+                w = max(0.0, min(left() - 0.3, 20.0))
+                code, j = c.req("GET", f"/api/whiteboard/boards/{bid}/jobs/{jid}?wait={w:.2f}", timeout=max(0.5, left() + 0.5))
+                if code != 200 or not isinstance(j, dict) or j.get("state") in ("done", "failed", "expired"):
+                    break
+        except ToolError as e:
+            return None, T(f"탭 렌더 요청이 끊김({str(e)[:120]})", f"the tab render request failed ({str(e)[:120]})")
+        if not isinstance(j, dict) or j.get("state") != "done":
+            st = j.get("state") if isinstance(j, dict) else "-"
+            err = j.get("error") if isinstance(j, dict) else None
+            return None, T(f"탭이 제시간에 그리지 못함({st}{': ' + str(err)[:160] if err else ''})",
+                           f"no tab drew it in time ({st}{': ' + str(err)[:160] if err else ''})")
+        data = j.get("data") or {}
+        try:
+            png = base64.b64decode(data.get("png") or "", validate=True)
+        except (ValueError, TypeError):
+            png = b""
+        size = rs.png_size(png)
+        if not size or not rs.png_complete(png):
+            return None, T("탭 결과가 온전한 PNG 가 아님", "the tab's result is not a complete PNG")
+        if max(size) > args["max_edge"] or len(png) > IMAGE_MAX_BYTES:
+            return None, T(f"탭 그림이 상한을 넘음({size[0]}×{size[1]} px · {len(png) // 1024} KB)",
+                           f"the tab's picture is over the cap ({size[0]}×{size[1]} px · {len(png) // 1024} KB)")
+        try:
+            s, x0, y0 = float(data.get("scale")), float(data.get("x0")), float(data.get("y0"))
+        except (TypeError, ValueError):
+            return None, T("탭 결과에 좌표가 없음", "the tab's result has no coordinates")
+        if not all(math.isfinite(v) for v in (s, x0, y0)) or s <= 0:
+            return None, T("탭 결과의 좌표가 틀림", "the tab's result has bad coordinates")
+        return {"png": png, "width": size[0], "height": size[1], "scale": s, "x0": x0, "y0": y0, "tag": data.get("tag"),
+                "missing_files": data.get("missing_files") or [], "by": ((j.get("claimer") or {}).get("user"))}, ""
+
+    def _save_snapshot(self, sid: Optional[str], c: Conn, bid: str, png: bytes) -> Path:
+        """$CERA_HOME/snapshots/<site>-<board>-<n>.png, 0600, created with O_EXCL (another MCP process cannot get the same name);
+        only the newest SNAP_KEEP per site are kept (by n)."""
+        d = self.s.ctx.HOME / "snapshots"
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+        # remote: "remote_<hash>" — '_' never appears in a local site id (personal: [a-z0-9-], temporary: mmdd-HHMM-hex), so `cera delete <id>`
+        # can never pick a remote board's pictures
+        site = sid or ("remote_" + hashlib.sha256(c.base.encode()).hexdigest()[:8])
+        board = bid if re.fullmatch(r"[A-Za-z0-9_]{1,64}", bid) else "b" + hashlib.sha256(bid.encode()).hexdigest()[:12]
+        pat = re.compile(re.escape(site) + r"-[A-Za-z0-9_]{1,64}-(\d+)\.png$")
+
+        def numbered():
+            return sorted(((int(m.group(1)), q) for q in d.glob(f"{site}-*.png") for m in [pat.match(q.name)] if m), key=lambda t: t[0])
+        with _SNAP_LOCK:
+            n = 1 + max([k for k, _ in numbered()] or [0])
+            for _ in range(1000):
+                p = d / f"{site}-{board}-{n}.png"
+                try:
+                    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    break
+                except FileExistsError:
+                    n += 1
+            else:
+                raise ToolError(T("스냅샷 파일 이름을 정하지 못했다", "Could not choose a snapshot file name"))
+            with os.fdopen(fd, "wb") as f:
+                f.write(png)
+            os.chmod(p, 0o600)
+            for _, old in numbered()[:-SNAP_KEEP]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        return p
+
+    def _raster(self, picked, frame, region, max_edge, want, pad, mono, cancelled) -> Tuple[dict, str]:
+        """Server raster within the time budget and the byte cap: on a timeout one retry at a smaller size, then an error. -> (out, note)."""
+        note, edge, budget = "", max_edge, SNAP_RASTER_S
+        for attempt in range(6):
+            try:
+                out = rs.render(picked, max_edge=edge, scale=want, pad=pad, mono=mono, frame=frame, crop=region, budget_s=budget,
+                                cancelled=cancelled)
+            except rs.RasterTimeout as e:
+                if cancelled() or attempt or edge <= 256:
+                    raise ToolError(T(f"서버 래스터가 너무 오래 걸린다({e}) — ids · region 으로 좁힌다",
+                                      f"The server raster takes too long ({e}) — narrow with ids / region"))
+                edge, want, budget = max(256, min(512, edge // 2)), None, SNAP_RASTER_S * 0.75
+                note = T(f"시간이 걸려 {edge}px 로 다시 그림", f"redrawn at {edge} px (took too long)")
                 continue
-            return "\n".join(lines) + T(f"\n(seq {since} — 이어서 기다리려면 since_seq 로 준다)", f"\n(seq {since} — to keep waiting, pass it as since_seq)"), \
-                {"board": bid, "seq": since, "epoch": epoch, "changes": out}
+            except ValueError as e:
+                raise ToolError(T(f"그리지 못했다: {e}", f"Could not draw: {e}"))
+            if len(out["png"]) <= IMAGE_MAX_BYTES:
+                return out, note
+            if edge <= 256:
+                raise ToolError(T("그림이 너무 크다 — ids · region 으로 좁힌다", "The picture is too large — narrow with ids / region"))
+            edge = max(256, int(edge * 0.7))
+            note = T(f"용량 상한 때문에 {edge}px 로 줄임", f"reduced to {edge} px for the size cap")
+        raise ToolError(T("그림을 상한 안에 넣지 못했다", "Could not fit the picture under the cap"))
+
+    def board_snapshot(self, a, cancelled=lambda: False):
+        c, sid = self.s.conn(a.get("site"))
+        bid = self.s.board_id(c, sid, a.get("board"))
+        chosen = [k for k in ("ids", "selection", "region", "page") if a.get(k) not in (None, False)]
+        if len(chosen) > 1:
+            raise ToolError(T("ids · selection · region · page 중 하나만 준다", "Give only one of ids, selection, region, page"))
+        if a.get("who") is not None and not a.get("selection"):
+            raise ToolError(T("who 는 selection:true 와 함께 쓴다", "who goes with selection:true"))
+        max_edge = int(_num(a.get("max_edge", SNAP_EDGE), "max_edge", 256, 1568))
+        pad = _num(a.get("pad", 16), "pad", 0, 200)
+        mono = a.get("mono", True)
+        if not isinstance(mono, bool):
+            raise ToolError(T("mono 는 true/false", "mono must be true/false"))
+        mode = a.get("render", "auto")
+        if mode not in ("auto", "tab", "server"):
+            raise ToolError(T('render 는 "auto" · "tab" · "server"', 'render must be "auto", "tab" or "server"'))
+        ids, region, page_k, who_line = None, None, None, ""
+        if a.get("ids") is not None:
+            ids = a["ids"]
+            if not isinstance(ids, list) or not ids or len(ids) > 2000 or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in ids):
+                raise ToolError(T("ids 는 글 목록(1–2000개, 각 200자까지)", "ids must be a list of strings (1-2000, each up to 200 characters)"))
+        elif a.get("selection"):
+            rows = self._selections(c, bid, a.get("who"))
+            users = sorted({r["user"] for r in rows})
+            if a.get("who") is not None and len(users) > 1:
+                raise ToolError(T("who 가 여러 사람과 맞는다: ", "who matches several people: ") + ", ".join(_clip(u, 40) for u in users[:10]))
+            ids = [i for i in (rows[0]["ids"] if rows else []) if isinstance(i, str) and 0 < len(i) <= 200][:2000]
+            if not ids:
+                raise ToolError(T("최근 60초 안에 고른 것이 없다" + (f"(who={_clip(str(a.get('who')), 40)})" if a.get("who") else "") +
+                                  " — 사람에게 고르게 하거나 ids · region 을 준다",
+                                  "Nothing was selected in the last 60 s" + (f" (who={_clip(str(a.get('who')), 40)})" if a.get("who") else "") +
+                                  " — ask the person to select, or give ids / region"))
+            who_line = T(f'{_clip(rows[0]["user"], 40)} 가 고른 것({len(ids)}개, {rows[0].get("age_s")}초 전)',
+                         f'selected by {_clip(rows[0]["user"], 40)} ({len(ids)}, {rows[0].get("age_s")} s ago)')
+        elif a.get("region") is not None:
+            r = a["region"]
+            if not isinstance(r, dict):
+                raise ToolError(T("region 은 {x,y,w,h}", "region must be {x,y,w,h}"))
+            region = (_num(r.get("x"), "region.x"), _num(r.get("y"), "region.y"), _num(r.get("w"), "region.w", 1e-6), _num(r.get("h"), "region.h", 1e-6))
+        elif a.get("page") is not None:
+            page_k = _num(a["page"], "page", 1, 10000)
+
+        def scene(d):
+            els = d.get("elements") or []
+            frame = None
+            if page_k is not None:
+                frame = next((e for e in _live(els) if rs.is_page(e) and float(e["customData"]["tbPage"]) == page_k), None)
+                if frame is None:
+                    raise ToolError(T(f"장 {int(page_k)} 이 없다(board_read 의 [장 n])", f"There is no page {int(page_k)} (see [page n] in board_read)"))
+            picked, missing = rs.pick(els, ids=ids, region=region, frame=frame)
+            return els, frame, picked, missing
+        d = _fetch(c, bid)
+        els, frame, picked, missing = scene(d)
+        if not picked:
+            raise ToolError(T("그릴 것이 없다" + (f" — 보드에 없는 id {len(missing)}개" if missing else ""),
+                              "Nothing to draw" + (f" — {len(missing)} id(s) not on the board" if missing else "")))
+        ch = rs.char_height(picked)
+        want = min(4.0, max(0.25, SNAP_LETTER_PX / ch)) if ch else None
+        out, why, renderer, notes = None, "", "server", []
+        if mode != "server":
+            deadline = time.time() + (SNAP_TAB_WAIT if mode == "auto" else SNAP_TAB_WAIT_FORCED)   # the presence query counts too
+            humans = self._humans(c, bid, d, deadline - time.time())
+            if humans:
+                job = {"max_edge": max_edge, "mono": mono, "pad": pad}
+                if want:
+                    job["scale"] = want
+                if ids is not None:   # only ids on the board (missing ones would only make the job bigger; the tab re-expands bound text etc.)
+                    gone = set(missing)
+                    job["ids"] = [i for i in ids if i not in gone]
+                elif region is not None:
+                    job["region"] = {"x": region[0], "y": region[1], "w": region[2], "h": region[3]}
+                elif frame is not None:
+                    job["page"] = frame["id"]
+                if len(json.dumps(job, ensure_ascii=False).encode("utf-8")) > JOB_ARGS_MAX - 512:
+                    out, why = None, T("id 가 너무 많아 탭 작업에 담기지 않음", "too many ids for a tab job")
+                else:
+                    out, why = self._tab_render(c, bid, job, deadline, cancelled)
+                if out is None and why.startswith(("탭 그림이 상한", "the tab's picture is over")):   # too big: once more, smaller
+                    if deadline - time.time() > 1.0:
+                        job["max_edge"] = max(256, int(max_edge * 0.6))
+                        job.pop("scale", None)
+                        out, why2 = self._tab_render(c, bid, job, deadline, cancelled)
+                        why = why2 or why
+                if out is not None and out.get("tag") != rs.scene_tag(picked):
+                    # the tab drew a different scene (someone edited in between, or the tab is behind): read the board again once
+                    try:
+                        if deadline - time.time() < 0.3:
+                            raise ToolError("deadline")
+                        d2 = _fetch(c, bid, timeout=max(0.3, min(5.0, deadline - time.time())))   # within the tab deadline
+                        els2, frame2, picked2, missing2 = scene(d2)
+                    except ToolError:
+                        picked2 = []
+                    if picked2 and out.get("tag") == rs.scene_tag(picked2):
+                        els, frame, picked, missing = els2, frame2, picked2, missing2
+                    else:
+                        out, why = None, T("탭이 그린 장면이 보드와 달랐다(그 사이 고침)", "the tab drew a different scene than the board (edited meanwhile)")
+                if out is not None:
+                    renderer = "tab"
+            else:
+                why = T("열린 사람 편집 탭이 없음", "no person's edit tab is open")
+            if out is None and mode == "tab":
+                raise ToolError(T(f"탭 렌더 실패: {why} — render:\"server\" 로 서버 래스터를 쓸 수 있다",
+                                  f"Tab render failed: {why} — render:\"server\" uses the server raster"))
+        if cancelled():
+            raise ToolError(T("취소됨", "Cancelled"))
+        if out is None:
+            out, note = self._raster(picked, frame, region, max_edge, want, pad, mono, cancelled)
+            if note:
+                notes.append(note)
+        path = self._save_snapshot(sid, c, bid, out["png"])
+        s, x0, y0 = out["scale"], out["x0"], out["y0"]
+        view = (x0, y0, out["width"] / s, out["height"] / s)   # the board rectangle the picture shows
+        want_box = ((rs._f(frame.get("x")), rs._f(frame.get("y")), rs._f(frame.get("width")), rs._f(frame.get("height"))) if frame is not None
+                    else region)
+        if want_box is not None:   # never past the page / region asked for (pixel rounding can add a fraction of a unit)
+            vx0, vy0 = max(view[0], want_box[0]), max(view[1], want_box[1])
+            vx1, vy1 = min(view[0] + view[2], want_box[0] + want_box[2]), min(view[1] + view[3], want_box[1] + want_box[3])
+            view = (vx0, vy0, max(0.0, vx1 - vx0), max(0.0, vy1 - vy0))
+        shown = [e for e in picked if (lambda b: b is not None and rs._overlaps(b, view))(rs.element_box(e))]
+        lines = [T(f"스냅샷 renderer: {renderer}", f"Snapshot renderer: {renderer}") +
+                 (T(" (사람 화면과 같은 그림" + (f", {_clip(out['by'], 40)} 의 탭" if out.get("by") else "") + ")",
+                    " (same picture as people see" + (f", {_clip(out['by'], 40)}'s tab" if out.get("by") else "") + ")") if renderer == "tab"
+                  else T(" (표준 라이브러리 래스터 — 글은 회색 막대, 글 내용은 아래 줄의 \"…\" 를 위치로 짝짓는다)",
+                         " (standard-library raster — text is drawn as gray bars; pair the \"…\" lines below by position)")),
+                 T(f"파일: {path}  — 그림이 안 보이면 이 경로를 그림 보기 도구로 연다(Claude Read · Codex view_image)",
+                   f"File: {path}  — if no image is shown, open this path with an image viewing tool (Claude Read, Codex view_image)"),
+                 T(f"그림 {out['width']}×{out['height']} px · 보이는 보드 범위 {ak.at_text((view[0], view[1], view[0] + view[2], view[1] + view[3]))} · "
+                   f"보드 = (x0 + px/s, y0 + py/s) = ({x0:.1f} + px/{s:.4g}, {y0:.1f} + py/{s:.4g})",
+                   f"Image {out['width']}×{out['height']} px · board area shown {ak.at_text((view[0], view[1], view[0] + view[2], view[1] + view[3]))} · "
+                   f"board = (x0 + px/s, y0 + py/s) = ({x0:.1f} + px/{s:.4g}, {y0:.1f} + py/{s:.4g})"),
+                 T(f"담긴 요소 {len(shown)}개", f"{len(shown)} element(s) in it") + (f" · {who_line}" if who_line else "") +
+                 (T(f" · 보드에 없는 id {len(missing)}개: ", f" · {len(missing)} id(s) not on the board: ") +
+                  ", ".join(_clip(i, 40) for i in missing[:5]) + (" …" if len(missing) > 5 else "") if missing else "")]
+        if why and renderer == "server":
+            lines.append(T(f"탭 대신 서버로 그림: {why}", f"Drawn by the server instead of a tab: {why}"))
+        lines += notes
+        if out.get("missing_files"):
+            lines.append(T(f"탭에 아직 없는 그림 파일 {len(out['missing_files'])}개는 빠졌다", f"{len(out['missing_files'])} image file(s) not yet in the tab were left out"))
+        text, _ = ak.describe(shown)
+        by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
+        body = annotate(text.split("\n"), by_id, _labels(els))
+        if len(body) > SNAP_LINES:
+            body = body[:SNAP_LINES] + [T(f"… {len(body) - SNAP_LINES}줄 더(board_read ids 로)", f"… {len(body) - SNAP_LINES} more line(s) (board_read with ids)")]
+        lines.append(T("담긴 것(보드 좌표 @(x,y w×h), 그림 밖으로 걸친 것은 일부만 보임):", "What it holds (board coordinates @(x,y w×h); items crossing the edge are partly shown):"))
+        lines.extend(body)
+        return "\n".join(lines), ImageResult(out["png"])
+
+    def board_selection(self, a):
+        c, sid = self.s.conn(a.get("site"))
+        bid = self.s.board_id(c, sid, a.get("board"))
+        rows = self._selections(c, bid, a.get("who"))
+        if not rows:
+            return (T("고른 것 없음(최근 60초)", "Nothing selected (last 60 s)") + (f" — who={_clip(str(a.get('who')), 40)}" if a.get("who") else ""),
+                    {"board": bid, "selections": []})
+        els = (_fetch(c, bid).get("elements") or [])
+        live = {e["id"]: e for e in _live(els) if isinstance(e.get("id"), str)}
+        by_id = {e.get("id"): e for e in els if isinstance(e, dict)}
+        pages = sorted((e for e in live.values() if rs.is_page(e)), key=lambda e: float(e["customData"]["tbPage"]))
+        out, lines = [], []
+        for r in rows:
+            want = [i for i in r["ids"] if isinstance(i, str)]
+            picked, _ = rs.pick(els, ids=want)
+            gone = [i for i in want if i not in live]
+            bb = ak.scene_bbox(picked)
+            page = None
+            if bb:
+                cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+                for p in pages:
+                    pb = ak.element_bbox(p)
+                    if pb and pb[0] <= cx <= pb[2] and pb[1] <= cy <= pb[3]:
+                        k = float(p["customData"]["tbPage"])
+                        page = int(k) if k.is_integer() else k
+                        break
+            row = {"user": r["user"], "ids": [i for i in want if i in live], "bbox": list(ak._fmt_box(bb)) if bb else None,
+                   "page": page, "age_s": r.get("age_s"), "current": bool(r.get("current"))}
+            out.append(row)
+            head = T(f'{_clip(row["user"], 40)}: {len(row["ids"])}개 {ak.at_text(bb)}', f'{_clip(row["user"], 40)}: {len(row["ids"])} element(s) {ak.at_text(bb)}') + \
+                (T(f" · 장 {page}", f" · page {page}") if page is not None else "") + \
+                T(f" · {row['age_s']}초 전" + (" (지금도 고른 상태)" if row["current"] else ""),
+                  f" · {row['age_s']} s ago" + (" (still selected)" if row["current"] else ""))
+            if gone:
+                head += T(f" · 그 뒤 지워진 것 {len(gone)}개", f" · {len(gone)} deleted since")
+            lines.append(head)
+            text, _ = ak.describe(picked)
+            body = [ln for ln in annotate(text.split("\n"), by_id, _labels(els))[1:] if ln.strip()]
+            lines.extend("  " + ln for ln in body[:SNAP_LINES])
+        return "\n".join(lines), {"board": bid, "selections": out}
 
     def board_export(self, a):
+        fmt = a.get("format", "excalidraw")
+        if fmt not in ("excalidraw", "drawio"):
+            raise ToolError(T('format 은 "excalidraw"(기본) 또는 "drawio"', 'format must be "excalidraw" (default) or "drawio"'))
         c, sid = self.s.conn(a.get("site"))
         bid = self.s.board_id(c, sid, a.get("board"))
         d = _fetch(c, bid)
         els = _live(d.get("elements") or [])
+        if fmt == "drawio":
+            return self._export_drawio(a, bid, d, els)
         files = {}
         for e in els:
             fid = e.get("fileId")
@@ -1232,6 +2285,22 @@ class Tools:
                "appState": {"viewBackgroundColor": "#ffffff"}, "files": files}
         p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         return T(f"{p} 에 저장했다(요소 {len(els)} · 그림 {len(files)}).", f"Saved to {p} (elements {len(els)} · images {len(files)})."), {"path": str(p), "elements": len(els), "files": len(files)}
+
+    def _export_drawio(self, a, bid: str, d: dict, els):
+        """format:"drawio": uncompressed mxGraph XML in board coordinates — shapes and free text as vertices, arrows and lines as edges (U4).
+        Ink, images and page frames are left out and counted."""
+        title = (d.get("meta") or {}).get("title") or bid
+        xml, cnt = gio.to_drawio(els, title)
+        out_dir = Path(os.path.expanduser(a["out_dir"])) if a.get("out_dir") else self.s.ctx.HOME / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^\w가-힣.-]+", "_", title).strip("_")[:60] or bid
+        p = out_dir / f"{name}-{bid}.drawio"
+        p.write_text(xml, encoding="utf-8")
+        sk = cnt["skipped"]
+        left = ", ".join(f"{k} {v}" for k, v in sorted(sk.items()))
+        return T(f"{p} 에 저장했다(도형 · 글 {cnt['vertices']} · 연결 {cnt['edges']}{' · 뺀 것: ' + left if left else ''}). draw.io 에서 열린다.",
+                 f"Saved to {p} (shapes / text {cnt['vertices']} · connections {cnt['edges']}{' · left out: ' + left if left else ''}). It opens in draw.io."), \
+            {"path": str(p), "format": "drawio", "vertices": cnt["vertices"], "edges": cnt["edges"], "skipped": sk}
 
     def board_import(self, a):
         """This computer's .excalidraw, .excalidrawlib and image files — merged into a board (merge) or as a new board (new)."""
@@ -1262,6 +2331,8 @@ class Tools:
         if res.get("bbox") and mode == "merge":
             b = res["bbox"]
             self._pointer(c, res["board"], [{"type": "rectangle", "x": b[0], "y": b[1], "width": b[2] - b[0], "height": b[3] - b[1]}])
+        if res.get("board"):
+            self.s.forget(c.base, res["board"])   # imported ids are not listed here — fall back to comparing with the current board
         st = {k: res.get(k) for k in ("board", "added", "skipped", "files", "missing_files", "bbox", "kind")}
         st["mode"] = mode
         return importers.summary(res) + ".", st
@@ -1274,14 +2345,39 @@ def _schemas():
     board = {"type": "string", "description": T("보드 id(board_list). 사이트의 첫 보드면 생략", "Board id (board_list). Omit for the site's first board")}
     item = {
         "type": "object",
-        "description": T("kind 별 칸 — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(또는 text),x?,y?,w?,h?,"
-                         "fill?,color?} · arrow{from,to(ref|요소 id|{x,y}),label?,dashed?,color?} · frame_page{title?}(새 장 — 뒤 항목은 그 안) · "
-                         "image{path,w?,x?,y?}. x/y 는 묶음 안 자리(생략하면 왼→오로 늘어놓음). math · mermaid 는 아직 안 된다",
-                         "Fields by kind — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(or text),x?,y?,w?,h?,"
-                         "fill?,color?} · arrow{from,to(ref|element id|{x,y}),label?,dashed?,color?} · frame_page{title?} (a new page — the items after it go inside) · "
-                         "image{path,w?,x?,y?}. x/y is the position within the group (if omitted, laid out left to right). math and mermaid are not supported yet"),
+        "description": T("kind 별 칸(그 밖의 칸은 거절) — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(또는 text),x?,y?,w?,h?,"
+                         "fill?,color?} · arrow{from,to(ref|요소 id|{x,y}),label?,dashed?,color?,head?(end 기본|start|both|none — none 은 방향 없는 선)} · "
+                         "line{points:[[x,y],…],dashed?,color?}(붙지 않는 꺾은선) · frame_page{title?}(새 장 — 뒤 항목은 그 안) · "
+                         "image{path,w?,x?,y?} · math{latex,size?,color?(#hex),x?,y?}(조판 수식 — 열린 사람 탭이 MathJax 로 그린다, 없으면 LaTeX 원문 자리 그림) · "
+                         "flow{dir?(TD|LR),layout?(keep 기본 — nodes 의 at 을 지킴|layered — 서버가 층 배치),nodes:[{id,label?,shape?(box|round|ellipse|diamond),at?{x,y}}],"
+                         "edges:[{from,to,label?,head?(end|none|both)}]}(노드 50개까지, 서버가 상자 · 양끝이 붙은 화살표로 만든다) · "
+                         "mermaid{source}(flowchart 글 — 혼자만, 열린 사람 탭이 바꾼다). x/y 는 묶음 안 자리(생략하면 왼→오로 늘어놓음)",
+                         "Fields by kind (other fields are refused) — text{text,x?,y?,size?,color?,width?} · box{ref?,shape?(rectangle|ellipse|diamond),label?(or text),x?,y?,w?,h?,"
+                         "fill?,color?} · arrow{from,to(ref|element id|{x,y}),label?,dashed?,color?,head?(end default|start|both|none — none is an undirected edge)} · "
+                         "line{points:[[x,y],…],dashed?,color?} (an unbound polyline) · frame_page{title?} (a new page — the items after it go inside) · "
+                         "image{path,w?,x?,y?} · math{latex,size?,color?(#hex),x?,y?} (a typeset formula — an open person's tab draws it with MathJax; with none, a LaTeX source placeholder) · "
+                         "flow{dir?(TD|LR),layout?(keep default — keeps the nodes' at|layered — the server lays out layers),nodes:[{id,label?,shape?(box|round|ellipse|diamond),at?{x,y}}],"
+                         "edges:[{from,to,label?,head?(end|none|both)}]} (up to 50 nodes; the server makes boxes and arrows bound at both ends) · "
+                         "mermaid{source} (flowchart text — alone; an open person's tab converts it). x/y is the position within the group (if omitted, laid out left to right)"),
         "properties": {
-            "kind": {"type": "string", "enum": ["text", "box", "arrow", "frame_page", "image", "math", "mermaid"]},
+            "kind": {"type": "string", "enum": ["text", "box", "arrow", "line", "frame_page", "image", "math", "flow", "mermaid"]},
+            "latex": {"type": "string", "description": T("math: LaTeX(달러 기호 없이)", "math: LaTeX (without dollar signs)")},
+            "source": {"type": "string", "description": T("mermaid: flowchart 글(20 KB 까지)", "mermaid: flowchart text (up to 20 KB)")},
+            "dir": {"type": "string", "enum": ["TD", "LR"], "description": T("flow 방향(기본 TD)", "flow direction (default TD)")},
+            "layout": {"type": "string", "enum": ["keep", "layered"],
+                       "description": T("flow: keep(기본) — 노드 at(스냅샷에서 읽은 가운데, 보드 좌표)을 20 px 격자 · 줄 맞춤만 하고 지킨다. at:\"absolute\" 면 그 자리, "
+                                        "아니면 모양 그대로 묶음째 옮긴다 · layered — 서버가 층으로 배치",
+                                        "flow: keep (default) — keeps the nodes' at (centres read from a snapshot, board coordinates), only a 20 px grid and row alignment; "
+                                        "with at:\"absolute\" exactly there, otherwise the whole group moves with its shape kept · layered — the server lays out layers")},
+            "nodes": {"type": "array", "maxItems": 50, "items": {"type": "object", "required": ["id"], "properties": {
+                "id": {"type": "string"}, "label": {"type": "string"}, "shape": {"type": "string", "enum": ["box", "round", "ellipse", "diamond"]},
+                "at": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}}},
+            "edges": {"type": "array", "maxItems": 200, "items": {"type": "object", "required": ["from", "to"], "properties": {
+                "from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"},
+                "head": {"type": "string", "enum": ["end", "none", "both"]}}}},
+            "head": {"type": "string", "enum": list(ak.ARROW_HEADS), "description": T("arrow 화살촉(기본 end)", "arrow heads (default end)")},
+            "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                       "minItems": 2, "maxItems": 500, "description": T("line 의 점(묶음 안 자리)", "line points (positions within the group)")},
             "ref": {"type": "string", "description": T("이번 호출 안에서 화살표가 가리킬 이름", "A name arrows can point to within this call")},
             "text": {"type": "string"}, "label": {"type": "string"}, "title": {"type": "string"},
             "shape": {"type": "string", "enum": ["rectangle", "ellipse", "diamond"]},
@@ -1335,10 +2431,12 @@ def tool_defs(remote: bool) -> List[dict]:
          "inputSchema": obj({"site": SITE, "title": {"type": "string"}}, ["title"]), "annotations": w},
         {"name": "board_read", "title": T("보드 읽기", "Read a board"),
          "description": T("보드를 읽는다. summary(기본): 장 순서 · 위→아래로 상자 · 글 · 수식 · 연결(\"A\" → \"B\") · 손글씨 획 수와 "
-                          "[id] 와 줄 끝 (vN · 라벨 vM) — 고칠 때 이 id 와 판을 쓴다. elements: 원래 요소 JSON(ids · page 로 좁힌다).",
+                          "[id] 와 줄 끝 (vN · 라벨 vM) — 고칠 때 이 id 와 판을 쓴다. elements: 원래 요소 JSON(ids · page 로 좁힌다). "
+                          "mermaid: 흐름도 노드와 화살표로 이어진 상자를 mermaid flowchart 글로.",
                           "Reads the board. summary (default): in page order, top to bottom — boxes, text, math, arrows (\"A\" → \"B\"), ink stroke counts, "
-                          "with the [id] and (vN · label vM) at the end of each line — use that id and version when editing. elements: the raw element JSON (narrow with ids / page)."),
-         "inputSchema": obj({"site": SITE, "board": BOARD, "format": {"type": "string", "enum": ["summary", "elements"], "default": "summary"},
+                          "with the [id] and (vN · label vM) at the end of each line — use that id and version when editing. elements: the raw element JSON (narrow with ids / page). "
+                          "mermaid: flow nodes and shapes joined by arrows as mermaid flowchart text."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "format": {"type": "string", "enum": ["summary", "elements", "mermaid"], "default": "summary"},
                              "page": {"type": "integer", "description": T("장 번호(판서 장)만", "Only this page number (a board page)")},
                              "ids": {"type": "array", "items": {"type": "string"}},
                              "limit": {"type": "integer", "default": READ_LIMIT, "maximum": 2000, "description": T("줄 · 요소 수 상한", "Maximum number of lines / elements")},
@@ -1346,9 +2444,9 @@ def tool_defs(remote: bool) -> List[dict]:
                              "points": {"type": "boolean", "description": T("elements: 손글씨 · 선의 점까지(크다)", "elements: include the points of ink / lines (large)")}}),
          "annotations": ro},
         {"name": "board_add", "title": T("보드에 그리기", "Draw on a board"),
-         "description": T("상자 · 글 · 화살표 · 새 장 · 그림을 한 묶음으로 넣는다. 사람 화면에 바로 보인다. at: 묶음을 놓을 곳 — "
+         "description": T("상자 · 글 · 화살표 · 새 장 · 그림 · 수식 · 흐름도를 한 묶음으로 넣는다. 사람 화면에 바로 보인다. at: 묶음을 놓을 곳 — "
                           "\"right\"(기존 그림 오른쪽, 기본) · \"below\" · {x,y} · \"absolute\"(x/y 를 보드 좌표로). page: 그 장 안에.",
-                          "Adds boxes, text, arrows, a new page and images as one group. It shows on people's screens right away. at: where to put the group — "
+                          "Adds boxes, text, arrows, a new page, images, formulas and flowcharts as one group. It shows on people's screens right away. at: where to put the group — "
                           "\"right\" (right of the existing drawing, default), \"below\", {x,y} or \"absolute\" (x/y as board coordinates). page: inside that page."),
          "inputSchema": obj({"site": SITE, "board": BOARD, "items": {"type": "array", "items": ITEM, "minItems": 1},
                              "at": {"description": "\"right\" | \"below\" | \"absolute\" | {x, y}"},
@@ -1392,13 +2490,48 @@ def tool_defs(remote: bool) -> List[dict]:
                             "base_version": {"type": "integer", "description": T("board_read 줄 끝 (vN) 의 N", "The N of (vN) at the end of the board_read line")},
                             "label_base_version": {"type": "integer", "description": T("라벨이 있으면 줄 끝 (라벨 vM) 의 M", "If there is a label, the M of (label vM) at the end of the line")}}}}}, ["ids"]),
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}},
+        {"name": "board_snapshot", "title": T("보드 그림으로 보기", "See the board as an image"),
+         "description": T("보드(또는 고른 것 · 영역 · 장)를 PNG 그림으로 돌려준다 — 손글씨 · 손그림을 읽을 때 쓴다. "
+                          "결과: 글(렌더러 · 그림 픽셀 → 보드 좌표 변환식 · 담긴 글과 위치 · PNG 파일 경로) + image. "
+                          "render:\"auto\"(기본)는 사람 편집 탭이 있으면 그 탭이 그린다(사람 화면과 같음, 6초까지), 없으면 서버 래스터"
+                          "(획 · 도형 · 화살표, 글은 회색 막대 — 글 내용은 결과 글에). 그림이 안 보이는 클라이언트는 글의 파일 경로를 그림 보기 도구로 연다. "
+                          "고르기: ids · selection:true(사람이 최근 고른 것, who 로 사람 지정) · region{x,y,w,h} · page 중 하나, 없으면 보드 전체.",
+                          "Returns the board (or a selection / region / page) as a PNG image — use it to read handwriting and hand drawings. "
+                          "Result: text (renderer, pixel → board coordinate formula, the text it holds with positions, the PNG file path) + image. "
+                          "render:\"auto\" (default) has a person's edit tab draw it when one is open (same as people see, up to 6 s), otherwise the server raster "
+                          "(strokes, shapes, arrows; text as gray bars — the words are in the result text). A client that shows no image opens the file path with an image tool. "
+                          "Choose one of ids · selection:true (what a person selected lately; who picks the person) · region{x,y,w,h} · page; none = the whole board."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 2000},
+                             "selection": {"type": "boolean", "description": T("사람이 최근(60초) 고른 것", "What a person selected in the last 60 s")},
+                             "who": {"type": "string", "description": T("selection 의 사람 이름(기본: 가장 최근에 고른 사람)", "Person for selection (default: whoever selected last)")},
+                             "region": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "w": {"type": "number"}, "h": {"type": "number"}},
+                                        "required": ["x", "y", "w", "h"], "description": T("보드 좌표 영역", "A region in board coordinates")},
+                             "page": {"type": "integer", "minimum": 1, "description": T("장 번호", "Page number")},
+                             "max_edge": {"type": "integer", "default": SNAP_EDGE, "minimum": 256, "maximum": 1568, "description": T("그림 긴 변 상한(px)", "Longest image side (px)")},
+                             "render": {"type": "string", "enum": ["auto", "tab", "server"], "default": "auto"},
+                             "mono": {"type": "boolean", "default": True, "description": T("한 가지 진한 잉크(인식용, 기본)", "One dark ink (for recognition, default)")},
+                             "pad": {"type": "number", "default": 16, "minimum": 0, "maximum": 200}}),
+         "annotations": ro},
+        {"name": "board_selection", "title": T("사람이 고른 것", "What people selected"),
+         "description": T("사람마다 최근(60초) 고른 요소 — '이거' 가 무엇인지. {user, ids, bbox, page, age_s} 와 고른 요소의 요약 줄. 에이전트는 빠진다. "
+                          "그림으로 보려면 board_snapshot selection:true.",
+                          "What each person selected lately (60 s) — what 'this' means. {user, ids, bbox, page, age_s} and summary lines of the selected elements. "
+                          "Agents are left out. To see it as an image: board_snapshot selection:true."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "who": {"type": "string", "description": T("사람 이름(일부도 됨)", "Person's name (part is fine)")}}),
+         "annotations": ro},
         {"name": "board_wait", "title": T("사람이 고칠 때까지 기다리기", "Wait until a person edits"),
-         "description": T("사람이 보드를 고칠 때까지 기다렸다가(최대 60초) 무엇이 바뀌었는지 한 줄씩 돌려준다. since_seq 는 board_read · "
-                          "앞 board_wait 의 seq(없으면 지금부터).",
-                          "Waits (up to 60 seconds) until a person edits the board, then returns what changed, one line each. since_seq is the seq from board_read or "
-                          "the previous board_wait (if omitted, from now)."),
+         "description": T("사람이 보드를 고칠 때까지 기다렸다가 무엇이 바뀌었는지 돌려준다 — 첫 줄은 요약(누가 무엇을 더함 @(x,y w×h)), 이어서 한 줄씩. "
+                          "since_seq 는 board_read · 앞 board_wait 의 seq(없으면 지금부터). idle_ms: 첫 변경 뒤 이만큼 아무도 안 고칠 때까지 모아서 "
+                          "한 번에 돌려준다(사람이 다 그릴 때까지 — 3000 권장). kinds: 셀 변경(ink · text · shape · any). "
+                          "timeout_s 상한은 클라이언트마다: Claude Code 600 · Codex 50 · 그 밖 55(CERA_WAIT_MAX 로 바꿈). 시간이 다 되면 timeout:true.",
+                          "Waits until a person edits the board, then returns what changed — the first line is a summary (who added what @(x,y w×h)), then one line each. "
+                          "since_seq is the seq from board_read or the previous board_wait (if omitted, from now). idle_ms: after the first change, keep collecting until "
+                          "nobody edits for this long, then return once (until the person finishes drawing — 3000 recommended). kinds: which changes count (ink, text, shape, any). "
+                          "The timeout_s cap depends on the client: Claude Code 600, Codex 50, others 55 (override with CERA_WAIT_MAX). When time runs out: timeout:true."),
          "inputSchema": obj({"site": SITE, "board": BOARD, "since_seq": {"type": "integer"},
-                             "timeout_s": {"type": "integer", "default": 60, "maximum": 60}}), "annotations": ro},
+                             "timeout_s": {"type": "integer", "default": WAIT_DEFAULT, "minimum": 1, "maximum": WAIT_SCHEMA_MAX},
+                             "idle_ms": {"type": "integer", "default": 0, "minimum": 0, "maximum": 30000},
+                             "kinds": {"type": "array", "items": {"type": "string", "enum": list(WAIT_KINDS)}, "minItems": 1}}), "annotations": ro},
         {"name": "board_import", "title": T("파일 가져오기", "Import a file"),
          "description": T("이 컴퓨터의 .excalidraw · .excalidrawlib · 그림(png · jpg · gif · webp · svg) 파일을 보드에 넣는다(50 MB 까지, "
                           "URL 은 안 된다). mode:\"merge\"(기본)는 지금 보드에 합친다 — id 를 새로 매기고 기존 그림 오른쪽(at)에 놓는다. "
@@ -1411,10 +2544,13 @@ def tool_defs(remote: bool) -> List[dict]:
                              "title": {"type": "string", "description": T("mode:new 의 보드 이름(기본: 파일 이름)", "Board name for mode:new (default: the file name)")},
                              "at": {"description": T("merge 자리 — \"right\"(기본) · \"below\" · {x, y}(묶음 가운데)", "merge position — \"right\" (default), \"below\" or {x, y} (center of the group)")}}, ["path"]),
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}},
-        {"name": "board_export", "title": T(".excalidraw 로 저장", "Save as .excalidraw"),
-         "description": T("보드를 .excalidraw 파일로 저장한다(기본 $CERA_HOME/exports). excalidraw.com 에서 열린다.",
-                          "Saves the board as a .excalidraw file (default $CERA_HOME/exports). It opens on excalidraw.com."),
-         "inputSchema": obj({"site": SITE, "board": BOARD, "out_dir": {"type": "string"}}), "annotations": w},
+        {"name": "board_export", "title": T("파일로 저장", "Save to a file"),
+         "description": T("보드를 파일로 저장한다(기본 $CERA_HOME/exports). format:\"excalidraw\"(기본) — excalidraw.com 에서 열린다. "
+                          "format:\"drawio\" — draw.io 파일(비압축 XML, 보드 좌표 그대로): 도형 · 글은 칸, 화살표 · 선은 연결. 손글씨 · 그림은 빠진다.",
+                          "Saves the board to a file (default $CERA_HOME/exports). format:\"excalidraw\" (default) — opens on excalidraw.com. "
+                          "format:\"drawio\" — a draw.io file (uncompressed XML, board coordinates): shapes and text become cells, arrows and lines connections. Ink and images are left out."),
+         "inputSchema": obj({"site": SITE, "board": BOARD, "out_dir": {"type": "string"},
+                             "format": {"type": "string", "enum": ["excalidraw", "drawio"], "default": "excalidraw"}}), "annotations": w},
     ]
     if remote:
         defs = [t for t in defs if not t["name"].startswith("site_")]
@@ -1492,10 +2628,22 @@ class Server:
                 raise ToolError(T(f"모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: {', '.join(schema['properties']) or '없음'}",
                                   f"Unknown field(s): {', '.join(extra)} — allowed fields: {', '.join(schema['properties']) or 'none'}"))
             if name == "board_wait":
+                tok = (params.get("_meta") or {}).get("progressToken") if isinstance(params.get("_meta"), dict) else None
+                prog = None
+                if isinstance(tok, (str, int)) and not isinstance(tok, bool):
+                    def prog(done, total, message, tok=tok):
+                        self.send({"jsonrpc": "2.0", "method": "notifications/progress",
+                                   "params": {"progressToken": tok, "progress": done, "total": total, "message": message}})
+                text, st = fn(args, cancelled=lambda: mid in self.cancelled, progress=prog)
+            elif name == "board_snapshot":
                 text, st = fn(args, cancelled=lambda: mid in self.cancelled)
             else:
                 text, st = fn(args)
-            res = cap_result(text, st)
+            if isinstance(st, ImageResult):
+                res = cap_result(text, None)
+                res["content"].append({"type": "image", "mimeType": "image/png", "data": base64.b64encode(st.png).decode("ascii")})
+            else:
+                res = cap_result(text, st)
         except ToolError as e:
             res = {"content": [{"type": "text", "text": str(e)}], "isError": True}
         except Exception as e:   # noqa: BLE001 — so one tool's mistake does not kill the server
@@ -1558,7 +2706,8 @@ class Server:
                     self.handle(m)
                 continue
             self.handle(msg)
-        for t in self.threads:   # stdin closed — briefly wait for calls in progress
+        self.s.clear_pointers()   # stdin closed = the client is leaving: hide the cursor now, not after the joins below
+        for t in self.threads:   # briefly wait for calls in progress
             t.join(timeout=2)
 
 

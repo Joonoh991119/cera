@@ -12,6 +12,7 @@ import importlib.util
 import json
 import math
 import random
+import re
 import shutil
 import subprocess
 import unittest
@@ -352,15 +353,15 @@ class Describe(unittest.TestCase):
         want = "\n".join([
             "보드 요약 — 장 2 · 상자 3 · 글 1 · 수식 1 · 그림 0 · 연결 2 · 손글씨 획 5",
             '[장 1] "장 1" (tbpage-1)',
-            '  [boxA] 상자 "A"',
-            '  [boxB] 상자 "B"',
-            "  [math1] 수식 $\\hat\\theta = x$",
-            '  [arrAB] 연결: "A" → "B" (라벨 "예")',
-            '  [arrBC] 연결: "B" → "C"',
-            "  손글씨 획 5개(영역 x 800..900, y 500..600) — 글로 읽을 수 없음, 그림으로 볼 것",
+            '  [boxA] 상자 "A" @(100,100 160×80)',
+            '  [boxB] 상자 "B" @(500,100 160×80)',
+            "  [math1] 수식 $\\hat\\theta = x$ @(100,400 200×60)",
+            '  [arrAB] 연결: "A" → "B" (라벨 "예") @(266,140 228×0)',
+            '  [arrBC] 연결: "B" → "C" @(666,140 1188×0)',
+            "  손글씨 획 5개 @(800,500 100×100) — 글로 읽을 수 없음, board_snapshot 으로 본다",
             '[장 2] "장 2" (tbpage-2)',
-            '  [boxC] 상자 "C"',
-            '  [memo1] 글 "메모 / 둘째 줄"',
+            '  [boxC] 상자 "C" @(1860,100 160×80)',
+            '  [memo1] 글 "메모 / 둘째 줄" @(1860,300 65×54)',
         ])
         self.assertEqual(text, want)
         self.assertIn('"A" → "B"', text)
@@ -383,7 +384,8 @@ class Describe(unittest.TestCase):
         t = ak.make_text("아래 글", 0, 300, id="tx")
         line = ak.make_arrow(a[0], (500, 500), id="ar")
         text, st = ak.describe(a + [t] + line)
-        self.assertEqual(text.split("\n")[1:], ['[bx] 상자 "X"', '[tx] 글 "아래 글"', '[ar] 연결: "X" → (빈 곳)'])
+        self.assertEqual(text.split("\n")[1:], ['[bx] 상자 "X" @(0,0 160×80)', '[tx] 글 "아래 글" @(0,300 65×27)',
+                                                '[ar] 연결: "X" → (빈 곳) @(120,84 380×416)'])
         self.assertEqual(ak.describe([])[0], "보드가 비어 있다.")
 
     def test_reading_order_rows(self):
@@ -575,6 +577,90 @@ NUNITO_REAL = {"A": 0.61, "B": 0.66, "C": 0.64, "D": 0.69, "E": 0.59, "F": 0.55,
 
 def _clip_like(s, n):
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+class Wp1Rough(unittest.TestCase):
+    """09 plan WP-1 criterion 1 on the 07 eval board (tests/fixtures/rough07.json, Playwright hand-drawn): every text line carries
+    @(x,y w×h), and the 18 flow strokes come out as at most 3 group lines whose bounds cover what was drawn."""
+
+    def setUp(self):
+        d = json.loads((HERE / "tests" / "fixtures" / "rough07.json").read_text())
+        self.els, self.regions = d["elements"], d["regions"]
+
+    def test_positions_and_ink_groups(self):
+        text, st = ak.describe(self.els)
+        lines = text.split("\n")[1:]
+        at = re.compile(r" @\((-?\d+),(-?\d+) (\d+)×(\d+)\)")
+        for ln in lines:
+            self.assertRegex(ln, at, ln)
+        texts = [ln for ln in lines if ln.startswith("[")]
+        self.assertEqual(len(texts), 9)
+        self.assertIn('글 "start" @(172,95 51×33)', text)
+        flow = set(self.regions["flow"]) & {e["id"] for e in self.els if e["type"] == "freedraw"}
+        self.assertEqual(len(flow), 18)
+        hit = [g for g in st["strokes"] if flow & set(g["ids"])]
+        self.assertLessEqual(len(hit), 3)
+        self.assertEqual(sum(len(flow & set(g["ids"])) for g in hit), 18)
+        by = {e["id"]: e for e in self.els}
+        for g in st["strokes"]:
+            x, y, w, h = g["bbox"]
+            for i in g["ids"]:   # every drawn point inside the printed box — no tolerance (r1: rounding left points outside)
+                e = by[i]
+                for px, py in e["points"]:
+                    self.assertTrue(x <= e["x"] + px <= x + w and y <= e["y"] + py <= y + h, (i, px, py, g["bbox"]))
+        ink_lines = [ln for ln in lines if "손글씨 획" in ln]
+        self.assertLessEqual(len(ink_lines), ak.INK_LINES + 1)
+        self.assertEqual(sum(g["count"] for g in st["strokes"]), 115)
+        self.assertIn("board_snapshot", text)
+        self.assertNotIn("그림으로 볼 것", text)
+
+    def test_groups_fold_and_split(self):
+        # far apart → separate; touching → one even when drawn slowly or edited later (r1: no time split); > INK_LINES groups fold into one line
+        near = [dict(_stroke(i, 0, i * 15), updated=1000 + i * 9000) for i in range(3)]
+        far = [dict(_stroke(10 + i, 2000 + i * 400, 0), updated=2000) for i in range(ak.INK_LINES + 3)]
+        gs = ak.ink_groups(near + far)
+        self.assertEqual(len(gs), 1 + len(far))
+        late = dict(_stroke(99, 0, 20), updated=10 ** 13)
+        self.assertEqual(len(ak.ink_groups(near + [late])), 1)
+        slow = [dict(_stroke(200 + i, i * 30, 0), updated=i * 9000) for i in range(18)]   # 18 touching strokes, 9 s apart
+        self.assertEqual(len(ak.ink_groups(slow)), 1)
+        text, st = ak.describe(near + far)
+        self.assertEqual(sum(1 for ln in text.split("\n")[1:] if "손글씨 획" in ln), ak.INK_LINES + 1)
+        self.assertIn("그 밖 손글씨 획 4개(묶음 4)", text)
+        self.assertTrue(st["strokes"][-1]["rest"])
+
+    def test_rotated_broken_and_huge(self):
+        # r1: rotation is applied around the center; x:null gets no @; x = width = 1e308 does not crash describe
+        r = ak.make_box("rectangle", None, -100, -50, 100, 20, id="rot")[0]
+        r["angle"] = math.pi / 2
+        t = ak.make_text("회전", 0, 0, id="rt")
+        t.update(width=200, height=20, angle=math.pi / 2)
+        text, _ = ak.describe([r, t])
+        self.assertIn("[rot] 상자 @(-60,-90 20×100)", text)
+        self.assertIn('[rt] 글 "회전" @(90,-90 20×200)', text)
+        bad = ak.make_text("깨짐", 0, 0, id="bad")
+        bad["x"] = None
+        huge = ak.make_box("rectangle", None, 0, 0, 10, 10, id="huge")[0]
+        huge.update(x=1e308, width=1e308)
+        ink = dict(_stroke(1, 1e308, 0), points=[[0, 0], [1e308, 0]])
+        text, st = ak.describe([bad, huge, ink])
+        self.assertIn('[bad] 글 "깨짐"\n', text + "\n")
+        self.assertNotIn("[bad] 글 \"깨짐\" @", text)
+        self.assertIn("[huge] 상자", text)
+        text, _ = ak.describe([ink])   # r2: only broken strokes → no '그 밖' line ending in a blank position
+        self.assertIn("손글씨 획 1개(위치를 알 수 없음)", text)
+        self.assertNotIn("그 밖", text)
+        json.dumps(st)
+
+    def test_make_line_and_heads(self):
+        (ln,) = ak.make_line([(10, 20), (110, 80), (60, 0)], by="Claude")
+        self.assertEqual((ln["type"], ln["x"], ln["y"], ln["points"][-1]), ("line", 10.0, 20.0, [50.0, -20.0]))
+        self.assertEqual((ln["width"], ln["height"], ln["startArrowhead"], ln["endArrowhead"]), (100.0, 80.0, None, None))
+        self.assertEqual(ak.element_bbox(ln), (10.0, 0.0, 110.0, 80.0))
+        with self.assertRaises(ValueError):
+            ak.make_line([(0, 0)])
+        self.assertEqual(ak.ARROW_HEADS["none"], (None, None))
+        self.assertEqual(ak.ARROW_HEADS["start"], ("arrow", None))
 
 
 class Py39(unittest.TestCase):

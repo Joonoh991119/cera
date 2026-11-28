@@ -11,11 +11,13 @@ import os as _os_lang
 
 _os_lang.environ["CERA_LANG"] = "ko"   # existing assertions are Korean; set before importing server code or spawning the CLI / MCP
 
+import base64
 import http.client
 import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -149,7 +152,7 @@ class Handshake(Base):
         self.assertEqual(res["capabilities"], {"tools": {"listChanged": False}})
         tools = m.call("tools/list")["result"]["tools"]
         names = [t["name"] for t in tools]
-        self.assertEqual(len(tools), 12, names)
+        self.assertEqual(len(tools), 14, names)
         self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", n) for n in names))
         self.assertTrue(all(t["inputSchema"]["type"] == "object" for t in tools))
         self.assertTrue(next(t for t in tools if t["name"] == "board_delete")["annotations"]["destructiveHint"])
@@ -163,16 +166,16 @@ class Handshake(Base):
                                            {"kind": "arrow", "from": "a", "to": "b", "label": "예"}]})
         st = add["structuredContent"]
         self.assertEqual(set(st["created"]), {"a", "b"})
-        self.assertRegex(add["content"][0]["text"], r'\[%s\] 상자 "A"  \(v\d+ · 라벨 v1\)' % re.escape(st["created"]["a"]), "board_add 결과 글에도 판")
+        self.assertRegex(add["content"][0]["text"], r'\[%s\] 상자 "A" @\(-?\d+,-?\d+ \d+×\d+\)  \(v\d+ · 라벨 v1\)' % re.escape(st["created"]["a"]), "board_add 결과 글에도 판")
         summary = m.ok("board_read", {})["content"][0]["text"]
         self.assertIn('"A" → "B" (라벨 "예")', summary)
         # unknown tool / method, and wrong arguments
         self.assertEqual(m.call("tools/call", {"name": "nope", "arguments": {}})["error"]["code"], -32602)
         self.assertEqual(m.call("resources/list")["error"]["code"], -32601)
         self.assertEqual(m.call("ping")["result"], {})
-        bad = m.tool("board_add", {"items": [{"kind": "math", "latex": "x"}]})
+        bad = m.tool("board_add", {"items": [{"kind": "math"}]})   # WP-4: math is accepted now, but needs latex
         self.assertTrue(bad["isError"])
-        self.assertIn("수식", bad["content"][0]["text"])
+        self.assertIn("latex", bad["content"][0]["text"])
         self.assertTrue(m.tool("board_read", {"board": "../../x"})["isError"])
         # the name and AI marker shown on the human's screen -- server presence
         port, h = self.human(sid)
@@ -208,7 +211,7 @@ class Handshake(Base):
         m = self.mcp(py=str(PY39))
         r = m.init("codex-mcp-client")
         self.assertEqual(r["result"]["serverInfo"]["name"], "cera")
-        self.assertEqual(len(m.call("tools/list")["result"]["tools"]), 12)
+        self.assertEqual(len(m.call("tools/list")["result"]["tools"]), 14)
         self.assertTrue(m.tool("site_list")["isError"] is False)
 
     def test_agent_names(self):
@@ -423,10 +426,10 @@ class Flows(Base):
         """Edits using a version obtained by reading only the content text (without structuredContent). After a human edits only the label, conflict and
         the human's text is kept. Changing text without a base gives refused and the board is unchanged. Moving works without a base."""
         text = self.m.ok("board_read", {})["content"][0]["text"]
-        m = re.search(r"\[%s\] 상자 \"A\"  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
+        m = re.search(r"\[%s\] 상자 \"A\" @\(-?\d+,-?\d+ \d+×\d+\)  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
         self.assertIsNotNone(m, text)
         bv, lv = int(m.group(1)), int(m.group(2))
-        self.assertRegex(text, r"\[%s\] 연결: \"A\" → \"B\"  \(v\d+\)" % re.escape(self.arrow))
+        self.assertRegex(text, r"\[%s\] 연결: \"A\" → \"B\" @\(-?\d+,-?\d+ \d+×\d+\)  \(v\d+\)" % re.escape(self.arrow))
         lab = self.els()[self.a + "-label"]
         human = dict(lab, text="사람 글", originalText="사람 글", version=lab["version"] + 1, versionNonce=11)
         raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "h", "elements": [human]})
@@ -447,7 +450,7 @@ class Flows(Base):
         self.assertRegex(r["content"][0]["text"], r"고침  \(v\d+ · 라벨 v\d+\)")
         # works with the re-read version
         text = self.m.ok("board_read", {})["content"][0]["text"]
-        m = re.search(r"\[%s\] 상자 \"사람 글\"  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
+        m = re.search(r"\[%s\] 상자 \"사람 글\" @\(-?\d+,-?\d+ \d+×\d+\)  \(v(\d+) · 라벨 v(\d+)\)" % re.escape(self.a), text)
         r = self.m.ok("board_update", {"changes": [{"id": self.a, "base_version": int(m.group(1)), "label_base_version": int(m.group(2)),
                                                     "text": "에이전트 글"}]})
         self.assertEqual(r["structuredContent"]["results"][0]["status"], "ok")
@@ -558,6 +561,403 @@ def _strings(o):
             yield from _strings(v)
 
 
+def _ink(i, x, y, version=1, w=60, updated=1):
+    return {"id": "hs%03d" % i, "type": "freedraw", "x": x, "y": y, "width": w, "height": 20, "angle": 0, "isDeleted": False,
+            "points": [[0, 0], [w / 2, 10], [w, 20]], "pressures": [], "simulatePressure": True, "version": version,
+            "versionNonce": 1000 + i * 7 + version, "strokeColor": "#1e1e1e", "index": None, "updated": updated}
+
+
+class Wp1(Base):
+    """09 plan WP-1: positions in the summary, arrow heads / lines, refusing unknown fields, the board_wait settle window,
+    per-client caps + progress, and the agent cursor (placed outside the group, hidden when the MCP process ends)."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "러프"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", self.h, {"client": "hum1", "pointer": {"x": 0, "y": 0}})
+
+    def board(self):
+        return raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]
+
+    def put(self, els):
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": els})[0], 200)
+
+    def agent_pointer(self):
+        st, d = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/poll?since=0&client=watch&pver=-1&wait=0.1", self.h)
+        ag = [p for p in d.get("presence") or [] if p.get("agent")]
+        return next((p["pointer"] for p in ag if p.get("pointer")), None)   # an agent that left stays listed (pointer null) for up to 30 s
+
+    def test_heads_line_and_unknown_fields(self):
+        """Criterion 2: head none → no arrowheads, both → two; an unknown field (heads) is refused with the allowed list and nothing is written."""
+        r = self.m.ok("board_add", {"items": [{"kind": "box", "ref": "a", "label": "A"}, {"kind": "box", "ref": "b", "label": "B", "x": 300},
+                                              {"kind": "arrow", "ref": "n", "from": "a", "to": "b", "head": "none"},
+                                              {"kind": "arrow", "ref": "w", "from": "b", "to": "a", "head": "both"},
+                                              {"kind": "line", "ref": "l", "points": [[0, 200], [100, 260], [300, 200]]}]})
+        c = r["structuredContent"]["created"]
+        els = {e["id"]: e for e in self.board()["elements"]}
+        self.assertIsNone(els[c["n"]]["endArrowhead"])
+        self.assertIsNone(els[c["n"]]["startArrowhead"])
+        self.assertEqual((els[c["w"]]["startArrowhead"], els[c["w"]]["endArrowhead"]), ("arrow", "arrow"))
+        ln = els[c["l"]]
+        self.assertEqual((ln["type"], len(ln["points"]), ln["startBinding"], ln["endArrowhead"]), ("line", 3, None, None))
+        text = self.m.ok("board_read", {})["content"][0]["text"]
+        self.assertRegex(text, r'\[%s\] 연결: "A" — "B" @\(' % re.escape(c["n"]))
+        self.assertRegex(text, r'\[%s\] 연결: "B" ↔ "A" @\(' % re.escape(c["w"]))
+        seq = self.board()["seq"]
+        bad = self.m.tool("board_add", {"items": [{"kind": "box", "ref": "x", "label": "X"},
+                                                  {"kind": "arrow", "from": "x", "to": "x", "heads": "none"}]})
+        self.assertTrue(bad["isError"])
+        msg = bad["content"][0]["text"]
+        self.assertIn("heads", msg)
+        self.assertIn("head", msg.split("쓸 수 있는 칸:")[1])
+        self.assertEqual(self.board()["seq"], seq, "nothing was written")
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "arrow", "from": {"x": 0, "y": 0}, "to": {"x": 9, "y": 9}, "head": "up"}]})["isError"])
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "line", "points": [[0, 0]]}]})["isError"])
+        # r1: head:null is not "none" — refused instead of silently drawing the default arrowhead
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "arrow", "from": {"x": -30, "y": 100}, "to": {"x": 0, "y": 0}, "head": None}]})["isError"])
+        # r1: arrows do not bind to a line (new ref or existing id)
+        r = self.m.tool("board_add", {"items": [{"kind": "line", "ref": "l2", "points": [[0, 0], [50, 0]]}, {"kind": "arrow", "from": "l2", "to": {"x": 90, "y": 90}}]})
+        self.assertTrue(r["isError"])
+        self.assertIn("line", r["content"][0]["text"])
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "arrow", "from": c["l"], "to": {"x": 90, "y": 90}}]})["isError"])
+        self.assertEqual(self.board()["seq"], seq)
+
+    def test_wait_settles_and_folds_smoothing_echo(self):
+        """Criterion 3: 18 strokes at < 1 s intervals, each re-written once by smoothing → idle_ms 3000 returns once,
+        3 s after the last stroke, with one ink line and no resized / edited lines."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        done = []
+
+        def draw():
+            time.sleep(0.5)
+            for i in range(18):
+                self.put([_ink(i, 100 + (i % 6) * 70, 100 + (i // 6) * 60)])
+                time.sleep(0.15)
+                self.put([_ink(i, 100 + (i % 6) * 70, 100 + (i // 6) * 60, version=2, w=62)])   # smoothing re-write
+                last = time.time()
+                time.sleep(0.5)
+            done.append(last)
+        threading.Thread(target=draw, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "idle_ms": 3000, "timeout_s": 60}, timeout=90)
+        back = time.time()
+        self.assertTrue(done, "returned before the drawing ended")
+        self.assertGreaterEqual(back - done[0], 2.8)
+        text = r["content"][0]["text"]
+        self.assertIn("손글씨 획 18개가 늘었다 @(", text)
+        self.assertRegex(text.split("\n")[0], r"^길동 가 획 18 을 더함 @\(100,100 \d+×\d+\)$")
+        self.assertNotIn("크기", text)
+        self.assertNotIn("고침", text)
+        self.assertEqual(r["structuredContent"]["changes"][0]["count"], 18)
+        # idle 0: the first stroke wakes it; the smoothing echo of that stroke within 2 s does not wake the next wait
+        seq = r["structuredContent"]["seq"]
+
+        def one():
+            time.sleep(0.5)
+            self.put([_ink(50, 0, 600)])
+        threading.Thread(target=one, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 10})
+        self.assertIn("손글씨 획 1개가 늘었다", r["content"][0]["text"])
+        self.put([_ink(50, 0, 600, version=2, w=64)])
+        r = self.m.ok("board_wait", {"since_seq": r["structuredContent"]["seq"], "timeout_s": 2})
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+
+    def test_wait_kinds(self):
+        """kinds:["text"] ignores ink and returns on text."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def act():
+            time.sleep(0.4)
+            self.put([_ink(1, 0, 0)])
+            time.sleep(0.6)
+            self.put([{"id": "ht1", "type": "text", "x": 0, "y": 100, "width": 40, "height": 25, "angle": 0, "text": "메모",
+                       "originalText": "메모", "fontSize": 20, "fontFamily": 6, "isDeleted": False, "version": 1, "versionNonce": 5,
+                       "index": None, "containerId": None}])
+        threading.Thread(target=act, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "kinds": ["text"], "timeout_s": 10})
+        text = r["content"][0]["text"]
+        self.assertIn('"메모"', text)
+        self.assertNotIn("손글씨", text)
+        self.assertTrue(self.m.tool("board_wait", {"kinds": ["request"], "timeout_s": 1})["isError"])
+
+    def test_wait_ignores_job_events(self):
+        """WP-2 tab-render jobs publish 'job' events on /poll — they must not wake board_wait nor show up as human changes."""
+        out = subprocess.run([sys.executable, str(CLI), "agent", "add", self.sid, "--name", "Other", "--json"], env=self.env,
+                             capture_output=True, text=True).stdout
+        tok = json.loads(out)["token"]
+        time.sleep(1.2)   # the supervisor re-reads state.json
+        ah = {"Authorization": f"Bearer {tok}", "X-Whiteboard": "1", "Content-Type": "application/json"}
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def jobs():
+            for _ in range(3):
+                time.sleep(0.5)
+                st, _ = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs", ah, {"client": "ag-other", "kind": "render", "args": {}})
+                self.assertEqual(st, 201)
+        th = threading.Thread(target=jobs, daemon=True)
+        th.start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 4})
+        th.join()
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+        self.assertEqual(r["structuredContent"]["changes"], [])
+        # a human edit after the jobs still wakes it, and only that edit is reported
+        threading.Thread(target=lambda: (time.sleep(0.5), self.put([_ink(7, 0, 0)])), daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 10})
+        self.assertEqual([c["action"] for c in r["structuredContent"]["changes"]], ["손글씨"])
+
+    def test_wait_cap_env_and_progress(self):
+        """Criterion 4 (fast form): CERA_WAIT_MAX caps timeout_s; progress notifications every 20 s carry the client's token."""
+        m = self.mcp({**self.env, "CERA_WAIT_MAX": "2"})
+        m.init("codex-mcp-client")
+        t0 = time.time()
+        r = m.ok("board_wait", {"timeout_s": 600})
+        self.assertTrue(r["structuredContent"]["timeout"])
+        self.assertLess(time.time() - t0, 6)
+        m = self.m   # claude-code, no override
+        t0 = time.time()
+        m.n += 1
+        mid = m.n
+        m.send({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                "params": {"name": "board_wait", "arguments": {"timeout_s": 23}, "_meta": {"progressToken": "pt-1"}}})
+        got, deadline = [], time.time() + 60
+        while True:
+            msg = m.q.get(timeout=max(0.1, deadline - time.time()))
+            if msg.get("method") == "notifications/progress":
+                got.append((time.time() - t0, msg["params"]))
+            if msg.get("id") == mid:
+                break
+        self.assertTrue(msg["result"]["structuredContent"]["timeout"])
+        self.assertEqual(len(got), 1, got)
+        self.assertEqual(got[0][1]["progressToken"], "pt-1")
+        self.assertEqual(got[0][1]["total"], 23)
+
+    # ---- review r1 regressions (04_review_WP-1_neon_r1 · opus_r1)
+    def presence(self, client, name):
+        h = dict(self.h, **{"X-Tb-Name": urllib.parse.quote(name)})
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", h, {"client": client, "pointer": {"x": 0, "y": 0}})
+
+    def test_r1_replay_old_seq_uses_board_as_seen(self):
+        """neon: since_seq older than now compared with the current board → an added stroke showed as 'edited', a delete vanished."""
+        seq0 = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([_ink(1, 0, 0)])
+        r = self.m.ok("board_wait", {"since_seq": seq0, "timeout_s": 5})
+        self.assertIn("손글씨 획 1개가 늘었다", r["content"][0]["text"])
+        self.assertNotIn("고침", r["content"][0]["text"])
+        seq1 = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([dict(_ink(1, 0, 0), version=5, versionNonce=9, isDeleted=True)])
+        r = self.m.ok("board_wait", {"since_seq": seq1, "timeout_s": 5})
+        self.assertIn("를 지움", r["content"][0]["text"])
+        self.assertFalse(r["structuredContent"].get("timeout"))
+
+    def test_r2_human_moves_or_deletes_agent_box_after_replay_seq(self):
+        """opus r2: board_read → board_add → board_wait(since_seq=read's seq): a person moving the agent's box is 'moved'
+        (not 'added'), and deleting it is reported (not dropped). Same for board_update / board_delete writes."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        add = self.m.ok("board_add", {"items": [{"kind": "box", "ref": "a", "label": "A"}, {"kind": "box", "ref": "b", "label": "B", "x": 300}]})
+        a, b = add["structuredContent"]["created"]["a"], add["structuredContent"]["created"]["b"]
+        els = {e["id"]: e for e in self.board()["elements"]}
+        self.put([dict(els[a], x=els[a]["x"] + 200, version=els[a]["version"] + 1, versionNonce=77)])
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 5})
+        text = r["content"][0]["text"]
+        self.assertIn(f"[{a}] 상자 를 옮김", text)
+        self.assertNotIn("넣음", text)
+        self.assertNotIn("더함", text)
+        seq2 = r["structuredContent"]["seq"]
+        self.m.ok("board_update", {"changes": [{"id": b, "dx": 40}]})   # the agent's own patch
+        els = {e["id"]: e for e in self.board()["elements"]}
+        self.put([dict(els[b], isDeleted=True, version=els[b]["version"] + 1, versionNonce=78)])
+        r = self.m.ok("board_wait", {"since_seq": seq2, "timeout_s": 5})
+        self.assertFalse(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+        self.assertIn(f"[{b}] 상자 를 지움", r["content"][0]["text"])
+        self.assertNotIn("옮김", r["content"][0]["text"], "the agent's own dx is not reported as a person's move")
+
+    def test_r1_cap_while_drawing_is_flagged(self):
+        """neon: reaching the cap while the person is still drawing must not look like a settled sketch."""
+        m = self.mcp({**self.env, "CERA_WAIT_MAX": "3"})
+        m.init("codex-mcp-client")
+        seq = m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def draw():
+            for i in range(10):
+                self.put([_ink(300 + i, i * 40, 0)])
+                time.sleep(0.5)
+        th = threading.Thread(target=draw, daemon=True)
+        th.start()
+        t0 = time.time()
+        r = m.ok("board_wait", {"since_seq": seq, "idle_ms": 3000, "timeout_s": 600})
+        self.assertLess(time.time() - t0, 4.5)
+        th.join()
+        self.assertIs(r["structuredContent"].get("settled"), False)
+        self.assertIn("아직 그리는 중", r["content"][0]["text"])
+        self.assertIn(f"since_seq={r['structuredContent']['seq']}", r["content"][0]["text"])   # r2: says which seq to use
+
+    def test_r1_echo_by_element_clock_not_read_time(self):
+        """opus: stroke → 100 ms smoothing echo → reported → the agent thinks 3 s → next wait must not wake on the echo."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([_ink(60, 0, 600, updated=50_000)])
+        time.sleep(0.1)
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 5})
+        self.assertIn("손글씨 획 1개가 늘었다", r["content"][0]["text"])
+        self.put([_ink(60, 0, 600, version=2, w=64, updated=50_100)])
+        time.sleep(3)
+        r = self.m.ok("board_wait", {"since_seq": r["structuredContent"]["seq"], "timeout_s": 2})
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+
+    def test_r1_echo_needs_same_connection_and_place(self):
+        """neon: another connection with the same display name moving the stroke is a real change, not an echo."""
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+        self.put([_ink(61, 0, 0, updated=70_000)])
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 5})
+        self.presence("hum2", "길동")
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum2", "elements": [_ink(61, 500, 0, version=2, updated=70_500)]})[0], 200)
+        r = self.m.ok("board_wait", {"since_seq": r["structuredContent"]["seq"], "timeout_s": 5})
+        self.assertIn("옮김", r["content"][0]["text"])
+
+    def test_r1_window_keeps_first_author_and_names_later_editor(self):
+        """neon: in the settle window the last editor replaced the author ('수진 added …'). Now 길동 added, 수진 edited after."""
+        self.presence("hum3", "수진")
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def act():
+            time.sleep(0.3)
+            self.put([_ink(62, 0, 0)])
+            time.sleep(0.5)
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                {"client": "hum3", "elements": [_ink(62, 300, 0, version=2, updated=99_000)]})
+        threading.Thread(target=act, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "idle_ms": 1500, "timeout_s": 10})
+        text = r["content"][0]["text"]
+        self.assertTrue(text.startswith("길동 가 획 1 을 더함"), text)
+        self.assertIn("뒤에 수진 가 고침", text)
+
+    def test_r1_other_agents_do_not_wake(self):
+        """neon: another agent's write (presence agent:true) is not a person's edit."""
+        out = subprocess.run([sys.executable, str(CLI), "agent", "add", self.sid, "--name", "Other", "--json"], env=self.env,
+                             capture_output=True, text=True).stdout
+        ah = {"Authorization": f"Bearer {json.loads(out)['token']}", "X-Whiteboard": "1", "Content-Type": "application/json"}
+        time.sleep(1.2)
+        seq = self.m.ok("board_read", {})["structuredContent"]["seq"]
+
+        def act():
+            time.sleep(0.4)
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", ah, {"client": "otherbot1", "pointer": {"x": 1, "y": 1}})
+            time.sleep(0.3)
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", ah, {"client": "otherbot1", "elements": [_ink(63, 0, 0)]})
+        threading.Thread(target=act, daemon=True).start()
+        r = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 3})
+        self.assertTrue(r["structuredContent"].get("timeout"), r["content"][0]["text"])
+
+    def test_r1_cursor_cleared_on_close_during_wait_and_on_kill(self):
+        """opus: stdin closed while two board_waits run → cursor gone within 2 s (not after the joins). neon: SIGKILL → watchdog clears it."""
+        self.m.ok("board_add", {"items": [{"kind": "text", "text": "a"}], "at": {"x": 0, "y": 0}})
+        for k in (1, 2):
+            self.m.send({"jsonrpc": "2.0", "id": 900 + k, "method": "tools/call", "params": {"name": "board_wait", "arguments": {"timeout_s": 30}}})
+        time.sleep(1.0)
+        self.assertIsNotNone(self.agent_pointer())
+        self.m.p.stdin.close()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 6:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+        m = self.mcp()
+        m.init()
+        m.ok("board_add", {"items": [{"kind": "text", "text": "b"}], "at": {"x": 0, "y": 900}})
+        self.assertIsNotNone(self.agent_pointer())
+        m.p.kill()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 6:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_cursor_outside_group_and_cleared_on_exit(self):
+        """Criterion 5: after board_add the agent cursor sits 24 px outside the top-left of the group; it is gone within 2 s of the MCP process ending."""
+        r = self.m.ok("board_add", {"items": [{"kind": "box", "label": "A", "x": 0, "y": 0}], "at": {"x": 500, "y": 400}})
+        self.assertEqual(self.agent_pointer()["x"], 476)
+        self.assertEqual(self.agent_pointer()["y"], 376)
+        self.m.p.stdin.close()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 5:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+        # SIGTERM path
+        m = self.mcp()
+        m.init()
+        m.ok("board_add", {"items": [{"kind": "text", "text": "x"}], "at": {"x": 0, "y": 900}})
+        self.assertIsNotNone(self.agent_pointer())
+        m.p.terminate()
+        t0 = time.time()
+        while self.agent_pointer() is not None and time.time() - t0 < 5:
+            time.sleep(0.1)
+        self.assertLess(time.time() - t0, 2.0)
+
+
+class SlowPoll(Base):
+    """neon r1: a board server that answers /poll late must not push board_wait past the client's cap (HTTP timeout bounded by the deadline)."""
+
+    def test_stuck_poll_respects_cap(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if "/poll" in self.path:
+                    time.sleep(8)
+                body = json.dumps({"elements": [], "seq": 0, "epoch": "e1", "meta": {"title": "x"}, "events": []}).encode()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            m = self.mcp({**self.env, "CERA_URL": f"http://127.0.0.1:{srv.server_address[1]}", "CERA_TOKEN": "tb_ag_fake", "CERA_WAIT_MAX": "3"})
+            m.init("codex-mcp-client")
+            t0 = time.time()
+            r = m.ok("board_wait", {"board": "abcdefgh12", "timeout_s": 600}, timeout=30)
+            self.assertLess(time.time() - t0, 5.0)
+            self.assertTrue(r["structuredContent"]["timeout"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class WaitCap(unittest.TestCase):
+    """B7: per-client cap on one board_wait (criterion 4 runs live in the WP-1 report; 50 / 55 s is too slow for the suite)."""
+
+    def test_caps(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cera_tb_mcp_cap", HERE / "server" / "tb_mcp.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        old = os.environ.pop("CERA_WAIT_MAX", None)
+        try:
+            self.assertEqual(mod.wait_cap("claude-code"), 600)
+            self.assertEqual(mod.wait_cap("codex-mcp-client"), 50)
+            self.assertEqual(mod.wait_cap("antigravity"), 55)
+            self.assertEqual(mod.wait_cap(None), 55)
+            self.assertEqual(mod.wait_cap("claude-code-preview"), 55)   # r1: exact names only
+            self.assertEqual(mod.wait_cap("codex-other"), 55)
+            os.environ["CERA_WAIT_MAX"] = "90"
+            self.assertEqual(mod.wait_cap("codex-mcp-client"), 90)
+            os.environ["CERA_WAIT_MAX"] = "abc"
+            self.assertEqual(mod.wait_cap("codex-mcp-client"), 50)
+        finally:
+            os.environ.pop("CERA_WAIT_MAX", None)
+            if old is not None:
+                os.environ["CERA_WAIT_MAX"] = old
+
+
 class English(Base):
     """CERA_LANG=en: everything the server tells the model is English (board data the test wrote is excepted)."""
 
@@ -572,7 +972,7 @@ class English(Base):
         self.assertIsNone(HANGUL.search(res["instructions"]), res["instructions"])
         self.assertIsNone(HANGUL.search(res["serverInfo"]["title"]))
         tools = m.call("tools/list")["result"]["tools"]
-        self.assertEqual(len(tools), 12)
+        self.assertEqual(len(tools), 14)
         for t in tools:
             for s in _strings(t):
                 self.assertIsNone(HANGUL.search(s), (t["name"], s))
@@ -587,7 +987,7 @@ class English(Base):
         created = add["structuredContent"]["created"]
         add_text = add["content"][0]["text"]
         self.assertIn("Added 7 item(s)", add_text)
-        self.assertRegex(add_text, r'\[%s\] box "A"  \(v\d+ · label v1\)' % re.escape(created["a"]))
+        self.assertRegex(add_text, r'\[%s\] box "A" @\(-?\d+,-?\d+ \d+×\d+\)  \(v\d+ · label v1\)' % re.escape(created["a"]))
         summary = m.ok("board_read", {})["content"][0]["text"]
         self.assertIn("Board summary", summary)
         self.assertIn('"A" → "B" (label "yes")', summary)
@@ -656,7 +1056,7 @@ class Remote(Base):
         m.init("some-remote-agent")
         names = [t["name"] for t in m.call("tools/list")["result"]["tools"]]
         self.assertFalse([n for n in names if n.startswith("site_")])
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 11)
         self.assertNotIn("site", json.dumps([t["inputSchema"] for t in m.call("tools/list")["result"]["tools"]]))
         self.assertEqual(m.call("tools/call", {"name": "site_open", "arguments": {}})["error"]["code"], -32602)
         r = m.ok("board_add", {"items": [{"kind": "box", "label": "원격 상자"}]})
@@ -793,7 +1193,7 @@ class RemoteAccess(Base):
             m = self.mcp(env)
             m.init("codex-mcp-client")
             names = [t["name"] for t in m.call("tools/list")["result"]["tools"]]
-            self.assertEqual(len(names), 9)
+            self.assertEqual(len(names), 11)
             self.assertFalse([n for n in names if n.startswith("site_")])
             self.assertIn("보드가 없다", m.ok("board_list", {})["content"][0]["text"])
             h = {k.lower(): v for k, v in cap.seen[-1].items()}
@@ -802,7 +1202,7 @@ class RemoteAccess(Base):
             # with only a URL and no credentials: it starts in remote mode (without touching the local site) but tools return a guidance error
             m2 = self.mcp({**self.env, "CERA_URL": f"http://127.0.0.1:{cap.port}"})
             m2.init()
-            self.assertEqual(len(m2.call("tools/list")["result"]["tools"]), 9)
+            self.assertEqual(len(m2.call("tools/list")["result"]["tools"]), 11)
             r = m2.tool("board_list", {})
             self.assertTrue(r["isError"])
             self.assertIn("CF_ACCESS_CLIENT_ID", r["content"][0]["text"])
@@ -811,6 +1211,903 @@ class RemoteAccess(Base):
         finally:
             cap.httpd.shutdown()
             cap.httpd.server_close()
+
+
+class Wp3(Base):
+    """09 plan WP-3: board_snapshot (tab render first, server raster otherwise; text + image, no structuredContent, PNG file 0600)
+    and board_selection (each person's last selection, 60 s)."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "보기"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+        fix = json.loads((HERE / "tests" / "fixtures" / "rough07.json").read_text(encoding="utf-8"))
+        self.regions = fix["regions"]
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": fix["elements"]})[0], 200)
+
+    def presence(self, client, **data):
+        self.assertIn(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", self.h, {"client": client, **data})[0], (200, 204))
+
+    def snap(self, args, timeout=60):
+        res = self.m.tool("board_snapshot", args, timeout)
+        return res
+
+    def check_image(self, res, edge=1024):
+        self.assertFalse(res.get("isError"), res["content"][0]["text"])
+        self.assertNotIn("structuredContent", res)
+        self.assertEqual([c["type"] for c in res["content"]], ["text", "image"])
+        img = res["content"][1]
+        self.assertEqual(img["mimeType"], "image/png")
+        png = __import__("base64").b64decode(img["data"])
+        w, h = __import__("struct").unpack(">II", png[16:24])
+        self.assertLessEqual(max(w, h), edge)
+        text = res["content"][0]["text"]
+        path = Path(re.search(r"파일: (\S+\.png)", text).group(1))
+        self.assertEqual(path.read_bytes(), png)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent, self.home / "snapshots")
+        return text, png, path
+
+    def test_server_raster_when_no_tab(self):
+        """Criteria 2, 3, 6: no person's tab → renderer: server; text + image only; file 0600; the text alone gives positions."""
+        t = time.time()
+        res = self.snap({"ids": self.regions["flow"]})
+        self.assertLess(time.time() - t, 3)
+        text, png, path = self.check_image(res)
+        self.assertIn("renderer: server", text)
+        self.assertIn("열린 사람 편집 탭이 없음", text)
+        m = re.search(r"보드 = \(x0 \+ px/s, y0 \+ py/s\) = \((-?[\d.]+) \+ px/([\d.e-]+), (-?[\d.]+) \+ py/([\d.e-]+)\)", text)
+        self.assertTrue(m, text)
+        self.assertIn("담긴 요소 26개", text)
+        # a text-only client: label lines and stroke groups carry board boxes
+        self.assertRegex(text, r'"[^"]+" @\(-?\d+,-?\d+ \d+×\d+\)')
+        self.assertRegex(text, r"손글씨 획 \d+개 @\(")
+        whole = self.check_image(self.snap({"render": "server", "max_edge": 1568}), 1568)[0]
+        self.assertIn("담긴 요소 124개", whole)
+        self.assertTrue(self.snap({"render": "tab"})["isError"])   # forced tab with no tab: an error that names render:"server"
+
+    def test_region_page_and_bad_args(self):
+        text = self.check_image(self.snap({"region": {"x": -10000, "y": -10000, "w": 20000, "h": 20000}, "max_edge": 256}), 256)[0]
+        self.assertIn("담긴 요소 124개", text)
+        r = self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "p"}, {"kind": "box", "label": "안"}]})
+        text = self.check_image(self.snap({"page": 1}))[0]
+        self.assertIn('"안"', text)
+        for bad in ({"ids": ["a"], "region": {"x": 0, "y": 0, "w": 1, "h": 1}}, {"page": 99}, {"ids": ["nope"]}, {"max_edge": 100},
+                    {"render": "gpu"}, {"who": "길동"}, {"selection": True}, {"ids": []}, {"pad": -1}):
+            res = self.snap(bad)
+            self.assertTrue(res["isError"], bad)
+            self.assertNotIn("structuredContent", res)
+
+    def fake_tab(self, mode="ok"):
+        """A person's edit tab that claims render jobs. ok: draws the requested scene with the raster (real PNG, coordinates and scene tag);
+        oversize: a valid PNG larger than max_edge; badtag: right picture, tag of another scene; silent: claims nothing."""
+        self.presence("tab1", pointer={"x": 0, "y": 0})
+        seen, stop = [], threading.Event()
+
+        def run():
+            try:
+                loop()
+            except OSError:   # the board server stopped at tearDown
+                pass
+
+        def loop():
+            while not stop.is_set():
+                st, d = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/jobs", self.h)
+                for j in (d or {}).get("jobs") or []:
+                    if mode == "silent":
+                        continue
+                    st, c = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/claim", self.h, {"client": "tab1", "prio": "high"})
+                    if st != 200:
+                        continue
+                    a = c["args"]
+                    seen.append(a)
+                    els = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+                    region = a.get("region")
+                    picked = RS.pick(els, ids=a.get("ids"), region=region and (region["x"], region["y"], region["w"], region["h"]))[0]
+                    out = RS.render(picked, max_edge=a["max_edge"], scale=a.get("scale"), pad=a["pad"],
+                                    crop=region and (region["x"], region["y"], region["w"], region["h"]))
+                    png = out["png"] if mode != "oversize" else RS.png_bytes(a["max_edge"] + 44, 10, bytes([255]) * ((a["max_edge"] + 44) * 10))
+                    tag = RS.scene_tag(picked) if mode != "badtag" else "1-00000000"
+                    raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/result", self.h,
+                        {"client": "tab1", "lease": c["lease"], "ok": True,
+                         "data": {"png": __import__("base64").b64encode(png).decode(), "width": out["width"], "height": out["height"],
+                                  "scale": out["scale"], "x0": out["x0"], "y0": out["y0"], "count": len(picked), "tag": tag, "renderer": "tab"}})
+                time.sleep(0.05)
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+
+        def done():
+            stop.set()
+            th.join(2)
+        self.addCleanup(done)
+        return seen, done
+
+    def test_tab_render_first(self):
+        """Criterion 1 (server side): with a person's edit tab attached the tab draws it (renderer: tab), the job carries the ids and a scale;
+        the words describe the same scene the tab drew (scene tag)."""
+        seen, done = self.fake_tab()
+        t = time.time()
+        res = self.snap({"ids": self.regions["flow"]})
+        self.assertLess(time.time() - t, 3)
+        text, png, _ = self.check_image(res)
+        self.assertIn("renderer: tab", text)
+        self.assertIn("담긴 요소 26개", text)
+        self.assertEqual(seen[0]["ids"], self.regions["flow"])
+        self.assertTrue(0.25 <= seen[0]["scale"] <= 4 and seen[0]["mono"] is True and seen[0]["max_edge"] == 1024)
+        self.assertIn("renderer: server", self.check_image(self.snap({"render": "server", "ids": self.regions["F1"]}))[0])
+        done()
+        # a tab that is present but never answers: auto falls back to the server raster after 6 s
+        t = time.time()
+        text = self.check_image(self.snap({"ids": self.regions["F1"]}))[0]
+        self.assertTrue(5.5 < time.time() - t < 8, time.time() - t)
+        self.assertIn("renderer: server", text)
+        self.assertIn("탭 대신 서버로 그림", text)
+
+    def test_r1_tab_picture_over_max_edge_is_refused(self):
+        """r1: a valid PNG wider than max_edge from a tab is not passed on (retry smaller, then the server raster)."""
+        seen, _ = self.fake_tab("oversize")
+        text, png, _ = self.check_image(self.snap({"ids": self.regions["F1"], "max_edge": 256}), 256)
+        self.assertIn("renderer: server", text)
+        self.assertIn("상한", text)
+        self.assertEqual(len(seen), 2)   # once at 256, once smaller
+
+    def test_r1_tab_scene_differs(self):
+        """r1: the tab drew another scene than the board (tag) -> server raster, which is described with the same elements."""
+        self.fake_tab("badtag")
+        text = self.check_image(self.snap({"ids": self.regions["F1"]}))[0]
+        self.assertIn("renderer: server", text)
+        self.assertIn("탭이 그린 장면이 보드와 달랐다", text)
+        self.assertIn("담긴 요소 13개", text)
+
+    def test_r1_region_in_page_crops_tab_and_raster(self):
+        """r1 (Opus): a small region inside a page is pictured as the region (letters stay readable), by the tab and by the raster."""
+        self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "p", "x": -2000, "y": -2000}]})
+        els = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+        fr = next(e for e in els if e["type"] == "frame")
+        big = {**fr, "x": -3000, "y": -3000, "width": 9000, "height": 9000, "version": fr["version"] + 1}
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": [big]})[0], 200)
+        f1 = [e for e in els if e["id"] in self.regions["F1"]]
+        x0 = min(RS.element_box(e)[0] for e in f1)
+        y0 = min(RS.element_box(e)[1] for e in f1)
+        reg = {"x": x0 - 5, "y": y0 - 5, "w": 200, "h": 120}
+        for mode in ("server", "auto"):
+            if mode == "auto":
+                self.fake_tab()
+            text, png, _ = self.check_image(self.snap({"region": reg, "render": mode}))
+            self.assertIn("renderer: " + ("server" if mode == "server" else "tab"), text)
+            w, h = struct.unpack(">II", png[16:24])
+            s = float(re.search(r"py/([\d.]+)\)", text).group(1))
+            self.assertLessEqual(w / s, 200 + 1e-3)
+            self.assertGreater(s, 1.0, text)   # not shrunk to the 9000-unit page
+
+    def test_selection(self):
+        """Criterion 5: last non-empty selection survives deselecting, per person (who), agents excluded; snapshot selection:true uses it."""
+        three = self.regions["note"][:3]
+        self.assertIn("고른 것 없음", self.m.ok("board_selection", {})["content"][0]["text"])
+        self.presence("hum1", selected={i: True for i in three})
+        time.sleep(1.1)
+        self.presence("hum1", selected={})
+        h2 = {**self.h, "X-Tb-Name": urllib.parse.quote("민수")}
+        self.assertIn(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", h2,
+                      {"client": "hum2", "selected": {self.regions["F1"][0]: True}})[0], (200, 204))
+        r = self.m.ok("board_selection", {})
+        rows = r["structuredContent"]["selections"]
+        self.assertEqual([x["user"] for x in rows], ["민수", "길동"])
+        gd = rows[1]
+        self.assertEqual(sorted(gd["ids"]), sorted(three))
+        self.assertGreaterEqual(gd["age_s"], 1.0)
+        self.assertFalse(gd["current"])
+        self.assertEqual(len(gd["bbox"]), 4)
+        self.assertIn("길동: 3개 @(", r["content"][0]["text"])
+        only = self.m.ok("board_selection", {"who": "길동"})["structuredContent"]["selections"]
+        self.assertEqual([x["user"] for x in only], ["길동"])
+        self.assertIn("고른 것 없음", self.m.ok("board_selection", {"who": "nobody"})["content"][0]["text"])
+        text = self.check_image(self.snap({"selection": True, "who": "길동"}))[0]
+        self.assertIn("담긴 요소 3개", text)
+        self.assertIn("길동 가 고른 것(3개", text)
+
+    def test_keep_50_and_delete_with_site(self):
+        for _ in range(53):
+            self.check_image(self.snap({"ids": self.regions["F2"], "render": "server", "max_edge": 256}), 256)
+        snaps = sorted((self.home / "snapshots").glob(f"{self.sid}-*.png"))
+        self.assertEqual(len(snaps), 50)
+        self.assertFalse((self.home / "snapshots" / f"{self.sid}-{self.bid}-1.png").exists())
+        self.assertTrue((self.home / "snapshots" / f"{self.sid}-{self.bid}-53.png").exists())
+        other = self.home / "snapshots" / "zzother-abcdefgh-1.png"
+        other.write_bytes(b"x")
+        self.m.close()
+        subprocess.run([sys.executable, str(CLI), "stop", self.sid], env=self.env, capture_output=True, timeout=60)
+        p = subprocess.run([sys.executable, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(list((self.home / "snapshots").glob(f"{self.sid}-*.png")), [])
+        self.assertTrue(other.exists())
+
+    def test_r1_selection_who_exact_and_deleted(self):
+        """r1: an exact who wins over a longer name containing it; a part matching several people is refused for a snapshot;
+        selected-then-deleted elements are not listed as ids."""
+        def sel(name, client, ids):
+            h = {**self.h, "X-Tb-Name": urllib.parse.quote(name)}
+            self.assertIn(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", h,
+                              {"client": client, "selected": {i: True for i in ids}})[0], (200, 204))
+        sel("Ann", "c_ann", self.regions["F2"][:2])
+        time.sleep(0.05)
+        sel("Anna", "c_anna", self.regions["F3"][:3])
+        text = self.check_image(self.snap({"selection": True, "who": "Ann"}))[0]
+        self.assertIn("Ann 가 고른 것(2개", text)
+        self.assertTrue(self.snap({"selection": True, "who": "An"})["isError"])
+        gone = self.regions["F2"][0]
+        el = next(e for e in raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"] if e["id"] == gone)
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": [{**el, "isDeleted": True, "version": el["version"] + 1}]})[0], 200)
+        r = self.m.ok("board_selection", {"who": "Ann"})
+        row = r["structuredContent"]["selections"][0]
+        self.assertEqual(row["ids"], [self.regions["F2"][1]])
+        self.assertIn("그 뒤 지워진 것 1개", r["content"][0]["text"])
+
+    def test_r1_long_missing_ids_keep_path_and_box(self):
+        """r1: many / long missing ids cannot push the file path and the picture box out of the 60 KB text."""
+        self.assertTrue(self.snap({"ids": self.regions["F1"] + ["x" * 60000]})["isError"])
+        text = self.check_image(self.snap({"ids": self.regions["F1"] + ["m%0199d" % i for i in range(1980)]}))[0]
+        head = text.split("\n")[:4]
+        self.assertTrue(head[1].startswith("파일: "), head)
+        self.assertIn("보이는 보드 범위 @(", head[2])
+        self.assertIn("보드에 없는 id 1980개", head[3])
+        self.assertLess(len(head[3]), 400)
+
+    def test_r1_page_text_outside_the_picture_is_not_described(self):
+        """r1: a page snapshot is cropped to the page — text of that page lying outside it is not in the words."""
+        r = self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "작은 장", "x": 5000, "y": 5000}]})
+        els = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+        fr = next(e for e in els if e["type"] == "frame")
+        small = {**fr, "width": 80, "height": 80, "version": fr["version"] + 1}
+        inside = {"id": "txtin00001", "type": "text", "x": fr["x"] + 10, "y": fr["y"] + 10, "width": 40, "height": 20, "text": "inside",
+                  "originalText": "inside", "fontSize": 16, "frameId": fr["id"], "version": 1, "versionNonce": 1, "isDeleted": False, "angle": 0}
+        off = {**inside, "id": "txtoff0001", "x": fr["x"] + 200, "y": fr["y"] + 200, "text": "offscreen", "originalText": "offscreen"}
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": [small, inside, off]})[0], 200)
+        text = self.check_image(self.snap({"page": 1, "render": "server"}))[0]
+        self.assertIn('"inside"', text)
+        self.assertNotIn("offscreen", text)
+
+    def test_r1_delete_reports_snapshot_failure(self):
+        """r1: if a snapshot cannot be removed, `cera delete` says so and keeps the site (so it can be run again)."""
+        self.check_image(self.snap({"ids": self.regions["F2"], "render": "server", "max_edge": 256}), 256)
+        self.m.close()
+        subprocess.run([sys.executable, str(CLI), "stop", self.sid], env=self.env, capture_output=True, timeout=60)
+        snaps = self.home / "snapshots"
+        os.chmod(snaps, 0o500)
+        try:
+            p = subprocess.run([sys.executable, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("스냅샷 그림 1개를 지우지 못해", p.stderr)
+            self.assertTrue((self.home / "sites" / self.sid).exists())
+        finally:
+            os.chmod(snaps, 0o700)
+        p = subprocess.run([sys.executable, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(list(snaps.glob(f"{self.sid}-*.png")), [])
+
+    def test_r2_delete_stops_when_snapshots_cannot_be_listed(self):
+        """R1-08: a snapshots folder that cannot be read (0300: glob sees nothing) must stop the delete, not skip the PNGs."""
+        self.check_image(self.snap({"ids": self.regions["F2"], "render": "server", "max_edge": 256}), 256)
+        self.m.close()
+        subprocess.run([sys.executable, str(CLI), "stop", self.sid], env=self.env, capture_output=True, timeout=60)
+        snaps = self.home / "snapshots"
+        os.chmod(snaps, 0o300)
+        try:
+            for py in [sys.executable] + ([str(PY39)] if PY39.exists() else []):
+                p = subprocess.run([py, str(CLI), "delete", self.sid, "--yes"], env=self.env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(p.returncode, 0, py)
+                self.assertTrue((self.home / "sites" / self.sid).exists(), py)
+        finally:
+            os.chmod(snaps, 0o700)
+        self.assertEqual(len(list(snaps.glob(f"{self.sid}-*.png"))), 1)
+
+    def test_python39(self):
+        if not PY39.exists():
+            self.skipTest("no /usr/bin/python3")
+        m = self.mcp(py=str(PY39))
+        m.init("codex-mcp-client")
+        res = m.tool("board_snapshot", {"ids": self.regions["graph"]})
+        self.check_image(res)
+
+
+class Wp3InProcess(unittest.TestCase):
+    """r1 checks that need no board server: bounded tab wait, byte cap, file names across processes, odd remote board ids."""
+
+    def setUp(self):
+        self.mod = _load("tb_mcp", "cera_tb_mcp_wp3")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from types import SimpleNamespace
+        self.tools = self.mod.Tools(SimpleNamespace(ctx=SimpleNamespace(HOME=Path(self.tmp.name))))
+        self.conn = SimpleNamespace(base="https://example.invalid", client="ag-x")
+
+    def test_tab_wait_is_bounded_and_a_read_timeout_is_a_miss(self):
+        mod = self.mod
+
+        class Slow:
+            client, base = "ag-x", "https://example.invalid"
+            timeouts = []
+
+            def req(self, method, path, body=None, timeout=30):
+                if method == "POST":
+                    return 201, {"jid": "a" * 12}
+                self.timeouts.append(timeout)
+                time.sleep(min(timeout, 3))
+                raise mod.ToolError("read timed out")
+        t = time.time()
+        out, why = self.tools._tab_render(Slow(), "b" * 10, {"max_edge": 1024}, time.time() + 2.0, lambda: False)
+        self.assertIsNone(out)
+        self.assertIn("끊김", why)
+        self.assertLess(time.time() - t, 3.2)
+        self.assertTrue(all(x <= 2.6 for x in Slow.timeouts), Slow.timeouts)
+
+    def test_raster_byte_cap_shrinks(self):
+        fix = json.loads((HERE / "tests" / "fixtures" / "rough07.json").read_text(encoding="utf-8"))
+        self.mod.IMAGE_MAX_BYTES = 6000
+        out, note = self.tools._raster(fix["elements"], None, None, 1568, None, 16, True, lambda: False)
+        self.assertLessEqual(len(out["png"]), 6000)
+        self.assertLess(out["width"], 1568)
+        self.assertIn("용량 상한", note)
+
+    def test_odd_board_id_and_numbering(self):
+        p1 = self.tools._save_snapshot(None, self.conn, "my-board.1", b"a")
+        p2 = self.tools._save_snapshot(None, self.conn, "my-board.1", b"b")
+        self.assertNotEqual(p1, p2)
+        self.assertRegex(p2.name, r"^remote_[0-9a-f]{8}-b[0-9a-f]{12}-2\.png$")
+        self.assertEqual(p1.read_bytes(), b"a")
+
+    def test_two_processes_never_share_a_file(self):
+        code = (
+            "import sys, importlib.util; from pathlib import Path; from types import SimpleNamespace\n"
+            f"spec = importlib.util.spec_from_file_location('m', {str(HERE / 'server' / 'tb_mcp.py')!r}); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.SNAP_KEEP = 10000\n"
+            "t = m.Tools(SimpleNamespace(ctx=SimpleNamespace(HOME=Path(sys.argv[1]))))\n"
+            "c = SimpleNamespace(base='http://h', client='x')\n"
+            "for i in range(40): t._save_snapshot('site1', c, 'abcdefgh', (sys.argv[2] + str(i)).encode())\n")
+        ps = [subprocess.Popen([sys.executable, "-c", code, self.tmp.name, tag]) for tag in ("P", "Q")]
+        for p in ps:
+            self.assertEqual(p.wait(60), 0)
+        files = list((Path(self.tmp.name) / "snapshots").glob("site1-*.png"))
+        self.assertEqual(len(files), 80)
+        self.assertEqual(len({f.read_bytes() for f in files}), 80)
+
+
+class FakeBoardConn:
+    """In-process stand-in for a Conn to one board (no server): board GET, presence poll, render job create / wait.
+    tab(job_args, elements) -> job data (or None: never done). Records (method, path, timeout, body) of each request."""
+
+    def __init__(self, mod, elements, tab=None, presence=True, delays=None):
+        self.mod, self.elements, self.tab, self.presence = mod, elements, tab, presence
+        self.client, self.base = "ag-x", "https://example.invalid"
+        self.calls, self.delays, self.board_gets, self.job = [], delays or {}, 0, None
+
+    def req(self, method, path, body=None, timeout=30):
+        self.calls.append((method, path, timeout, body))
+        if "/poll?" in path:
+            time.sleep(min(timeout, self.delays.get("poll", 0)))
+            return 200, {"presence": [{"role": "edit", "user": "길동"}] if self.presence else []}
+        if method == "POST" and path.endswith("/jobs"):
+            if len(json.dumps(body["args"], ensure_ascii=False).encode("utf-8")) > 64 * 1024:   # server.py JOB_ARGS_MAX
+                return 413, {"error": "args too large"}
+            self.job = body["args"]
+            return 201, {"jid": "j" * 12}
+        if "/jobs/" in path:
+            data = self.tab(self.job, self.elements) if self.tab else None
+            if data is None:
+                time.sleep(min(timeout, 0.2))
+                return 200, {"state": "claimed"}
+            return 200, {"state": "done", "data": data, "claimer": {"user": "길동"}}
+        if method == "GET" and path.endswith("/boards/b1"):
+            self.board_gets += 1
+            d = self.delays.get("board%d" % self.board_gets, 0)
+            if d:
+                time.sleep(min(timeout, d))
+                if timeout <= d:
+                    raise self.mod.ToolError("read timed out")
+            return 200, {"elements": self.elements, "seq": 1, "epoch": "e"}
+        return 404, {"error": "?"}
+
+    def ok(self, method, path, body=None, timeout=30, want=(200, 201, 204)):
+        code, data = self.req(method, path, body, timeout)
+        if code not in want:
+            raise self.mod.ToolError("HTTP %s" % code)
+        return data
+
+
+def _tab_data(a, elements, tag=None, png=None):
+    """What a tab would answer for render args a: the raster of the picked scene."""
+    region = a.get("region")
+    picked = RS.pick(elements, ids=a.get("ids"), region=region and (region["x"], region["y"], region["w"], region["h"]))[0]
+    out = RS.render(picked, max_edge=a["max_edge"], scale=a.get("scale"), pad=a["pad"])
+    return {"png": __import__("base64").b64encode(png if png is not None else out["png"]).decode(), "width": out["width"],
+            "height": out["height"], "scale": out["scale"], "x0": out["x0"], "y0": out["y0"], "tag": tag or RS.scene_tag(picked)}
+
+
+class Wp3R2(unittest.TestCase):
+    """Review r2 (04_review_WP-3_neon_r2, written by Codex): each finding reproduced in-process first, then fixed."""
+
+    def setUp(self):
+        self.mod = _load("tb_mcp", "cera_tb_mcp_wp3r2")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def tools(self, conn, sid=None):
+        from types import SimpleNamespace
+        return self.mod.Tools(SimpleNamespace(ctx=SimpleNamespace(HOME=Path(self.tmp.name)), conn=lambda site: (conn, sid),
+                                              board_id=lambda c, s, b: "b1"))
+
+    @staticmethod
+    def box(i, x=0, y=0, **kw):
+        return {"id": i, "type": "rectangle", "x": x, "y": y, "width": 40, "height": 30, "angle": 0, "strokeWidth": 2, "version": 1,
+                "versionNonce": 7, "isDeleted": False, **kw}
+
+    def test_r2_truncated_tab_png_falls_back(self):
+        """R1-01: a tab answering only the first 33 bytes of a good PNG (IHDR, no IDAT/IEND) is not passed on."""
+        els = [self.box("a1")]
+        conn = FakeBoardConn(self.mod, els, tab=lambda a, e: _tab_data(a, e, png=RS.render(e, max_edge=256)["png"][:33]))
+        text, img = self.tools(conn).board_snapshot({"ids": ["a1"]})
+        self.assertIn("renderer: server", text)
+        self.assertTrue(RS.png_complete(img.png))
+
+    def test_r2_refetch_after_tag_mismatch_stays_in_the_deadline(self):
+        """R1-03: when the tags differ the board is read again — that read must end within the tab deadline, not after 30 s."""
+        self.mod.SNAP_TAB_WAIT = 2.0
+        els = [self.box("a1")]
+        conn = FakeBoardConn(self.mod, els, tab=lambda a, e: _tab_data(a, e, tag="1-00000000"), delays={"board2": 5})
+        t = time.time()
+        text, _ = self.tools(conn).board_snapshot({"ids": ["a1"]})
+        self.assertLess(time.time() - t, 3.0)
+        self.assertIn("renderer: server", text)
+
+    def test_r2_presence_query_counts_against_the_deadline(self):
+        """R1-03: the presence query happens inside the tab deadline (a slow poll does not add to it)."""
+        self.mod.SNAP_TAB_WAIT = 2.0
+        conn = FakeBoardConn(self.mod, [self.box("a1")], tab=None, delays={"poll": 1.5})
+        t = time.time()
+        text, _ = self.tools(conn).board_snapshot({"ids": ["a1"]})
+        self.assertLess(time.time() - t, 2.8)
+        self.assertIn("renderer: server", text)
+
+    def test_r2_page_filter_uses_the_page_not_rounded_pixels(self):
+        """R1-05: a page 80.2 wide drawn at 4x is 321 px (80.25 units); text starting at 80.21 lies outside the page and is not described."""
+        page = {"id": "tbpage-1", "type": "frame", "x": 0, "y": 0, "width": 80.2, "height": 80, "angle": 0, "version": 1, "versionNonce": 1,
+                "isDeleted": False, "customData": {"tbPage": 1}}
+        txt = {"id": "tin", "type": "text", "x": 10, "y": 10, "width": 30, "height": 14, "text": "inside", "originalText": "inside",
+               "fontSize": 14, "frameId": "tbpage-1", "version": 1, "versionNonce": 1, "isDeleted": False, "angle": 0}
+        off = {**txt, "id": "toff", "x": 80.21, "text": "offpage", "originalText": "offpage"}
+        conn = FakeBoardConn(self.mod, [page, txt, off], presence=False)
+        text, img = self.tools(conn).board_snapshot({"page": 1, "render": "server"})
+        self.assertIn("4", re.search(r"py/([\d.]+)\)", text).group(1))
+        self.assertIn('"inside"', text)
+        self.assertNotIn("offpage", text)
+
+    def test_r2_remote_prefix_cannot_be_a_local_site_id(self):
+        """new: a personal site id may look like remote-<hash> (lowercase, digits, '-'); remote snapshots must not share its names."""
+        import hashlib
+        from types import SimpleNamespace
+        conn = SimpleNamespace(base="https://example.invalid", client="x")
+        local = "remote-" + hashlib.sha256(conn.base.encode()).hexdigest()[:8]
+        t = self.tools(conn)
+        p_local = t._save_snapshot(local, conn, "abcdefgh", b"L")
+        p_remote = t._save_snapshot(None, conn, "abcdefgh", b"R")
+        pat = re.escape(local) + r"-[A-Za-z0-9_]{1,64}-\d+\.png"   # bin/cera cmd_delete
+        self.assertTrue(re.fullmatch(pat, p_local.name))
+        self.assertIsNone(re.fullmatch(pat, p_remote.name), p_remote.name)
+
+    def test_r2_many_ids_still_reach_the_tab(self):
+        """new: 2000 uuid-length ids (valid input; most not on the board) must not make the tab job 413."""
+        import uuid
+        els = [self.box("a1")]
+        conn = FakeBoardConn(self.mod, els, tab=lambda a, e: _tab_data(a, e))
+        ids = ["a1"] + [str(uuid.UUID(int=i)) for i in range(1999)]
+        text, _ = self.tools(conn).board_snapshot({"ids": ids, "render": "tab"})
+        self.assertIn("renderer: tab", text)
+
+
+FLOW07 = {"kind": "flow", "dir": "TD", "layout": "layered",
+          "nodes": [{"id": "start", "label": "start", "shape": "ellipse"}, {"id": "load", "label": "load data"},
+                    {"id": "ok", "label": "ok?", "shape": "diamond"}, {"id": "fit", "label": "fit model"},
+                    {"id": "fin", "label": "end", "shape": "ellipse"}, {"id": "clean", "label": "clean", "shape": "round"}],
+          "edges": [{"from": "start", "to": "load"}, {"from": "load", "to": "ok"}, {"from": "ok", "to": "fit", "label": "yes"},
+                    {"from": "fit", "to": "fin"}, {"from": "ok", "to": "clean", "label": "no"}, {"from": "clean", "to": "load"}]}
+DRAWIO = Path("/Applications/draw.io.app/Contents/MacOS/draw.io")
+
+
+class Wp4(Base):
+    """09 plan WP-4: board_add flow (layered / keep, undirected edges, errors that name the field), math (placeholder → a tab typesets it),
+    mermaid (a tab converts it), board_read format:"mermaid", board_export format:"drawio"."""
+
+    def setUp(self):
+        super().setUp()
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "구조"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+
+    def board(self):
+        return raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]
+
+    def live(self):
+        return {e["id"]: e for e in self.board()["elements"] if not e.get("isDeleted")}
+
+    def test_criterion_1_7_flow_layered_mermaid_drawio(self):
+        """1: one call, < 0.5 s, boxes never overlap, every edge bound at both ends (box.boundElements has the arrow, so dragging a box drags it).
+        7: format:"mermaid" parses back to the same node / edge sets; the .drawio has 6 vertices + 6 edges and draw.io exports it to PNG."""
+        t = time.time()
+        r = self.m.ok("board_add", {"items": [FLOW07]})
+        self.assertLess(time.time() - t, 0.5)
+        made = r["structuredContent"]["created"]
+        self.assertEqual(set(made), {n["id"] for n in FLOW07["nodes"]})
+        els = self.live()
+        boxes = [els[made[n["id"]]] for n in FLOW07["nodes"]]
+        self.assertEqual([b["type"] for b in boxes], ["ellipse", "rectangle", "diamond", "rectangle", "ellipse", "rectangle"])
+        self.assertIsNone(boxes[1]["roundness"])
+        self.assertIsNotNone(boxes[5]["roundness"])   # round
+        for i, a in enumerate(boxes):
+            for b in boxes[i + 1:]:
+                self.assertFalse(a["x"] < b["x"] + b["width"] and b["x"] < a["x"] + a["width"] and
+                                 a["y"] < b["y"] + b["height"] and b["y"] < a["y"] + a["height"], (a["id"], b["id"]))
+        arrows = [e for e in els.values() if e["type"] == "arrow"]
+        self.assertEqual(len(arrows), 6)
+        for a in arrows:
+            s, t_ = a["startBinding"]["elementId"], a["endBinding"]["elementId"]
+            self.assertIn(a["id"], [x["id"] for x in els[s]["boundElements"]])
+            self.assertIn(a["id"], [x["id"] for x in els[t_]["boundElements"]])
+            self.assertEqual((a["startArrowhead"], a["endArrowhead"]), (None, "arrow"))
+            self.assertEqual(a["customData"]["cera"]["graph"]["g"], boxes[0]["customData"]["cera"]["graph"]["g"])
+        labels = sorted(e["text"] for e in els.values() if e["type"] == "text" and els.get(e.get("containerId"), {}).get("type") == "arrow")
+        self.assertEqual(labels, ["no", "yes"])
+        # 7: mermaid round trip
+        res = self.m.ok("board_read", {"format": "mermaid"})
+        src = res["structuredContent"]["mermaid"]
+        self.assertIn("```mermaid", res["content"][0]["text"])
+        g = GIO.parse_mermaid(src)
+        self.assertEqual({(n["key"], n["label"], n["shape"]) for n in g["nodes"]},
+                         {(n["id"], n["label"], n.get("shape", "box")) for n in FLOW07["nodes"]})
+        self.assertEqual({(e["from"], e["to"], e.get("label", "")) for e in g["edges"]},
+                         {(e["from"], e["to"], e.get("label", "")) for e in FLOW07["edges"]})
+        # 7: draw.io
+        out = Path(self.tmp.name) / "out"
+        st = self.m.ok("board_export", {"format": "drawio", "out_dir": str(out)})["structuredContent"]
+        self.assertEqual((st["vertices"], st["edges"]), (6, 6))
+        root = ET.parse(st["path"]).getroot()
+        self.assertEqual(sum(1 for c in root.iter("mxCell") if c.get("vertex") == "1"), 6)
+        self.assertEqual(sum(1 for c in root.iter("mxCell") if c.get("edge") == "1" and c.get("source") and c.get("target")), 6)
+        if DRAWIO.exists():
+            png = out / "flow.png"
+            p = subprocess.run([str(DRAWIO), "-x", "-f", "png", "-o", str(png), st["path"]], capture_output=True, timeout=120)
+            self.assertEqual(p.returncode, 0, p.stderr[-500:])
+            self.assertEqual(png.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertTrue(self.m.ok("board_export", {"out_dir": str(out)})["structuredContent"]["path"].endswith(".excalidraw"))   # default unchanged
+        self.assertTrue(self.m.tool("board_export", {"format": "svg"})["isError"])
+
+    def test_criterion_2_keep(self):
+        """2: layout keep — each centre within 20 px of at (at:"absolute"), y closer than 30 % of the height → the same y.
+        Without absolute the group moves but keeps its shape."""
+        nodes = [{"id": "a", "label": "입력", "at": {"x": 103, "y": 207}}, {"id": "b", "label": "처리", "at": {"x": 391, "y": 222}},
+                 {"id": "c", "label": "출력", "at": {"x": 705, "y": 199}}, {"id": "d", "label": "판단", "shape": "diamond", "at": {"x": 391, "y": 460}}]
+        item = {"kind": "flow", "nodes": nodes, "edges": [{"from": "a", "to": "b"}, {"from": "b", "to": "c"}, {"from": "b", "to": "d"}]}
+        made = self.m.ok("board_add", {"items": [item], "at": "absolute"})["structuredContent"]["created"]
+        els = self.live()
+        ctr = {k: (els[v]["x"] + els[v]["width"] / 2, els[v]["y"] + els[v]["height"] / 2) for k, v in made.items()}
+        for n in nodes:
+            dx, dy = ctr[n["id"]][0] - n["at"]["x"], ctr[n["id"]][1] - n["at"]["y"]
+            self.assertLessEqual((dx * dx + dy * dy) ** 0.5, 20, n["id"])
+        self.assertEqual(ctr["a"][1], ctr["b"][1])
+        self.assertEqual(ctr["b"][1], ctr["c"][1])
+        self.assertNotEqual(ctr["d"][1], ctr["b"][1])
+        self.assertEqual(els[made["a"]]["width"], els[made["c"]]["width"])   # one size per shape
+        made2 = self.m.ok("board_add", {"items": [item]})["structuredContent"]["created"]
+        els = self.live()
+        ctr2 = {k: (els[v]["x"] + els[v]["width"] / 2, els[v]["y"] + els[v]["height"] / 2) for k, v in made2.items()}
+        self.assertGreater(ctr2["a"][0], ctr["c"][0])   # to the right of the first one
+        for k in ctr:
+            self.assertAlmostEqual(ctr2[k][0] - ctr2["a"][0], ctr[k][0] - ctr["a"][0], delta=0.01)
+            self.assertAlmostEqual(ctr2[k][1] - ctr2["a"][1], ctr[k][1] - ctr["a"][1], delta=0.01)
+        # keep with no at at all: laid out as layered, and said so
+        r = self.m.ok("board_add", {"items": [{"kind": "flow", "nodes": [{"id": "x"}, {"id": "y"}], "edges": [{"from": "x", "to": "y"}]}]})
+        self.assertIn("layered", r["content"][0]["text"])
+
+    def test_criterion_3_undirected_graph(self):
+        """3: head:"none" edges have no arrowheads (graph A-E); mermaid shows them as ---."""
+        nodes = [{"id": k, "label": k, "shape": "ellipse"} for k in "ABCDE"]
+        edges = [{"from": f, "to": t, "head": "none"} for f, t in ("AB", "AC", "BD", "CD", "DE", "BE")]
+        self.m.ok("board_add", {"items": [{"kind": "flow", "layout": "layered", "nodes": nodes, "edges": edges}]})
+        arrows = [e for e in self.live().values() if e["type"] == "arrow"]
+        self.assertEqual(len(arrows), 6)
+        for a in arrows:
+            self.assertIsNone(a["startArrowhead"])
+            self.assertIsNone(a["endArrowhead"])
+            self.assertTrue(a["startBinding"] and a["endBinding"])
+        src = self.m.ok("board_read", {"format": "mermaid"})["structuredContent"]["mermaid"]
+        self.assertEqual(src.count(" --- "), 6)
+        self.assertNotIn("-->", src)
+
+    def test_criterion_4_errors_name_the_field(self):
+        """4: an edge to a missing node → isError with that field and the existing ids; the board seq does not move."""
+        seq = self.board()["seq"]
+        bad = dict(FLOW07, edges=FLOW07["edges"][:3] + [{"from": "fit", "to": "X"}])
+        res = self.m.tool("board_add", {"items": [bad]})
+        self.assertTrue(res["isError"])
+        self.assertIn("items[0].edges[3].to = 'X' 없음 — 있는 id: start, load, ok, fit, fin, clean", res["content"][0]["text"])
+        for item, want in ((dict(FLOW07, nodes=FLOW07["nodes"] + [{"id": "ok"}]), "items[0].nodes[6].id = 'ok' 가 겹친다"),
+                           (dict(FLOW07, layout="keep", nodes=[{"id": "a", "at": {"x": 0, "y": 0}}, {"id": "b"}], edges=[]), "없는 노드: b"),
+                           (dict(FLOW07, edges=[{"from": "start", "to": "load", "arrow": "x"}]), "edges[0] 에 모르는 칸: arrow"),
+                           (dict(FLOW07, edges=[{"from": "start", "to": "start"}]), "자기 자신"),
+                           (dict(FLOW07, edges=[{"from": "start", "to": "load", "head": "start"}]), "head"),
+                           (dict(FLOW07, dir="BT"), "dir"), (dict(FLOW07, nodes=[{"id": "n%d" % i} for i in range(51)], edges=[]), "1–50"),
+                           (dict(FLOW07, x=3), "모르는 칸: x")):
+            res = self.m.tool("board_add", {"items": [item]})
+            self.assertTrue(res["isError"], item)
+            self.assertIn(want, res["content"][0]["text"])
+        self.assertEqual(self.board()["seq"], seq)
+
+    def fake_tab(self, latex_error="\\fracc"):
+        """A person's edit tab for math / mermaid jobs. math: writes the typeset result like web/src/features/jobs/mathJob.js (file first, then
+        the element with a new fileId and cera.render done) — or render error + message when the LaTeX contains latex_error.
+        mermaid: writes a box, a diamond and a bound arrow (what mermaidJob.js makes) and returns their ids."""
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/presence", self.h, {"client": "tab1", "pointer": {"x": 0, "y": 0}})
+        stop, seen = threading.Event(), []
+
+        def post_els(els):
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "tab1", "elements": els})
+
+        def one(j):
+            st, c = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/claim", self.h, {"client": "tab1", "prio": "high"})
+            if st != 200:
+                return
+            a, done = c["args"], {"client": "tab1", "lease": c["lease"]}
+            seen.append((c["kind"], a))
+            if c["kind"] == "math" and "STALL" in a["latex"]:
+                return   # claimed, never answered (a hung tab)
+            if c["kind"] == "math":
+                el = self.live()[a["id"]]
+                cd = dict(el["customData"])
+                nxt = {"version": el["version"] + 1, "versionNonce": el["versionNonce"] + 1}
+                if latex_error in a["latex"]:
+                    cd["cera"] = {"render": "error", "message": "Undefined control sequence \\fracc"}
+                    post_els([{**el, **nxt, "customData": cd}])
+                    body = {**done, "ok": False, "error": "Undefined control sequence \\fracc"}
+                else:
+                    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="30"><path d="M0 0h80"/></svg>'
+                    fid = "t" * 40
+                    raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/files", self.h,
+                        {"client": "tab1", "id": fid, "mimeType": "image/svg+xml", "dataURL": "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()})
+                    cd.update(w0=80, h0=30, cera={"render": "done"})
+                    post_els([{**el, **nxt, "fileId": fid, "width": 80, "height": 30, "customData": cd}])
+                    body = {**done, "ok": True, "data": {"id": el["id"], "fileId": fid, "width": 80, "height": 30}}
+            else:
+                x = AK.make_box("rectangle", "A", 0, 0)
+                y = AK.make_box("diamond", "B?", 0, 200)
+                arr = AK.make_arrow(x[0], y[0])
+                post_els(x + y + arr)
+                ids = [e["id"] for e in x + y + arr]
+                body = {**done, "ok": True, "data": {"ids": ids, "count": len(ids), "x": 0, "y": 0}}
+            raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/jobs/{j['jid']}/result", self.h, body)
+
+        def run():
+            try:
+                while not stop.is_set():
+                    for j in (raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/jobs", self.h)[1] or {}).get("jobs") or []:
+                        one(j)
+                    time.sleep(0.05)
+            except OSError:   # the board server stopped at tearDown
+                pass
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+
+        def done():
+            stop.set()
+            th.join(2)
+        self.addCleanup(done)
+        return seen, done
+
+    def test_criterion_5_math_without_tab(self):
+        """5 (no tab): the board gets a LaTeX-source placeholder and the reply says render pending; the element is a formula image the
+        existing 'Edit formula' path opens (image + customData.latex); the job waits on the server; a tab opened later draws it and
+        board_wait does not report that as a person's edit."""
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "x^2 + y^2 = r^2 <&>", "size": 40, "color": "#1971c2"}]})
+        text = r["content"][0]["text"]
+        self.assertIn("렌더 대기(화면이 열리면 그린다)", text)
+        self.assertEqual(r["structuredContent"]["math"][0]["render"], "pending")
+        el = self.live()[r["structuredContent"]["ids"][0]]
+        self.assertEqual(el["type"], "image")
+        self.assertEqual(el["customData"]["latex"], "x^2 + y^2 = r^2 <&>")   # selectedMath / mathInitial (features/math) look at exactly this
+        self.assertEqual((el["customData"]["size"], el["customData"]["color"]), (40, "#1971c2"))
+        self.assertEqual(el["customData"]["cera"], {"render": "pending"})
+        f = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/files/{el['fileId']}", self.h)[1]
+        svg = base64.b64decode(f["dataURL"].split(",", 1)[1]).decode()
+        self.assertIn("x^2 + y^2 = r^2 &lt;&amp;&gt;", svg)
+        ET.fromstring(svg)   # well-formed
+        jobs = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/jobs", self.h)[1]["jobs"]
+        self.assertEqual([j["kind"] for j in jobs], ["math"])
+        rd = self.m.ok("board_read")
+        self.assertIn("(렌더 대기)", rd["content"][0]["text"])
+        seq = rd["structuredContent"]["seq"]
+        seen, _ = self.fake_tab()
+        deadline = time.time() + 5
+        while time.time() < deadline and self.live()[el["id"]]["customData"]["cera"]["render"] != "done":
+            time.sleep(0.1)
+        self.assertEqual(self.live()[el["id"]]["customData"]["cera"]["render"], "done")
+        self.assertEqual(seen[0][1], {"id": el["id"], "latex": "x^2 + y^2 = r^2 <&>", "size": 40, "color": "#1971c2"})
+        w = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 2})["structuredContent"]
+        self.assertTrue(w.get("timeout"), w)
+        self.assertNotIn("렌더 대기", self.m.ok("board_read")["content"][0]["text"])
+        for bad in ({"kind": "math", "latex": ""}, {"kind": "math", "latex": "x", "color": "red"}, {"kind": "math", "latex": "x", "text": "y"}):
+            self.assertTrue(self.m.tool("board_add", {"items": [bad]})["isError"], bad)
+
+    def test_criterion_5_math_with_tab(self):
+        """5 (tab open): rendered within 3 s and the reply says so; bad LaTeX → the reply carries the MathJax error within 5 s."""
+        self.fake_tab()
+        t = time.time()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\frac{a+b}{2}"}, {"kind": "text", "text": "옆 글"}]})
+        self.assertLess(time.time() - t, 3)
+        self.assertIn("렌더됨", r["content"][0]["text"])
+        self.assertNotIn("렌더 대기", r["content"][0]["text"])
+        el = self.live()[r["structuredContent"]["ids"][0]]
+        self.assertEqual((el["fileId"], el["customData"]["cera"]["render"]), ("t" * 40, "done"))
+        t = time.time()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\fracc{"}]})
+        self.assertLess(time.time() - t, 5)
+        self.assertIn("LaTeX 오류 — Undefined control sequence \\fracc", r["content"][0]["text"])
+        self.assertEqual(r["structuredContent"]["math"][0]["render"], "error")
+        self.assertIn("(LaTeX 오류: Undefined control sequence", self.m.ok("board_read")["content"][0]["text"])
+
+    def test_criterion_6_mermaid(self):
+        """6: no tab → isError recommending kind:"flow" (with the converted item); tab → editable shapes and arrows (no picture)."""
+        src = "flowchart LR\n  a[입력] --> b{맞나?}\n  b -->|예| c(끝)"
+        seq = self.board()["seq"]
+        res = self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": src}]})
+        self.assertTrue(res["isError"])
+        text = res["content"][0]["text"]
+        self.assertIn('kind:"flow"', text)
+        hint = json.loads(text.split("그대로 board_add items 에 넣으면 된다): ", 1)[1])
+        self.assertEqual(self.board()["seq"], seq)
+        ok = self.m.ok("board_add", {"items": [hint]})   # the suggested item works as is
+        self.assertEqual(len(ok["structuredContent"]["created"]), 3)
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": src}, {"kind": "text", "text": "x"}]})["isError"])
+        self.assertTrue(self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": "x" * 20001}]})["isError"])
+        seen, _ = self.fake_tab()
+        r = self.m.ok("board_add", {"items": [{"kind": "mermaid", "source": src}], "at": {"x": 1000, "y": 50}})
+        self.assertEqual(seen[-1], ("mermaid", {"source": src, "at": {"x": 1000, "y": 50}}))
+        self.assertEqual(sorted(i["type"] for i in r["structuredContent"]["items"]), ["diamond", "rectangle"])
+        self.assertEqual(len(r["structuredContent"]["links"]), 1)
+        self.assertNotIn("그림(image)", r["content"][0]["text"])
+
+    def test_python39(self):
+        if not PY39.exists():
+            self.skipTest("no /usr/bin/python3")
+        p = subprocess.run([str(PY39), "-c", "import sys; sys.path.insert(0, 'server'); import layout, graphio"], cwd=str(HERE), capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class Wp4R1(Wp4):
+    """Review r1 of WP-4 (04_review_WP-4_neon_r1 · _opus_r1): each test reproduces one finding."""
+
+    def test_r1_layered_edges_go_around_boxes(self):
+        """opus 2: FLOW07's back edge clean → load and any layer-skipping edge bend around the boxes in between (still bound at both ends)."""
+        made = self.m.ok("board_add", {"items": [FLOW07]})["structuredContent"]["created"]
+        els = self.live()
+        rect = {k: (els[v]["x"], els[v]["y"], els[v]["x"] + els[v]["width"], els[v]["y"] + els[v]["height"]) for k, v in made.items()}
+        key = {v: k for k, v in made.items()}
+        bent = 0
+        for a in (e for e in els.values() if e["type"] == "arrow"):
+            s_, t_ = key[a["startBinding"]["elementId"]], key[a["endBinding"]["elementId"]]
+            pts = [(a["x"] + p[0], a["y"] + p[1]) for p in a["points"]]
+            bent += len(pts) > 2
+            for p, q in zip(pts, pts[1:]):
+                for k, r in rect.items():
+                    if k in (s_, t_):
+                        continue
+                    for i in range(101):
+                        x, y = p[0] + (q[0] - p[0]) * i / 100, p[1] + (q[1] - p[1]) * i / 100
+                        self.assertFalse(r[0] + 2 < x < r[2] - 2 and r[1] + 2 < y < r[3] - 2, (s_, t_, k))
+            lab = [e for e in els.values() if e.get("containerId") == a["id"]]
+            for l_ in lab:   # the label sits on the path (near one of its points or segment middles)
+                cx, cy = l_["x"] + l_["width"] / 2, l_["y"] + l_["height"] / 2
+                mids = pts + [((p[0] + q[0]) / 2, (p[1] + q[1]) / 2) for p, q in zip(pts, pts[1:])]
+                self.assertLess(min(((cx - m[0]) ** 2 + (cy - m[1]) ** 2) ** 0.5 for m in mids), 2)
+        self.assertGreaterEqual(bent, 1)
+
+    def test_r1_latex_control_character_refused(self):
+        """neon 2 · opus 1: "\\frac" sent as "\f"+"rac" (form feed) is refused with the double-backslash hint; nothing is written."""
+        seq = self.board()["seq"]
+        res = self.m.tool("board_add", {"items": [{"kind": "math", "latex": "\x0crac{a}{b} + \x08eta"}]})
+        self.assertTrue(res["isError"])
+        self.assertIn("U+000C", res["content"][0]["text"])
+        self.assertIn("\\\\frac", res["content"][0]["text"])
+        self.assertEqual(self.board()["seq"], seq)
+        ok = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "a\nb\tc"}]})   # newline and tab are fine
+        self.assertEqual(ok["structuredContent"]["math"][0]["render"], "pending")
+        self.m.ok("board_add", {"items": [{"kind": "box", "label": "bad\x0cchar"}]})
+        st = self.m.ok("board_export", {"format": "drawio", "out_dir": str(Path(self.tmp.name) / "o")})["structuredContent"]
+        ET.parse(st["path"])
+
+    def test_r1_second_formula_is_not_reported_pending(self):
+        """neon 3: the first formula's tab hangs; the second is drawn at once — its reply says rendered, not pending."""
+        self.fake_tab()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "STALL"}, {"kind": "math", "latex": "y=1"}]}, timeout=30)
+        st = r["structuredContent"]["math"]
+        self.assertEqual([x["render"] for x in st], ["pending", "done"])
+
+    def test_r1_reply_shows_the_rendered_version(self):
+        """neon 4: after the tab typesets the formula the reply describes the board's element (v2, typeset size), so base_version works."""
+        self.fake_tab()
+        r = self.m.ok("board_add", {"items": [{"kind": "math", "latex": "\\frac{a+b}{2}"}]})
+        eid = r["structuredContent"]["ids"][0]
+        el = self.live()[eid]
+        text = r["content"][0]["text"]
+        self.assertIn("(v%d)" % el["version"], text)
+        self.assertIn("80×30", text)
+        it = next(i for i in r["structuredContent"]["items"] if i["id"] == eid)
+        self.assertEqual(it.get("render"), None)   # done: no pending / error mark
+
+    def test_r1_mermaid_is_not_a_person_edit_for_board_wait(self):
+        """neon 5: board_read → board_add mermaid (a person's tab writes it) → board_wait from that seq does not wake for it."""
+        self.fake_tab()
+        seq = self.m.ok("board_read")["structuredContent"]["seq"]
+        self.m.ok("board_add", {"items": [{"kind": "mermaid", "source": "flowchart TD\n a --> b"}]})
+        w = self.m.ok("board_wait", {"since_seq": seq, "timeout_s": 2})["structuredContent"]
+        self.assertTrue(w.get("timeout"), w)
+
+    def test_r1_mermaid_page_matches_board_read_page(self):
+        """neon 6: shapes drawn inside page 1's area without frameId count for format:"mermaid" page:1, like board_read page:1."""
+        self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "p"}]})
+        fr = next(e for e in self.live().values() if e["type"] == "frame")
+        a = AK.make_box("rectangle", "A", fr["x"] + 100, fr["y"] + 100)
+        b = AK.make_box("rectangle", "B", fr["x"] + 400, fr["y"] + 100)
+        arr = AK.make_arrow(a[0], b[0])
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": a + b + arr})
+        self.assertEqual(len(self.m.ok("board_read", {"page": 1})["structuredContent"]["items"]), 2)
+        st = self.m.ok("board_read", {"format": "mermaid", "page": 1})["structuredContent"]
+        self.assertEqual((st["nodes"], st["edges"]), (2, 1))
+
+    def test_r1_mermaid_hint_is_always_usable(self):
+        """neon 8: with no tab, a flow hint is offered only when board_add would take it as is (51 nodes, A-->A, empty, long ids)."""
+        cases = ["flowchart TD\n" + "\n".join("n%d --> n%d" % (i, i + 1) for i in range(60)), "flowchart TD\n A --> A\n A --> B",
+                 "flowchart TD\n %% only a comment", "flowchart TD\n " + "x" * 50 + " --> b", "flowchart TD\n a --> b"]
+        offered = 0
+        for src in cases:
+            text = self.m.tool("board_add", {"items": [{"kind": "mermaid", "source": src}]})["content"][0]["text"]
+            if "그대로 board_add items 에 넣으면 된다): " in text:
+                offered += 1
+                hint = json.loads(text.split("그대로 board_add items 에 넣으면 된다): ", 1)[1])
+                self.m.ok("board_add", {"items": [hint]})
+        self.assertGreaterEqual(offered, 1)
+
+    def test_r2_empty_page_gives_an_empty_diagram(self):
+        """r2 (neon 1 · opus 1): an empty page (or ids none of which are on the page) never leaks another page's diagram."""
+        self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "빈 장"}]})
+        made = self.m.ok("board_add", {"items": [{"kind": "frame_page", "title": "둘째"}, FLOW07]})["structuredContent"]["created"]
+        self.assertEqual(self.m.ok("board_read", {"format": "mermaid", "page": 2})["structuredContent"]["nodes"], 6)
+        for args in ({"page": 1}, {"page": 1, "ids": [made["start"], made["load"]]}):
+            st = self.m.ok("board_read", {"format": "mermaid", **args})["structuredContent"]
+            self.assertEqual((st["nodes"], st["edges"]), (0, 0), args)
+        self.assertEqual(self.m.ok("board_read", {"format": "mermaid", "ids": []})["structuredContent"]["nodes"], 6)   # no filter = all
+
+
+for _n in [n for n in vars(Wp4) if n.startswith("test")]:   # Wp4R1 borrows Wp4's helpers only — Wp4's own tests run once, in Wp4
+    setattr(Wp4R1, _n, None)
+
+
+def _load(name, mod_name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(mod_name, HERE / "server" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+RS = _load("raster", "cera_raster_t2")
+GIO = _load("graphio", "cera_graphio_t2")
+AK = _load("agentkit", "cera_agentkit_t2")
 
 
 if __name__ == "__main__":

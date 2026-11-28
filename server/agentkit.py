@@ -460,6 +460,55 @@ def make_arrow(from_el: Union[Element, Point], to_el: Union[Element, Point], lab
     return out
 
 
+def route_via(arrow: Element, a: Element, b: Element, via: Sequence[Point], label: Optional[Element] = None,
+              gap: Number = BIND_GAP) -> Element:
+    """Re-route a bound arrow a → b through absolute bend points (in place; the bindings stay, so dragging a box still drags the ends).
+    Used by flow layout for edges that would otherwise cut through boxes. A label goes to the middle of the polyline."""
+    if not via:
+        return reroute(arrow, a, b)
+    ca, cb = _center(a), _center(b)
+    pts = [(float(p[0]), float(p[1])) for p in via]
+
+    def end(e, c, toward):
+        dx, dy = toward[0] - c[0], toward[1] - c[1]
+        if dx == 0 and dy == 0:
+            dx = 1.0
+        n = math.hypot(dx, dy)
+        x, y = _edge_point(e, dx, dy)
+        return x + dx / n * gap, y + dy / n * gap
+    path = [end(a, ca, pts[0])] + pts + [end(b, cb, pts[-1])]
+    x0, y0 = path[0]
+    rel = [[px - x0, py - y0] for px, py in path]
+    xs, ys = [p[0] for p in rel], [p[1] for p in rel]
+    arrow.update({"x": x0, "y": y0, "points": rel, "width": max(xs) - min(xs), "height": max(ys) - min(ys)})
+    if label is not None:
+        m = len(path) // 2
+        (px, py), (qx, qy) = (path[m - 1], path[m]) if len(path) % 2 == 0 else (path[m], path[m])
+        label["x"] = (px + qx) / 2 - _num(label.get("width")) / 2
+        label["y"] = (py + qy) / 2 - _num(label.get("height")) / 2
+    return arrow
+
+
+ARROW_HEADS = {"end": (None, "arrow"), "start": ("arrow", None), "both": ("arrow", "arrow"), "none": (None, None)}   # head → (start, end)
+
+
+def make_line(points: Sequence[Point], *, color: str = INK, dashed: bool = False, by: Optional[str] = None,
+              id: Optional[str] = None, frame_id: Optional[str] = None) -> List[Element]:
+    """A free polyline (Excalidraw type "line") through absolute points — no bindings, no arrowheads. Needs 2+ points."""
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    if len(pts) < 2:
+        raise ValueError(T("선은 점이 2개 이상", "A line needs 2 or more points"))
+    x0, y0 = pts[0]
+    rel = [[px - x0, py - y0] for px, py in pts]
+    xs, ys = [p[0] for p in rel], [p[1] for p in rel]
+    line = _base("line", x0, y0, max(xs) - min(xs), max(ys) - min(ys), by=by, id=id, frame_id=frame_id, stroke=color)
+    line.update({"points": rel, "lastCommittedPoint": None, "startBinding": None, "endBinding": None,
+                 "startArrowhead": None, "endArrowhead": None, "polygon": False})
+    if dashed:
+        line["strokeStyle"] = "dashed"
+    return [line]
+
+
 PAGE_SEED = 7919   # seed in web/src/features/pages/pages.js pageElementsFor = 7919 × k
 
 
@@ -515,6 +564,39 @@ def make_image(file_id: str, w: Number, h: Number, x: Number = 0, y: Number = 0,
     return e
 
 
+MATH_LINES = 8          # placeholder shows at most this many source lines
+MATH_LINE_CHARS = 120   # ... each clipped to this many characters
+
+
+def math_placeholder_svg(latex: str, size: Number = 32, color: str = INK) -> Tuple[str, float, float]:
+    """Stand-in picture for a formula until a person's tab typesets it (09 plan B5): the LaTeX source in a monospace font inside a dashed
+    frame, so the board shows the formula even with no tab open. -> (svg text, width, height). color must already be a checked #hex."""
+    import re
+    from xml.sax.saxutils import escape
+    clean = re.sub("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", "", str(latex).replace("\r", "").replace("\t", " "))
+    lines = [ln[:MATH_LINE_CHARS] for ln in clean.split("\n")][:MATH_LINES] or [""]
+    fs = max(10.0, min(28.0, float(size) * 0.55))
+    pad = 8.0
+    w = max(len(ln) for ln in lines) * fs * 0.62 + 2 * pad + 4
+    h = len(lines) * fs * 1.3 + 2 * pad
+    rows = "".join('<text x="%g" y="%g">%s</text>' % (pad + 2, pad + fs * (1.3 * i + 1.0), escape(ln)) for i, ln in enumerate(lines))
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="%g" height="%g" viewBox="0 0 %g %g">'
+           '<rect x="1" y="1" width="%g" height="%g" rx="6" fill="none" stroke="#9a9a9a" stroke-dasharray="5 4"/>'
+           '<g font-family="ui-monospace, Menlo, Consolas, monospace" font-size="%g" fill="%s">%s</g></svg>'
+           % (w, h, w, h, w - 2, h - 2, fs, color, rows))
+    return svg, round(w, 2), round(h, 2)
+
+
+def tag_graph(el: Element, g: str, k: str, direction: Optional[str] = None) -> Element:
+    """Mark a flow node / edge as part of graph g (customData.cera.graph = {g, k[, d]}) — mermaid / draw.io export find the graph by it."""
+    cd = dict(el.get("customData") or {})
+    cera = dict(cd.get("cera") or {})
+    cera["graph"] = {"g": g, "k": k, **({"d": direction} if direction else {})}
+    cd["cera"] = cera
+    el["customData"] = cd
+    return el
+
+
 # ── z-order (index) ─────────────────────────────────────────────────
 def index_between(a: Optional[str], b: Optional[str]) -> str:
     """Key between a and b (same result as JS fractional-indexing generateKeyBetween)."""
@@ -560,13 +642,24 @@ def element_bbox(e: Element) -> Optional[Tuple[float, float, float, float]]:
     if not isinstance(e, dict) or not _ok_num(e.get("x")) or not _ok_num(e.get("y")):
         return None
     x, y = float(e["x"]), float(e["y"])
-    if e.get("type") in LINEAR:
-        pts = _points(e)
-        if pts:
-            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-            return x + min(xs), y + min(ys), x + max(xs), y + max(ys)
-    w, h = _num(e.get("width")), _num(e.get("height"))
-    return min(x, x + w), min(y, y + h), max(x, x + w), max(y, y + h)
+    pts = _points(e) if e.get("type") in LINEAR else []
+    if pts:
+        corners = [(x + px, y + py) for px, py in pts]
+    else:
+        w, h = _num(e.get("width")), _num(e.get("height"))
+        corners = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
+    x0, y0 = min(p[0] for p in corners), min(p[1] for p in corners)
+    x1, y1 = max(p[0] for p in corners), max(p[1] for p in corners)
+    ang = _num(e.get("angle"))
+    if ang and math.isfinite(x1 - x0) and math.isfinite(y1 - y0):   # Excalidraw rotates around the center of the unrotated bounds
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        ca, sa = math.cos(ang), math.sin(ang)
+        rot = [(cx + (px - cx) * ca - (py - cy) * sa, cy + (px - cx) * sa + (py - cy) * ca) for px, py in corners]
+        x0, y0 = min(p[0] for p in rot), min(p[1] for p in rot)
+        x1, y1 = max(p[0] for p in rot), max(p[1] for p in rot)
+    if not all(math.isfinite(v) for v in (x0, y0, x1, y1, x1 - x0, y1 - y0)):   # e.g. x = width = 1e308 → treated as broken
+        return None
+    return x0, y0, x1, y1
 
 
 def _bbox0(e: Element) -> Tuple[float, float, float, float]:
@@ -715,7 +808,72 @@ def _rows(items: List[Tuple[Element, Tuple[float, float, float, float]]]) -> Lis
 
 
 def _fmt_box(b: Tuple[float, float, float, float]) -> List[int]:
-    return [int(round(b[0])), int(round(b[1])), int(round(b[2] - b[0])), int(round(b[3] - b[1]))]
+    """[x, y, w, h] in whole units that cover b (floor the start, ceil the end — rounding each could leave drawn points outside)."""
+    x0, y0 = int(math.floor(b[0] + 1e-6)), int(math.floor(b[1] + 1e-6))
+    x1, y1 = int(math.ceil(b[2] - 1e-6)), int(math.ceil(b[3] - 1e-6))
+    return [x0, y0, max(0, x1 - x0), max(0, y1 - y0)]
+
+
+def at_text(b: Optional[Tuple[float, float, float, float]]) -> str:
+    """'@(x,y w×h)' in whole board units — so a text-only client can pair labels with drawings by position."""
+    if not b:
+        return ""
+    x, y, w, h = _fmt_box(b)
+    return "@(%d,%d %d×%d)" % (x, y, w, h)
+
+
+INK_GAP = 24          # strokes whose points come within about this many px of each other are one group
+INK_SAMPLES = 128     # points looked at per stroke
+INK_LINES = 12        # group lines per page in the summary; the rest are folded into one line
+
+
+def ink_groups(strokes: Sequence[Element], gap: Number = INK_GAP) -> List[List[Element]]:
+    """Group handwriting strokes by where they are only (points within ~gap px, grid cells) — not by time: slow drawing or a later
+    edit must not split one sketch. Order: reading order of the group bounds. Broken strokes (no coordinates) form no group."""
+    ok = [e for e in strokes if element_bbox(e) is not None]
+    sessions: List[List[Element]] = [ok] if ok else []
+    g = float(gap) if gap and gap > 0 else float(INK_GAP)
+    out: List[List[Element]] = []
+    for ses in sessions:
+        parent = list(range(len(ses)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        cell: Dict[Tuple[int, int], int] = {}
+        for i, e in enumerate(ses):
+            bb = element_bbox(e)
+            x, y = float(e["x"]), float(e["y"])
+            pts = _points(e) or [(0.0, 0.0)]
+            step = max(1, len(pts) // INK_SAMPLES)
+            seen = set()
+            ang = _num(e.get("angle"))
+            if ang:   # rotated stroke: use its rotated bounds' corners and center (rare — strokes are drawn unrotated)
+                samples = [(bb[0], bb[1]), (bb[2], bb[1]), (bb[0], bb[3]), (bb[2], bb[3]), ((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2)]
+            else:
+                samples = [(x + px, y + py) for px, py in pts[::step] + [pts[-1]]]
+            for ax, ay in samples:
+                if abs(ax) > 1e12 or abs(ay) > 1e12:
+                    continue
+                c = (int(math.floor(ax / g)), int(math.floor(ay / g)))
+                if c in seen:
+                    continue
+                seen.add(c)
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        j = cell.get((c[0] + dx, c[1] + dy))
+                        if j is not None:
+                            parent[find(j)] = find(i)
+                cell.setdefault(c, i)
+        groups: Dict[int, List[Element]] = {}
+        for i, e in enumerate(ses):
+            groups.setdefault(find(i), []).append(e)
+        out.extend(groups.values())
+    boxes = [(grp, scene_bbox(grp) or (0.0, 0.0, 0.0, 0.0)) for grp in out]
+    order = _rows([({"id": str(n)}, b) for n, (_, b) in enumerate(boxes)])
+    return [boxes[int(o["id"])][0] for o in order]
 
 
 def describe(elements: Iterable[Element], page: Optional[int] = None) -> Tuple[str, dict]:
@@ -848,29 +1006,35 @@ def describe(elements: Iterable[Element], page: Optional[int] = None) -> Tuple[s
                 lab = labels.get(e["id"])
                 item.update(kind="box", shape=t, text=_text_of(lab) if lab else None)
                 item["label_id"] = lab["id"] if lab else None
-                lines.append(ind + "[%s] %s%s" % (e["id"], shape_word(t), ' "%s"' % _clip(_text_of(lab)) if lab else ""))
+                line = ind + "[%s] %s%s" % (e["id"], shape_word(t), ' "%s"' % _clip(_text_of(lab)) if lab else "")
             elif e["id"] in orphans:
                 item.update(kind="orphan_label", text=_text_of(e), container=_sid(e.get("containerId")))
-                lines.append(ind + T('[%s] 떨어진 라벨 "%s"(담던 요소가 없다)', '[%s] detached label "%s" (its container is gone)')
-                             % (e["id"], _clip(_text_of(e))))
+                line = ind + T('[%s] 떨어진 라벨 "%s"(담던 요소가 없다)', '[%s] detached label "%s" (its container is gone)') \
+                    % (e["id"], _clip(_text_of(e)))
             elif t == "text":
                 item.update(kind="text", text=_text_of(e))
-                lines.append(ind + T('[%s] 글 "%s"', '[%s] text "%s"') % (e["id"], _clip(_text_of(e))))
+                line = ind + T('[%s] 글 "%s"', '[%s] text "%s"') % (e["id"], _clip(_text_of(e)))
             elif t == "image" and cd.get("latex"):
                 item.update(kind="math", latex=str(cd["latex"]))
-                lines.append(ind + T("[%s] 수식 $%s$", "[%s] math $%s$") % (e["id"], _clip(cd["latex"], 200)))
+                line = ind + T("[%s] 수식 $%s$", "[%s] math $%s$") % (e["id"], _clip(cd["latex"], 200))
+                render = _dict(cd.get("cera")).get("render")
+                if render in ("pending", "error"):   # MCP formula (B5): not typeset yet, or MathJax refused it
+                    item["render"] = render
+                    line += T(" (렌더 대기)", " (render pending)") if render == "pending" else \
+                        T(" (LaTeX 오류: %s)", " (LaTeX error: %s)") % _clip(str(_dict(cd.get("cera")).get("message") or ""), 120)
             elif t == "image":
                 item.update(kind="image")
-                lines.append(ind + T("[%s] 그림 %d×%d", "[%s] image %d×%d") % (e["id"], round(_num(e.get("width"))), round(_num(e.get("height")))))
+                line = ind + T("[%s] 그림", "[%s] image") % e["id"]
             elif t == "line":
                 item.update(kind="line")
-                lines.append(ind + T("[%s] 선", "[%s] line") % e["id"])
+                line = ind + T("[%s] 선", "[%s] line") % e["id"]
             elif t == "frame":
                 item.update(kind="frame", text=e.get("name") if isinstance(e.get("name"), str) else None)
-                lines.append(ind + T('[%s] 틀 "%s"', '[%s] frame "%s"') % (e["id"], _clip(e.get("name") or "", 40)))
+                line = ind + T('[%s] 틀 "%s"', '[%s] frame "%s"') % (e["id"], _clip(e.get("name") or "", 40))
             else:
                 item.update(kind="other")
-                lines.append(ind + "[%s] %s%s" % (e["id"], t, " " + str(e["link"]) if e.get("link") else ""))
+                line = ind + "[%s] %s%s" % (e["id"], t, " " + str(e["link"]) if e.get("link") else "")
+            lines.append(line + (" " + at_text(element_bbox(e)) if element_bbox(e) else ""))
             s_items.append(item)
         pos = {e["id"]: i for i, e in enumerate(seq)}
 
@@ -882,23 +1046,36 @@ def describe(elements: Iterable[Element], page: Optional[int] = None) -> Tuple[s
             sid, eid = _bound_ids(a)
             src, dst = by_id.get(sid or ""), by_id.get(eid or "")
             lab = labels.get(a["id"])
-            two_way = bool(a.get("startArrowhead")) and bool(a.get("endArrowhead"))
-            arrow_word = "↔" if two_way else ("→" if a.get("endArrowhead") or not a.get("startArrowhead") else "←")
+            hs, he = bool(a.get("startArrowhead")), bool(a.get("endArrowhead"))
+            arrow_word = "↔" if hs and he else ("→" if he else ("←" if hs else "—"))
             lines.append(ind + T("[%s] 연결: %s %s %s%s", "[%s] arrow: %s %s %s%s")
                          % (a["id"], name_of(src), arrow_word, name_of(dst),
-                            T(' (라벨 "%s")', ' (label "%s")') % _clip(_text_of(lab), 60) if lab else ""))
+                            T(' (라벨 "%s")', ' (label "%s")') % _clip(_text_of(lab), 60) if lab else "") + (" " + at_text(element_bbox(a)) if element_bbox(a) else ""))
             s_links.append({"id": a["id"], "from": src["id"] if src else None, "to": dst["id"] if dst else None,
                             "from_name": name_of(src), "to_name": name_of(dst),
                             "label": _text_of(lab) if lab else None,
                             "label_id": lab["id"] if lab else None, "page": pid})
         if g["strokes"]:
-            bb = scene_bbox(g["strokes"])
-            n = len(g["strokes"])
-            where = T("(영역 x %d..%d, y %d..%d)", "(area x %d..%d, y %d..%d)") % (round(bb[0]), round(bb[2]), round(bb[1]), round(bb[3])) if bb else ""
-            lines.append(ind + T("손글씨 획 %d개%s — 글로 읽을 수 없음, 그림으로 볼 것",
-                                 "%d ink stroke(s)%s — not readable as text, look at the picture") % (n, where))
-            s_strokes.append({"page": pid, "count": n, "bbox": _fmt_box(bb) if bb else None,
-                              "ids": [s["id"] for s in g["strokes"]]})
+            grps = ink_groups(g["strokes"])
+            grouped = {s["id"] for grp in grps for s in grp}
+            loose = [s for s in g["strokes"] if s["id"] not in grouped]   # broken strokes (no coordinates)
+            show, rest = grps[:INK_LINES], grps[INK_LINES:]
+            for grp in show:
+                bb = scene_bbox(grp)
+                lines.append(ind + T("손글씨 획 %d개 %s — 글로 읽을 수 없음, board_snapshot 으로 본다",
+                                     "%d ink stroke(s) %s — not readable as text, look with board_snapshot") % (len(grp), at_text(bb)))
+                s_strokes.append({"page": pid, "count": len(grp), "bbox": _fmt_box(bb) if bb else None,
+                                  "ids": [s["id"] for s in grp]})
+            more = [s for grp in rest for s in grp] + loose
+            if more:
+                bb = scene_bbox(more)
+                if rest:
+                    lines.append(ind + T("그 밖 손글씨 획 %d개(묶음 %d)", "%d more ink stroke(s) (%d group(s))") % (len(more), len(rest))
+                                 + (" " + at_text(bb) if bb else ""))
+                else:   # only strokes with broken coordinates
+                    lines.append(ind + T("손글씨 획 %d개(위치를 알 수 없음)", "%d ink stroke(s) (position unknown)") % len(loose))
+                s_strokes.append({"page": pid, "count": len(more), "bbox": _fmt_box(bb) if bb else None,
+                                  "ids": [s["id"] for s in more], "rest": True})
     whole = scene_bbox(live)
     structured = {"counts": counts, "pages": s_pages, "items": s_items, "links": s_links, "strokes": s_strokes,
                   "bbox": _fmt_box(whole) if whole else None}
