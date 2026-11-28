@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import secrets
 import signal
 import struct
 import subprocess
@@ -88,6 +89,9 @@ IMAGE_MAX_BYTES = 2_600_000   # PNG bytes in one image block (base64 ≈ 3.5 MB,
 HEARTBEAT_S = 10.0            # while this agent holds a working request, its presence is refreshed this often (the server marks a request interrupted after 60 s without)
 REQ_IDS_SHOWN = 40            # target ids listed per request in board_requests (the rest: board_snapshot request:<rid>)
 REQ_STATUS_AGENT = ("working", "proposed", "failed", "declined")
+PROP_GAP = 30                 # a proposal goes this far right of (or below) the originals' box (WP-6)
+PROP_UNCERTAIN_MAX = 20       # proposal.uncertain entries ('?' badge on the card)
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 REQ_WAITING = ("open", "interrupted")   # requests waiting for an agent (same as pending.json): board_wait kinds request wakes on these
 REQ_KIND_WORD = {"auto": ("알아서", "auto"), "text": ("글", "text"), "math": ("수식", "math"), "diagram": ("도식", "diagram"),
                  "graph": ("그래프", "graph"), "tidy": ("정리", "tidy")}
@@ -293,6 +297,7 @@ class Session:
         self.closed = False
         self.watchdog = None
         self.hb: Dict[Tuple[str, str, str], "Conn"] = {}   # (server, board, rid) → Conn: working requests whose presence heartbeat this session keeps
+        self.req_seen: Dict[Tuple[str, str, str], dict] = {}   # (server, board, rid) → {id: version} on the request's area when this agent took / read it (WP-6 drift)
         self.hb_thread = None
         self.hb_stop = threading.Event()
         env = _sibling("i18n").env   # CERA_* first, then the old TEMPBOARD_* names
@@ -536,6 +541,11 @@ def _req_lines(r, now_ms: int) -> List[str]:
                (T(f" … {len(ids) - len(shown)}개 더(board_snapshot request 로 본다)", f" … {len(ids) - len(shown)} more (see board_snapshot request)")
                 if len(ids) > len(shown) else ""))
     return out
+
+
+def _centred(e, box) -> bool:
+    b = ak.element_bbox(e)
+    return bool(b) and box[0] <= (b[0] + b[2]) / 2 <= box[2] and box[1] <= (b[1] + b[3]) / 2 <= box[3]
 
 
 def _live(els):
@@ -1260,6 +1270,11 @@ class Tools:
             if isinstance(it, dict) and it.get("kind") == "mermaid" and len(items_in) != 1:
                 raise ToolError(T("mermaid 는 혼자 넣는다(items 에 그 하나만). 다른 항목은 다음 호출로.",
                                   "mermaid goes alone (only that one item in items). Add the other items in another call."))
+        prop = self._proposal_args(a.get("proposal")) if a.get("proposal") is not None else None
+        if prop is not None:
+            if a.get("page") is not None or any(isinstance(it, dict) and it.get("kind") in ("frame_page", "mermaid") for it in items_in):
+                raise ToolError(T("proposal 은 page · frame_page · mermaid 와 함께 쓰지 않는다(자리는 원본 옆으로 정해진다 — 흐름도는 kind:\"flow\"). 아무것도 넣지 않았다.",
+                                  "proposal does not go with page, frame_page or mermaid (it is placed beside the originals — use kind:\"flow\" for a flowchart). Nothing was added."))
         if isinstance(items_in[0], dict) and items_in[0].get("kind") == "mermaid":
             return self._add_mermaid(a, items_in[0])
         c, sid = self.s.conn(a.get("site"))
@@ -1268,6 +1283,21 @@ class Tools:
         els = [e for e in d.get("elements") or [] if isinstance(e, dict)]
         live = {e["id"]: e for e in _live(els) if isinstance(e.get("id"), str)}
         by = self.s.name
+        req = None
+        if prop is not None:
+            if prop["request"]:
+                req = next((r for r in self._requests(c, bid, True) if r.get("rid") == prop["request"]), None)
+                if req is None:
+                    raise ToolError(T(f"요청 {prop['request']} 가 없다(board_requests all:true). 아무것도 넣지 않았다.",
+                                      f"No request {prop['request']} (board_requests all:true). Nothing was added."))
+                if req.get("status") not in ("open", "working", "interrupted"):
+                    raise ToolError(T(f"요청 {prop['request']} 는 이미 {req.get('status')} — 제안을 놓지 않았다", f"Request {prop['request']} is already {req.get('status')} — no proposal placed"))
+            src_in = prop["sources"] if prop["sources"] is not None else \
+                [t.get("id") for t in (req or {}).get("targets") or [] if isinstance(t, dict) and isinstance(t.get("id"), str)]
+            prop["sources"] = [i for i in dict.fromkeys(src_in) if i in live and not ak.proposal_of(live[i])]
+            if not prop["sources"]:
+                raise ToolError(T("proposal.sources 의 원본이 보드에 하나도 없다(지워졌거나 id 가 틀리다). 아무것도 넣지 않았다.",
+                                  "None of proposal.sources is on the board (deleted, or wrong ids). Nothing was added."))
         at = a.get("at", "right")
         if isinstance(at, dict):
             at = (_num(at.get("x"), "at.x"), _num(at.get("y"), "at.y"))
@@ -1327,6 +1357,9 @@ class Tools:
                         ends.append((_num(v.get("x"), side + ".x"), _num(v.get("y"), side + ".y")))
                     elif isinstance(v, str) and (v in refs or v in live):
                         tgt = refs[v] if v in refs else live[v]
+                        if prop is not None and v not in refs:   # binding would bump an existing element's version: the originals must stay untouched
+                            raise ToolError(T(f"items[{n}].{side} = {v!r} — 제안 안의 화살표는 이번 items 의 ref 끼리만 잇는다(원본은 바꾸기 전까지 그대로). 아무것도 넣지 않았다.",
+                                              f"items[{n}].{side} = {v!r} — arrows in a proposal join refs from this items list only (the originals stay untouched until a person applies). Nothing was added."))
                         if tgt.get("type") in ("arrow", "line", "freedraw"):   # arrows bind only to shapes, text, images, frames
                             raise ToolError(T(f"items[{n}].{side} = {v!r} 는 {tgt.get('type')} — 화살표는 선 · 화살표 · 손글씨에 붙지 않는다. {{x, y}} 로 준다",
                                               f"items[{n}].{side} = {v!r} is a {tgt.get('type')} — arrows do not attach to lines, arrows or ink; give {{x, y}}"))
@@ -1400,7 +1433,9 @@ class Tools:
             if bb:
                 frame["width"] = max(frame["width"], bb[2] - frame["x"] + 80)
                 frame["height"] = max(frame["height"], bb[3] - frame["y"] + 80)
-        if at == "absolute":
+        if prop is not None:   # beside the originals: right +30, else below (B2) — never over anyone's drawing
+            ak.place(els, new, at=self._proposal_spot(live, prop["sources"], new))
+        elif at == "absolute":
             ak.assign_indices(els, new)
         elif frame is not None and not frame_new:   # inside an existing page — below the drawings in that page (top-left of the page if none)
             inside = [e for e in _live(els) if e.get("frameId") == frame["id"]]
@@ -1415,6 +1450,15 @@ class Tools:
                 a_, b_, x0_, y0_, via, labl = v
                 dx, dy = a_["x"] - x0_, a_["y"] - y0_
                 ak.route_via(e, a_, b_, [(p[0] + dx, p[1] + dy) for p in via], labl)
+        anchor = None
+        if prop is not None:
+            src_els = [live[i] for i in prop["sources"]]
+            drift = self._drift(c, bid, req, els, {e["id"] for e in new}) if req else 0
+            anchor = ak.make_anchor(secrets.token_hex(5), ak.scene_bbox(new), rid=req.get("rid") if req else None, sources=prop["sources"],
+                                    results=[e["id"] for e in new], src_box=ak.scene_bbox(src_els), note=prop["note"],
+                                    uncertain=prop["uncertain"], drift=drift, agent=by, by=by)
+            ak.assign_indices(els + new, [anchor])
+            new.append(anchor)
         for f in files:
             c.ok("POST", f"/api/whiteboard/boards/{bid}/files", {"client": c.client, **f}, want=(200, 201))
         for i in range(0, len(new), 2000):
@@ -1440,18 +1484,163 @@ class Tools:
             try:
                 cur = {e.get("id"): e for e in _fetch(c, bid).get("elements") or [] if isinstance(e, dict)}
                 new = [cur.get(e["id"], e) if e.get("type") == "image" else e for e in new]
+                if anchor is not None:
+                    anchor = self._refit_anchor(c, bid, cur, anchor) or anchor
             except ToolError:
                 pass
+        prop_line = ""
+        if anchor is not None:
+            pr = ak.proposal_of(anchor)
+            prop_line = T(f"\n제안 [{pr['pid']}] 을 원본 옆에 놓았다 — 사람이 바꾸기 · 둘 다 두기 · 버리기를 고른다. 원본은 그대로다.",
+                          f"\nProposal [{pr['pid']}] placed beside the originals — a person chooses apply / keep both / dismiss. The originals are untouched.")
+            if pr["drift"]:
+                prop_line += T(f" 요청 뒤 원본 쪽이 {pr['drift']}곳 바뀌었다(카드에 '읽은 뒤 바뀜 {pr['drift']}').",
+                               f" {pr['drift']} change(s) on the originals since the request (the card says so).")
+            if req:
+                code, d2 = c.req("POST", f"/api/whiteboard/boards/{bid}/requests/{req['rid']}", {"client": c.client, "status": "proposed", "pid": pr["pid"]})
+                self.s.heartbeat(c, bid, req["rid"], False)
+                prop_line += T(f" 요청 [{req['rid']}] → 제안 도착.", f" Request [{req['rid']}] → proposal placed.") if code == 200 else \
+                    T(f" 요청 상태는 못 바꿨다({code}: {(d2 or {}).get('error') if isinstance(d2, dict) else d2}).",
+                      f" The request status was not changed ({code}: {(d2 or {}).get('error') if isinstance(d2, dict) else d2}).")
         text, st = ak.describe(new + [live[i] for i in touched_existing])
         created = {k: v["id"] for k, v in refs.items()}
         res = {"board": bid, "created": created, "ids": [e["id"] for e in new], "items": st["items"], "links": st["links"]}
+        if anchor is not None:
+            pr = ak.proposal_of(anchor)
+            res["proposal"] = {"pid": pr["pid"], "anchor": anchor["id"], "request": pr["rid"], "sources": len(pr["sources"]), "drift": pr["drift"]}
         if math_st:
             res["math"] = math_st
         nb = {e["id"]: e for e in new}
         lines = annotate(text.split("\n")[1:], nb, _labels(new))
         return T(f"보드 {bid} 에 {len(new)}개를 넣었다.", f"Added {len(new)} item(s) to board {bid}.") + \
-            (f" ref→id: {json.dumps(created, ensure_ascii=False)}" if created else "") + \
+            (f" ref→id: {json.dumps(created, ensure_ascii=False)}" if created else "") + prop_line + \
             "".join("\n" + x for x in notes + math_lines) + "\n" + "\n".join(lines), res
+
+    def _refit_anchor(self, c: Conn, bid: str, cur: dict, anchor: dict) -> Optional[dict]:
+        """After a tab typeset the formulas (their size changed), make the anchor wrap the result again - only if nobody acted on it meanwhile
+        (base_version), so a person's apply is never undone."""
+        a = cur.get(anchor["id"])
+        p = ak.proposal_of(a) if a else None
+        if not p or a.get("isDeleted") or p.get("status") != "proposed":
+            return None
+        rb = ak.scene_bbox([cur[i] for i in p.get("results") or [] if i in cur and i != anchor["id"]])
+        if not rb:
+            return None
+        pad = ak.PROPOSAL_PAD   # the top-left stays (it is the card's 'home' for revert); only the size follows the result
+        w, h = max(rb[2] + pad - a["x"], 2 * pad), max(rb[3] + pad - a["y"], 2 * pad)
+        if abs(w - a["width"]) < 0.5 and abs(h - a["height"]) < 0.5:
+            return None
+        r = c.ok("POST", f"/api/whiteboard/boards/{bid}/patch", {"client": c.client, "changes": [
+            {"id": a["id"], "base_version": a.get("version"), "set": {"width": w, "height": h}}]}) or {}
+        return dict(a, width=w, height=h) if r.get("applied") else None
+
+    def _proposal_args(self, v) -> dict:
+        """board_add proposal:{request?, sources?, note?, uncertain?:[{text, alts}]} -> checked dict. Every mistake names the field; nothing is written."""
+        if not isinstance(v, dict):
+            raise ToolError(T("proposal 은 객체 {request?, sources?, note?, uncertain?}", "proposal must be an object {request?, sources?, note?, uncertain?}"))
+        extra = sorted(str(k) for k in v if k not in ("request", "sources", "note", "uncertain"))
+        if extra:
+            raise ToolError(T(f"proposal 에 모르는 칸: {', '.join(extra)} — 쓸 수 있는 칸: request, sources, note, uncertain. 아무것도 넣지 않았다.",
+                              f"proposal has unknown field(s): {', '.join(extra)} — allowed: request, sources, note, uncertain. Nothing was added."))
+        rid = v.get("request")
+        if rid is not None and (not isinstance(rid, str) or not re.fullmatch(r"[a-f0-9]{10}", rid)):
+            raise ToolError(T("proposal.request 는 board_requests 의 [rid]", "proposal.request must be the [rid] from board_requests"))
+        src = v.get("sources")
+        if src is not None and (not isinstance(src, list) or not 1 <= len(src) <= 500 or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in src)):
+            raise ToolError(T("proposal.sources 는 원본 요소 id 1–500개", "proposal.sources must be 1-500 element ids of the originals"))
+        if rid is None and src is None:
+            raise ToolError(T("proposal 에는 request 나 sources 가 있어야 한다(무엇을 바꿀 제안인지)", "proposal needs request or sources (what it would replace)"))
+        note = _CTRL_RE.sub(" ", _str(v["note"], "proposal.note", 200, allow_empty=True)).strip() if v.get("note") is not None else ""
+        unc = v.get("uncertain") or []
+        if not isinstance(unc, list) or len(unc) > PROP_UNCERTAIN_MAX:
+            raise ToolError(T(f"proposal.uncertain 은 {PROP_UNCERTAIN_MAX}개까지의 목록 [{{text, alts}}]", f"proposal.uncertain must be a list of up to {PROP_UNCERTAIN_MAX} [{{text, alts}}]"))
+        out_u = []
+        for k, u in enumerate(unc):
+            alts = u.get("alts", []) if isinstance(u, dict) else None
+            if not isinstance(u, dict) or not isinstance(u.get("text"), str) or not u["text"].strip() or len(u["text"]) > 80 or \
+                    not isinstance(alts, list) or len(alts) > 6 or not all(isinstance(x, str) and 0 < len(x) <= 80 for x in alts):
+                raise ToolError(T(f"proposal.uncertain[{k}] 는 {{text: 80자까지, alts: 후보 6개까지}}", f"proposal.uncertain[{k}] must be {{text: up to 80 chars, alts: up to 6 candidates}}"))
+            out_u.append({"text": _CTRL_RE.sub(" ", u["text"]).strip(), "alts": [_CTRL_RE.sub(" ", x).strip() for x in alts]})
+        return {"request": rid, "sources": src, "note": note, "uncertain": out_u}
+
+    @staticmethod
+    def _proposal_spot(live: dict, sources: List[str], new: List[dict]) -> Tuple[float, float]:
+        """Top-left for the result group: right of the originals' box +30 (the anchor's edge), else below it; if both are taken, slid right or
+        down past what is in the way, whichever ends nearer the originals. Never over anyone's drawing."""
+        src = set(sources)
+        sb = ak.scene_bbox([live[i] for i in sources])
+        gb = ak.scene_bbox(new)
+        if sb is None or gb is None:
+            raise ToolError(T("원본(또는 결과)에 쓸 수 있는 좌표가 없어 자리를 못 정한다. 아무것도 넣지 않았다.",
+                              "The originals (or the result) have no usable coordinates, so no place can be chosen. Nothing was added."))
+        w, h = gb[2] - gb[0], gb[3] - gb[1]
+        pad, gap = ak.PROPOSAL_PAD, PROP_GAP
+        obs = [b for b in (ak.element_bbox(e) for e in live.values() if e["id"] not in src and e.get("containerId") not in src
+                           and e.get("type") not in ("frame", "magicframe")) if b]   # a page frame holds drawings; it is not in the way
+
+        def hits(x, y):
+            box = (x - pad, y - pad, x + w + pad, y + h + pad)
+            return [o for o in obs if o[0] < box[2] and box[0] < o[2] and o[1] < box[3] and box[1] < o[3]]
+        def slide(x, y, right):   # push right (or down) past whatever is in the way
+            for _ in range(80):
+                hh = hits(x, y)
+                if not hh:
+                    return x, y
+                if right:
+                    x = max(o[2] for o in hh) + gap + pad
+                else:
+                    y = max(o[3] for o in hh) + gap + pad
+            return x, y
+        r0, b0 = (sb[2] + gap + pad, sb[1]), (sb[0], sb[3] + gap + pad)
+        if not hits(*r0):
+            return r0
+        if not hits(*b0):
+            return b0
+        r, b = slide(*r0, True), slide(*b0, False)   # both blocked: whichever stays nearer the originals
+        return r if r[0] - r0[0] <= b[1] - b0[1] else b
+
+    def _note_read(self, c: Conn, bid: str, r: dict, els=None):
+        """Remember what was on request r's area (its targets plus anything centred in its box, with versions) when this agent took it or
+        looked at it - 'changed after reading' on the card is measured from here, by server versions (no device clocks)."""
+        box = _req_box(r)
+        if not box or not isinstance(r.get("rid"), str):
+            return
+        try:
+            els = els if els is not None else _fetch(c, bid).get("elements") or []
+        except ToolError:
+            return
+        tids = {t.get("id") for t in r.get("targets") or [] if isinstance(t, dict)}
+        seen = {e["id"]: e.get("version") for e in _live(els) if isinstance(e.get("id"), str) and (e["id"] in tids or _centred(e, box))}
+        if len(seen) <= 20000:
+            store = getattr(self.s, "req_seen", None)
+            if store is None:
+                store = self.s.req_seen = {}
+            store[(c.base, bid, r["rid"])] = seen
+
+    def _drift(self, c: Conn, bid: str, req: dict, els: List[dict], own: set) -> int:
+        """How much changed on the request's area since this agent took it or last looked at it (board_snapshot request): elements seen then
+        whose version moved or that were deleted, plus people's elements now centred in the box that were not there. Server versions only.
+        Without a record (another session took it) only the targets' versions at request time are compared."""
+        seen = (getattr(self.s, "req_seen", None) or {}).get((c.base, bid, req.get("rid")))
+        if seen is None:
+            seen, count_new = {t.get("id"): t.get("v") for t in req.get("targets") or [] if isinstance(t, dict)}, False
+        else:
+            count_new = True
+        by_id = {e.get("id"): e for e in els}
+        n = 0
+        for i, v in seen.items():
+            e = by_id.get(i)
+            if e is None or e.get("isDeleted") or e.get("version") != v:
+                n += 1
+        box = _req_box(req)
+        if count_new and box:
+            for e in _live(els):
+                cd = e.get("customData") if isinstance(e.get("customData"), dict) else {}
+                if e.get("id") in seen or e.get("id") in own or ak.proposal_of(e) or str(cd.get("tbBy") or "").startswith("agent:"):
+                    continue
+                if _centred(e, box):
+                    n += 1
+        return n
 
     def _relabel(self, c_el: dict, lab: Optional[dict], text: str) -> Tuple[dict, dict, Optional[dict]]:
         """Change the text label of a box / arrow → (box set, label set, new label element | None)."""
@@ -2119,6 +2308,8 @@ class Tools:
         if code not in (200, 201) or not isinstance(d, dict):
             c.fail(code, d, f"/api/whiteboard/boards/{bid}/requests/{rid}")
         self.s.heartbeat(c, bid, rid, status == "working")
+        if status == "working":
+            self._note_read(c, bid, d)
         bb = _req_box(d)
         if status == "working" and bb:   # show people where the agent is looking: just off the top-right corner of the request area
             try:
@@ -2293,6 +2484,7 @@ class Tools:
                 raise ToolError(T("그 요청에 대상이 없다", "That request has no targets"))
             kind = T(*REQ_KIND_WORD[req.get("kind")]) if req.get("kind") in REQ_KIND_WORD else str(req.get("kind"))
             who_line = T(f'요청 [{rid}] ({_clip(str(req.get("by")), 40)} · {kind})', f'request [{rid}] ({_clip(str(req.get("by")), 40)} · {kind})')
+            self._note_read(c, bid, req)
         elif a.get("selection"):
             rows = self._selections(c, bid, a.get("who"))
             users = sorted({r["user"] for r in rows})
@@ -2491,7 +2683,7 @@ class Tools:
         """format:"drawio": uncompressed mxGraph XML in board coordinates — shapes and free text as vertices, arrows and lines as edges (U4).
         Ink, images and page frames are left out and counted."""
         title = (d.get("meta") or {}).get("title") or bid
-        xml, cnt = gio.to_drawio(els, title)
+        xml, cnt = gio.to_drawio([e for e in els if not ak.proposal_of(e)], title)   # a proposal's dashed anchor is screen-only (WP-6)
         out_dir = Path(os.path.expanduser(a["out_dir"])) if a.get("out_dir") else self.s.ctx.HOME / "exports"
         out_dir.mkdir(parents=True, exist_ok=True)
         name = re.sub(r"[^\w가-힣.-]+", "_", title).strip("_")[:60] or bid
@@ -2651,7 +2843,19 @@ def tool_defs(remote: bool) -> List[dict]:
                           "\"right\" (right of the existing drawing, default), \"below\", {x,y} or \"absolute\" (x/y as board coordinates). page: inside that page."),
          "inputSchema": obj({"site": SITE, "board": BOARD, "items": {"type": "array", "items": ITEM, "minItems": 1},
                              "at": {"description": "\"right\" | \"below\" | \"absolute\" | {x, y}"},
-                             "page": {"type": "integer"}}, ["items"]),
+                             "page": {"type": "integer"},
+                             "proposal": {"type": "object", "description": T(
+                                 "있으면 결과를 원본 오른쪽(막히면 아래)에 '제안' 으로 놓는다 — 원본은 그대로, 사람이 카드에서 바꾸기 · 둘 다 두기 · 버리기. "
+                                 "request 를 주면 그 요청이 '제안 도착' 이 되고 sources 기본값은 요청 대상. at 은 쓰지 않고, page · mermaid 와는 같이 못 쓴다. "
+                                 "uncertain: 자신 없는 글자 [{text, alts}] → 카드의 '?'.",
+                                 "If given, the result goes beside the originals (right, else below) as a 'proposal' — originals untouched; a person picks apply / keep both / "
+                                 "dismiss on its card. With request, that request becomes 'proposal placed' and sources default to its targets. at is not used; page and mermaid are refused. "
+                                 "uncertain: readings you are unsure of [{text, alts}] -> the card's '?'."),
+                                 "properties": {"request": {"type": "string"}, "sources": {"type": "array", "items": {"type": "string"}},
+                                                "note": {"type": "string", "maxLength": 200},
+                                                "uncertain": {"type": "array", "items": {"type": "object", "properties": {
+                                                    "text": {"type": "string"}, "alts": {"type": "array", "items": {"type": "string"}}}}}},
+                                 "additionalProperties": False}}, ["items"]),
          "annotations": w},
         {"name": "board_update", "title": T("보드 고치기", "Edit a board"),
          "description": T("요소를 고친다(글 · 라벨 · 자리 · 크기 · 색). 서버가 지금 상태에 적용한다. base_version(board_read 의 version)을 주면 "

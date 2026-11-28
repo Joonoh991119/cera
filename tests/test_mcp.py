@@ -2331,5 +2331,140 @@ class Wp5R1(unittest.TestCase):
             self.assertTrue(st.get("timeout"), (later, text))
 
 
+class Wp6(Base):
+    """09 plan WP-6: board_add proposal:{request, sources} places the result beside the originals with an anchor, never touches them,
+    marks the request proposed, counts what changed after the request, and board_read lists the proposal."""
+    ask = Wp5.ask
+
+    def setUp(self):
+        Base.setUp(self)
+        self.m = self.mcp()
+        self.m.init()
+        o = self.m.ok("site_open", {"tunnel": "none", "title": "제안"}, timeout=120)["structuredContent"]
+        self.sid, self.bid = o["site"], o["board"]
+        self.port, self.h = self.human(self.sid)
+        fix = json.loads((HERE / "tests" / "fixtures" / "rough07.json").read_text(encoding="utf-8"))
+        self.flow = fix["regions"]["flow"]
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h,
+                             {"client": "hum1", "elements": fix["elements"]})[0], 200)
+        self.vers = {e["id"]: e["version"] for e in fix["elements"]}
+
+    FLOW = {"kind": "flow", "dir": "TD", "nodes": [{"id": k, "label": k, "shape": "diamond" if k == "C" else "box"} for k in "ABCDEF"],
+            "edges": [{"from": "A", "to": "B"}, {"from": "B", "to": "C"}, {"from": "C", "to": "D", "label": "yes"},
+                      {"from": "C", "to": "E", "label": "no"}, {"from": "D", "to": "F"}, {"from": "E", "to": "F"}]}
+
+    def board(self):
+        return raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}", self.h)[1]["elements"]
+
+    def src_box(self):
+        by = {e["id"]: e for e in self.board()}
+        return AK.scene_bbox([by[i] for i in self.flow])
+
+    def test_criterion_1_flow_proposal_beside_originals_untouched(self):
+        r = self.ask()
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        res = self.m.ok("board_add", {"items": [self.FLOW], "proposal": {"request": r["rid"], "sources": self.flow, "note": "C 는 마름모로 읽음",
+                                                                       "uncertain": [{"text": "yes", "alts": ["ves"]}]}})
+        st, text = res["structuredContent"], res["content"][0]["text"]
+        pid = st["proposal"]["pid"]
+        self.assertIn(f"제안 [{pid}]", text)
+        els = self.board()
+        self.assertEqual({e["id"]: e["version"] for e in els if e["id"] in self.vers}, self.vers, "원본 version 하나도 안 바뀜")
+        a = next(e for e in els if e["id"] == "prop-" + pid)
+        p = AK.proposal_of(a)
+        self.assertEqual((p["status"], p["rid"], sorted(p["sources"]), p["note"], p["agent"]), ("proposed", r["rid"], sorted(self.flow), "C 는 마름모로 읽음", "Claude"))
+        self.assertEqual(p["uncertain"], [{"text": "yes", "alts": ["ves"]}])
+        self.assertTrue(a["locked"])
+        self.assertEqual(a["strokeStyle"], "dashed")
+        sb = self.src_box()
+        self.assertGreaterEqual(a["x"], sb[2] + 30 - 0.5, "원본 bbox 오른쪽 +30(그래프가 막고 있어 그 오른쪽으로 밀림)")
+        self.assertLess(a["x"], 829 + 30 + 1, "그래프 바로 오른쪽 — 멀리 아래로 가지 않는다")
+        self.assertAlmostEqual(a["y"], sb[1] - AK.PROPOSAL_PAD, delta=0.5)
+        results = [e for e in els if e["id"] in p["results"]]
+        self.assertEqual(sum(1 for e in results if e["type"] in ("rectangle", "diamond") and not e.get("containerId")), 6)
+        self.assertEqual(sum(1 for e in results if e["type"] == "arrow"), 6)
+        rb = AK.scene_bbox(results)
+        self.assertTrue(a["x"] <= rb[0] and a["y"] <= rb[1] and a["x"] + a["width"] >= rb[2] and a["y"] + a["height"] >= rb[3], "앵커가 결과를 감싼다")
+        rq = raw(self.port, "GET", f"/api/whiteboard/boards/{self.bid}/requests", self.h)[1]["requests"][0]
+        self.assertEqual((rq["status"], rq["pid"]), ("proposed", pid))
+        summary = self.m.ok("board_read", {})
+        self.assertIn(f"제안 [{pid}] 사람이 고르기를 기다림 · 원본 26개 → 결과", summary["content"][0]["text"])
+        self.assertNotIn(f"[prop-{pid}] 상자", summary["content"][0]["text"], "앵커는 상자로 안 읽힌다")
+        self.assertEqual(summary["structuredContent"]["proposals"][0]["pid"], pid)
+        # a person applies on the server: the board_read line follows
+        st_, d = raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/proposals/{pid}", self.h, {"client": "hum1", "action": "apply", "from_status": "proposed"})
+        self.assertEqual(st_, 200, d)
+        self.assertIn(f"제안 [{pid}] 바꿈(원래대로 가능)", self.m.ok("board_read", {})["content"][0]["text"])
+        out = self.m.ok("board_export", {"format": "drawio", "out_dir": str(self.home / "ex")})["structuredContent"]["path"]
+        a2 = next(e for e in self.board() if e["id"] == "prop-" + pid)
+        geo = 'x="%g" y="%g" width="%g" height="%g"' % (a2["x"], a2["y"], a2["width"], a2["height"])
+        self.assertNotIn(geo, Path(out).read_text(encoding="utf-8"), "draw.io 에도 앵커는 안 나간다")
+
+    def test_criterion_8_strokes_added_after_working_show_as_drift(self):
+        r = self.ask()
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        b = r["bbox"]
+        now = int(time.time() * 1000) + 5
+        new = [{"id": f"late{i}", "type": "freedraw", "x": b["x"] + 20 + 10 * i, "y": b["y"] + 20, "width": 10, "height": 10,
+                "points": [[0, 0], [10, 10]], "version": 1, "versionNonce": i, "updated": now} for i in range(2)]
+        self.assertEqual(raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": new})[0], 200)
+        res = self.m.ok("board_add", {"items": [{"kind": "text", "text": "정리"}], "proposal": {"request": r["rid"]}})
+        self.assertEqual(res["structuredContent"]["proposal"]["drift"], 2)
+        self.assertIn("읽은 뒤 바뀜 2", self.m.ok("board_read", {})["content"][0]["text"])
+
+    def test_r1_drift_counts_from_working_not_from_the_request(self):
+        """Opus r1: strokes drawn before the agent took the request (and read them) are not 'changed after reading'; server versions, no clocks."""
+        r = self.ask()
+        b = r["bbox"]
+        early = [{"id": f"early{i}", "type": "freedraw", "x": b["x"] + 20 + 10 * i, "y": b["y"] + 20, "width": 10, "height": 10,
+                  "points": [[0, 0], [10, 10]], "version": 1, "versionNonce": i, "updated": 1} for i in range(2)]
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": early})
+        self.m.ok("board_request_update", {"rid": r["rid"], "status": "working"})
+        late = [dict(early[0], id="late0", updated=1), dict(early[1], id="early1", version=2, versionNonce=9, updated=1)]   # a clock far behind
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": late})
+        res = self.m.ok("board_add", {"items": [{"kind": "text", "text": "정리"}], "proposal": {"request": r["rid"]}})
+        self.assertEqual(res["structuredContent"]["proposal"]["drift"], 2, "working 뒤 새 획 1 + 고친 획 1, 그 전 획은 안 센다")
+
+    def test_below_when_the_right_is_taken_and_refusals(self):
+        sb = self.src_box()
+        wall = {"id": "wall", "type": "rectangle", "x": sb[2] + 10, "y": sb[1] - 50, "width": 400, "height": sb[3] - sb[1] + 100, "version": 1, "versionNonce": 1}
+        raw(self.port, "POST", f"/api/whiteboard/boards/{self.bid}/elements", self.h, {"client": "hum1", "elements": [wall]})
+        res = self.m.ok("board_add", {"items": [{"kind": "box", "label": "X"}], "proposal": {"sources": self.flow}})
+        a = next(e for e in self.board() if e["id"] == res["structuredContent"]["proposal"]["anchor"])
+        self.assertGreaterEqual(a["y"], sb[3] + 30 - 0.5, "오른쪽이 막혀 아래로")
+        for args, word in (({"items": [{"kind": "box"}], "page": 1, "proposal": {"sources": self.flow}}, "page"),
+                           ({"items": [{"kind": "arrow", "from": self.flow[0], "to": {"x": 0, "y": 0}}], "proposal": {"sources": self.flow}}, "ref 끼리만"),
+                           ({"items": [{"kind": "box"}], "proposal": {"sources": self.flow, "why": 1}}, "모르는 칸"),
+                           ({"items": [{"kind": "box"}], "proposal": {}}, "request 나 sources"),
+                           ({"items": [{"kind": "box"}], "proposal": {"sources": ["gone"]}}, "하나도 없다"),
+                           ({"items": [{"kind": "box"}], "proposal": {"request": "f" * 10}}, "없다")):
+            bad = self.m.tool("board_add", args)
+            self.assertTrue(bad.get("isError"), args)
+            self.assertIn(word, bad["content"][0]["text"])
+        self.assertEqual({e["id"]: e["version"] for e in self.board() if e["id"] in self.vers}, self.vers)
+
+
+class Wp6Spot(unittest.TestCase):
+    """WP-6 placement in-process: right of the originals +30 when free, below when the right is taken."""
+    def test_right_then_below(self):
+        mod = _load("tb_mcp", "cera_tb_mcp_wp6")
+        src = {"id": "s", "type": "rectangle", "x": 0, "y": 0, "width": 100, "height": 50}
+        res = [{"id": "r", "type": "rectangle", "x": 0, "y": 0, "width": 60, "height": 40}]
+        pad = AK.PROPOSAL_PAD
+        self.assertEqual(mod.Tools._proposal_spot({"s": src}, ["s"], res), (100 + 30 + pad, 0))
+        wall = {"id": "w", "type": "rectangle", "x": 120, "y": -20, "width": 50, "height": 100}
+        self.assertEqual(mod.Tools._proposal_spot({"s": src, "w": wall}, ["s"], res), (0, 50 + 30 + pad))
+
+    def test_r1_page_frame_is_not_in_the_way_and_broken_originals_say_so(self):
+        """neon r1 #3 · #9: a page frame around the originals is not an obstacle; originals without usable coordinates give a ToolError."""
+        mod = _load("tb_mcp", "cera_tb_mcp_wp6r1")
+        fr = AK.make_frame(None, 0, 0, 1600, 900, page=1)
+        src = {"id": "s", "type": "rectangle", "x": 100, "y": 100, "width": 200, "height": 150, "frameId": fr["id"]}
+        res = [{"id": "r", "type": "rectangle", "x": 0, "y": 0, "width": 60, "height": 40}]
+        self.assertEqual(mod.Tools._proposal_spot({"s": src, fr["id"]: fr}, ["s"], res), (300 + 30 + AK.PROPOSAL_PAD, 100))
+        with self.assertRaises(mod.ToolError):
+            mod.Tools._proposal_spot({"s": dict(src, x="bad")}, ["s"], res)
+
+
 if __name__ == "__main__":
     unittest.main()

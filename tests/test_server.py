@@ -883,5 +883,227 @@ class Requests(unittest.TestCase):
         self.assertEqual(self.upd(r["rid"], "proposed", client="ag-owner")[0], 200)
 
 
+AK = None
+
+
+def _ak():
+    global AK
+    if AK is None:
+        sp = importlib.util.spec_from_file_location("wb_agentkit_t", HERE / "server" / "agentkit.py")
+        AK = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(AK)
+    return AK
+
+
+class Proposals(unittest.TestCase):
+    """WP-6 proposal cards: apply · revert · keep · dismiss on the server, under the lock, with the request following the card."""
+    EK, VK, TOK = Jobs.EK, Jobs.VK, Jobs.TOK
+    person, agent, call, tearDown = Jobs.person, Jobs.agent, Jobs.call, Jobs.tearDown
+
+    def setUp(self):
+        Jobs.setUp(self)
+        self.src = [{"id": f"s{i}", "type": "freedraw", "x": 10 * i, "y": 20, "width": 30, "height": 10, "points": [[0, 0], [30, 10]],
+                     "version": 3, "versionNonce": i} for i in range(3)] + \
+                   [{"id": "box", "type": "rectangle", "x": 0, "y": 60, "width": 80, "height": 40, "version": 2, "versionNonce": 7,
+                     "boundElements": [{"type": "text", "id": "box-label"}]},
+                    {"id": "box-label", "type": "text", "x": 10, "y": 70, "width": 40, "height": 20, "text": "A", "containerId": "box", "version": 2, "versionNonce": 8}]
+        self.res = [{"id": f"r{i}", "type": "rectangle", "x": 300 + 100 * i, "y": 30, "width": 80, "height": 40, "version": 1, "versionNonce": 1}
+                    for i in range(2)]
+        self.post(self.src + self.res)
+        _, self.req = self.call("POST", self.base + "/requests", self.person("민수"), {"client": "c1", "kind": "diagram", "ids": ["s0", "s1", "s2", "box"]})
+        self.assertEqual(self.call("POST", f"{self.base}/requests/{self.req['rid']}", self.agent(), {"client": "ag-1", "status": "working"})[0], 200)
+        self.place("p1")
+
+    def post(self, els):
+        self.assertEqual(self.call("POST", self.base + "/elements", self.person(), {"client": "seed", "elements": els})[0], 200)
+
+    def place(self, pid):
+        ak = _ak()
+        a = ak.make_anchor(pid, (300, 30, 480, 70), rid=self.req["rid"], sources=["s0", "s1", "s2", "box"], results=["r0", "r1"],
+                           src_box=(0, 20, 80, 100), note="둘째 줄 확인", agent="Claude", by="Claude")
+        self.post([a])
+        b = self.store.get(self.bid)
+        with b.lock:   # a new round: the request is being worked on again
+            b.meta["requests"] = [dict(r, status="working") for r in b.meta["requests"]]
+        self.assertEqual(self.call("POST", f"{self.base}/requests/{self.req['rid']}", self.agent(),
+                                   {"client": "ag-1", "status": "proposed", "pid": pid})[0], 200)
+        return a
+
+    def act(self, action, frm="proposed", pid="p1", h=None, client="c1"):
+        return self.call("POST", f"{self.base}/proposals/{pid}", h or self.person("민수"), {"client": client, "action": action, "from_status": frm})
+
+    def els(self):
+        b = self.store.get(self.bid)
+        with b.lock:
+            return {k: dict(v) for k, v in b.elements.items()}
+
+    @staticmethod
+    def hash(els):
+        return sorted(f"{e['id']}:{e['version']}" for e in els.values() if not e.get("isDeleted"))
+
+    def test_criterion_2_3_apply_then_revert_restores_ids_places_and_card(self):
+        before = self.els()
+        b = self.store.get(self.bid)
+        seq0 = b.seq
+        st, d = self.act("apply")
+        self.assertEqual((st, d["status"]), (200, "applied"), d)
+        now = self.els()
+        for i in ("s0", "s1", "s2", "box", "box-label"):
+            self.assertTrue(now[i]["isDeleted"], i + " 원본(상자 안 글까지) 지움")
+            self.assertEqual(now[i]["version"], before[i]["version"] + 1)
+        self.assertEqual((now["r0"]["x"], now["r0"]["y"]), (0.0, 20.0), "결과가 원본 자리(왼쪽 위)로")
+        self.assertEqual((now["r1"]["x"] - now["r0"]["x"]), 100.0, "결과끼리 자리는 그대로")
+        a = now["prop-p1"]
+        self.assertEqual(srv.proposal_of(a)["status"], "applied")
+        evs = [(e, frm) for (n, frm, e, _) in b.log if n > seq0]
+        self.assertIn(("elements", ""), evs, "누른 사람 탭도 받는다(누구의 연결도 아닌 '')")
+        prop_ev = [d for (n, _, e, d) in b.log if n > seq0 and e == "proposal"]
+        self.assertEqual([(x["action"], x["by"], x["status"]) for x in prop_ev], [("apply", "민수", "applied")])
+        self.assertEqual(self.call("GET", self.base + "/requests?all=1", self.person())[1]["requests"][0]["status"], "done", "바꾸기 → 요청 끝")
+        st, d = self.act("revert", "applied", h=self.person("길동"), client="c2")
+        self.assertEqual((st, d["status"]), (200, "proposed"), d)
+        back = self.els()
+        for i in ("s0", "s1", "s2", "box", "box-label"):
+            self.assertFalse(back[i]["isDeleted"])
+            self.assertEqual((back[i]["x"], back[i]["y"]), (before[i]["x"], before[i]["y"]), i + " 같은 id · 같은 자리")
+        for i in ("r0", "r1", "prop-p1"):
+            self.assertEqual((back[i]["x"], back[i]["y"]), (before[i]["x"], before[i]["y"]), i + " 제안 자리로")
+        self.assertEqual(srv.proposal_of(back["prop-p1"])["status"], "proposed")
+        self.assertEqual(sorted(i.split(":")[0] for i in self.hash(back)), sorted(i.split(":")[0] for i in self.hash(before)))
+        self.assertEqual(self.call("GET", self.base + "/requests", self.person())[1]["requests"][0]["status"], "proposed", "원래대로 → 요청 다시 제안")
+        # what the screens receive is exactly the server state: a fresh GET equals the merged event stream
+        got = {e["id"]: e for e in self.call("GET", self.base, self.person())[1]["elements"]}
+        self.assertEqual(self.hash(got), self.hash(back))
+
+    def test_keep_and_dismiss(self):
+        st, d = self.act("keep")
+        self.assertEqual((st, d["status"]), (200, "gone"))
+        e = self.els()
+        self.assertTrue(e["prop-p1"]["isDeleted"])
+        self.assertFalse(any(e[i].get("isDeleted") for i in ("s0", "r0", "r1")), "둘 다 두기: 원본 · 결과 모두 남는다")
+        self.assertEqual(self.act("dismiss")[0], 409, "닫힌 카드에는 아무것도 못 한다")
+        self.assertEqual(self.call("GET", self.base + "/requests?all=1", self.person())[1]["requests"][0]["status"], "done")
+        self.place("p2")
+        st, _ = self.act("dismiss", pid="p2")
+        e = self.els()
+        self.assertEqual(st, 200)
+        self.assertTrue(all(e[i]["isDeleted"] for i in ("prop-p2", "r0", "r1")))
+        self.assertFalse(any(e[i].get("isDeleted") for i in ("s0", "s1", "s2", "box")), "버리기: 원본은 그대로")
+
+    def test_rules_and_permissions(self):
+        self.assertEqual(self.act("apply", h=self.person("보기", self.VK), client="v1")[0], 403, "보기 링크")
+        self.assertEqual(self.act("apply", h=self.agent(), client="ag-1")[0], 403, "에이전트는 놓기만, 고르지는 못한다")
+        self.assertEqual(self.act("bogus")[0], 400)
+        self.assertEqual(self.act("apply", frm="gone")[0], 400)
+        self.assertEqual(self.act("apply", pid="nope")[0], 404)
+        self.assertEqual(self.act("revert")[0], 409, "제안 상태에서 원래대로 없음")
+        self.assertEqual(self.act("apply", frm="applied")[0], 409, "본 상태가 다르면 409")
+        self.assertEqual(self.act("apply")[0], 200)
+        st, d = self.act("dismiss", "applied")
+        self.assertEqual((st, d["status"]), (409, "applied"), "바뀐 뒤 버리기 없음 — 원본과 결과가 둘 다 지워지지 않게")
+        self.assertEqual(self.act("apply")[0], 409, "두 번째 바꾸기")
+        st, d = self.act("keep", "applied")
+        self.assertEqual((st, d["status"]), (200, "gone"), "확정")
+        e = self.els()
+        self.assertTrue(e["s0"]["isDeleted"])
+        self.assertFalse(e["r0"].get("isDeleted"))
+
+    def test_criterion_4_apply_and_dismiss_at_once_20_times(self):
+        """Two people press apply and dismiss at the same moment: exactly one 200, one 409, and never originals and result both deleted."""
+        for k in range(20):
+            if k:
+                self.post([dict(e, version=e["version"] + 10 * k, versionNonce=k, isDeleted=False) for e in self.src + self.res])
+                self.place(f"q{k}")
+            pid = "p1" if not k else f"q{k}"
+            out, go = {}, threading.Barrier(2)
+
+            def press(name, action):
+                go.wait()
+                out[name] = self.act(action, pid=pid, client="c" + name)[0]
+            ts = [threading.Thread(target=press, args=("a", "apply")), threading.Thread(target=press, args=("b", "dismiss"))]
+            [t.start() for t in ts]
+            [t.join(10) for t in ts]
+            self.assertEqual(sorted(out.values()), [200, 409], (k, out))
+            e = self.els()
+            src_gone = all(e[i].get("isDeleted") for i in ("s0", "s1", "s2", "box"))
+            res_gone = all(e[i].get("isDeleted") for i in ("r0", "r1"))
+            self.assertFalse(src_gone and res_gone, f"round {k}: 원본과 결과가 둘 다 지워짐")
+            self.assertTrue(src_gone != res_gone, f"round {k}: 정확히 한쪽만")
+
+    def test_wp5_cap_counts_only_open_and_working(self):
+        """WP-5 review follow-up: a proposed request waits on people (its card closes it), so it no longer counts toward the 20 open."""
+        b = self.store.get(self.bid)
+        with b.lock:
+            b.meta["requests"] = b.meta["requests"] + [dict(b.meta["requests"][0], rid=f"{i:010x}", status="proposed") for i in range(25)]
+        st, d = self.call("POST", self.base + "/requests", self.person(), {"client": "c9", "kind": "auto", "ids": ["s0"]})
+        self.assertEqual(st, 201, d)
+
+
+class ProposalsR1(Proposals):
+    """WP-6 review r1 repros (neon #2 · #4 · #6 · #8 · #9, Opus #1 · #3)."""
+    for _n in [n for n in dir(Proposals) if n.startswith("test_")]:
+        locals()[_n] = None
+    del _n
+
+    def test_r1_apply_refused_when_every_result_is_gone(self):
+        self.post([dict(e, version=e["version"] + 1, isDeleted=True) for e in self.res])
+        st, d = self.act("apply")
+        self.assertEqual((st, d.get("status")), (409, "proposed"), d)
+        self.assertFalse(self.els()["s0"].get("isDeleted"), "원본은 그대로")
+
+    def test_r1_label_added_to_a_result_moves_and_goes_with_it(self):
+        self.post([{"id": "t_h", "type": "text", "x": 320, "y": 40, "width": 30, "height": 20, "text": "x", "containerId": "r0", "version": 1, "versionNonce": 1}])
+        self.assertEqual(self.act("apply")[0], 200)
+        e = self.els()
+        self.assertEqual((e["t_h"]["x"] - e["r0"]["x"], e["t_h"]["y"] - e["r0"]["y"]), (20.0, 10.0), "라벨이 결과와 같이 움직인다")
+        self.assertEqual(self.act("revert", "applied")[0], 200)
+        self.assertEqual(self.act("dismiss")[0], 200)
+        self.assertTrue(self.els()["t_h"]["isDeleted"], "버리면 라벨도 같이")
+
+    def test_r1_outside_arrows_follow_results_and_let_go_of_originals(self):
+        ext = {"id": "ext", "type": "arrow", "x": 600, "y": 50, "width": 120, "height": 0, "points": [[0, 0], [-120, 0]], "version": 1, "versionNonce": 1,
+               "startBinding": {"elementId": "far", "focus": 0, "gap": 4}, "endBinding": {"elementId": "r1", "focus": 0, "gap": 4}}
+        ext2 = {"id": "ext2", "type": "arrow", "x": -100, "y": 80, "width": 90, "height": 0, "points": [[0, 0], [90, 0]], "version": 1, "versionNonce": 1,
+                "startBinding": None, "endBinding": {"elementId": "box", "focus": 0, "gap": 4}}
+        self.post([ext, ext2])
+        r1 = self.els()["r1"]
+        self.assertEqual(self.act("apply")[0], 200)
+        e = self.els()
+        dx = e["r1"]["x"] - r1["x"]
+        self.assertEqual(e["ext"]["x"] + e["ext"]["points"][-1][0], 480 + dx, "결과에 묶인 끝은 결과를 따라간다")
+        self.assertEqual(e["ext"]["x"], 600, "다른 끝은 그대로")
+        self.assertIsNone(e["ext2"]["endBinding"], "지워진 원본을 가리키지 않는다")
+        self.assertEqual(self.act("revert", "applied")[0], 200)
+        e = self.els()
+        self.assertEqual(e["ext"]["x"] + e["ext"]["points"][-1][0], 480)
+        self.assertEqual(e["ext2"]["endBinding"]["elementId"], "box", "원래대로 하면 묶음도 돌아온다")
+
+    def test_r1_big_proposal_is_not_cut_at_2000(self):
+        many = [{"id": f"m{i}", "type": "rectangle", "x": 300 + i % 50 * 5, "y": 300 + i // 50 * 5, "width": 4, "height": 4, "version": 1, "versionNonce": 1}
+                for i in range(2100)]
+        for k in range(0, 2100, 1000):
+            self.post(many[k:k + 1000])
+        a = _ak().make_anchor("big", (300, 300, 550, 510), rid=None, sources=["s0", "s1", "s2", "box"], results=[e["id"] for e in many],
+                              src_box=(0, 20, 80, 100), agent="Claude", by="Claude")
+        self.post([a])
+        self.assertEqual(self.act("apply", pid="big")[0], 200)
+        e = self.els()
+        self.assertEqual(srv.proposal_of(e["prop-big"])["status"], "applied", "앵커가 잘리지 않는다")
+        self.assertEqual(sum(1 for m in many if e[m["id"]]["x"] < 300), 2100, "결과 전부 옮김")
+        self.assertEqual(self.act("revert", "applied", pid="big")[0], 200)
+        self.assertFalse(self.els()["s0"].get("isDeleted"))
+
+    def test_r1_broken_numbers_never_500(self):
+        b = self.store.get(self.bid)
+        self.assertEqual(self.act("apply")[0], 200)
+        with b.lock:
+            a = b.elements["prop-p1"]
+            p = dict(srv.proposal_of(a), home=[float("nan"), 0])
+            b.elements["prop-p1"] = dict(a, x="bad", customData={"cera": {"proposal": p}})
+        st, _ = self.act("revert", "applied")
+        self.assertEqual(st, 200)
+        self.assertFalse(self.els()["s0"].get("isDeleted"))
+
+
 if __name__ == "__main__":
     unittest.main()

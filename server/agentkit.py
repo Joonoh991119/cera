@@ -28,6 +28,7 @@ Standard library only; importable on Python 3.9.
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import secrets
 import sys
@@ -555,6 +556,33 @@ def make_frame(name: Optional[str] = None, x: Number = 0, y: Number = 0, w: Numb
     return e
 
 
+PROPOSAL_PREFIX = "prop-"   # server.py PROP_PREFIX: the anchor of proposal <pid> is element prop-<pid>
+PROPOSAL_PAD = 12           # the anchor's dashed box sits this far outside the result
+PROPOSAL_COLOR = "#1d8a5b"  # web/src/features/ask/ask.css .wb-ask-proposed
+
+
+def proposal_of(e: Element) -> Optional[dict]:
+    """customData.cera.proposal of a proposal anchor (WP-6), or None."""
+    p = _dict(_dict(_dict(e).get("customData")).get("cera")).get("proposal") if isinstance(e, dict) else None
+    return p if isinstance(p, dict) and isinstance(p.get("pid"), str) else None
+
+
+def make_anchor(pid: str, result_box: Tuple[float, float, float, float], *, rid: Optional[str], sources: Sequence[str],
+                results: Sequence[str], src_box: Optional[Tuple[float, float, float, float]], note: str = "",
+                uncertain: Optional[list] = None, drift: int = 0, agent: str = "", by: Optional[str] = None) -> Element:
+    """The proposal anchor: a locked dashed box around the result (people cannot grab or erase it by accident). The card on screen is drawn
+    over it; exports leave it out (web/src/features/export/exporters.js). Its record is what the server's apply / revert act on."""
+    x0, y0, x1, y1 = result_box
+    pad = PROPOSAL_PAD
+    rec = {"pid": pid, "rid": rid, "sources": list(sources), "results": list(results), "status": "proposed",
+           "home": [x0 - pad, y0 - pad], "src_box": list(src_box) if src_box else None, "deleted": [],
+           "note": note, "uncertain": list(uncertain or []), "drift": int(drift), "agent": agent}
+    e = _base("rectangle", x0 - pad, y0 - pad, x1 - x0 + 2 * pad, y1 - y0 + 2 * pad, by=by, id=PROPOSAL_PREFIX + pid,
+              stroke=PROPOSAL_COLOR, roundness={"type": 3}, custom={"cera": {"proposal": rec}})
+    e.update(strokeStyle="dashed", locked=True, opacity=60)
+    return e
+
+
 def make_image(file_id: str, w: Number, h: Number, x: Number = 0, y: Number = 0, *, latex: Optional[str] = None,
                by: Optional[str] = None, id: Optional[str] = None, frame_id: Optional[str] = None) -> Element:
     """Image element. The file (data URL) is uploaded separately via POST /files — before the element. With latex, it is displayed as a formula."""
@@ -881,6 +909,8 @@ def describe(elements: Iterable[Element], page: Optional[int] = None) -> Tuple[s
     In page order (frame customData.tbPage), top→bottom and left→right within a page. With page=k, only that page.
     Text is written as the original (originalText). Does not crash on broken elements (no coordinates, NaN, odd types)."""
     live = [e for e in elements or [] if isinstance(e, dict) and not e.get("isDeleted") and _sid(e.get("id"))]
+    props = [e for e in live if proposal_of(e)]   # proposal anchors (WP-6): one '제안' line each at the end, not a box
+    live = [e for e in live if not proposal_of(e)]
     by_id = {e["id"]: e for e in live}
     labels: Dict[str, Element] = {}
     orphans = set()   # bound text whose container element is gone (deleted)
@@ -1076,7 +1106,28 @@ def describe(elements: Iterable[Element], page: Optional[int] = None) -> Tuple[s
                     lines.append(ind + T("손글씨 획 %d개(위치를 알 수 없음)", "%d ink stroke(s) (position unknown)") % len(loose))
                 s_strokes.append({"page": pid, "count": len(more), "bbox": _fmt_box(bb) if bb else None,
                                   "ids": [s["id"] for s in more], "rest": True})
+    s_props = []
+    for e in sorted(props, key=lambda e: (_num(e.get("y")), _num(e.get("x")))):
+        p = proposal_of(e)
+        st = "applied" if p.get("status") == "applied" else "proposed"
+        src, res = p.get("sources"), p.get("results")
+        n_src, n_res = len(src) if isinstance(src, list) else 0, len(res) if isinstance(res, list) else 0
+        line = T("제안 [%s] %s · 원본 %d개 → 결과 %d개", "proposal [%s] %s · %d original(s) → %d result element(s)") % (
+            _clip(p["pid"], 64), T("바꿈(원래대로 가능)", "applied (can be reverted)") if st == "applied" else T("사람이 고르기를 기다림", "waiting for a person"),
+            n_src, n_res)
+        if isinstance(p.get("rid"), str):
+            line += T(" · 요청 [%s]", " · request [%s]") % _clip(p["rid"], 40)
+        if isinstance(p.get("drift"), int) and p["drift"] > 0:
+            line += T(" · 읽은 뒤 바뀜 %d", " · changed after reading: %d") % p["drift"]
+        if isinstance(p.get("note"), str) and p["note"]:
+            line += T(" · 메모 %s", " · note %s") % json.dumps(_clip(p["note"], 200), ensure_ascii=False)
+        b = element_bbox(e)
+        lines.append(line + (" " + at_text(b) if b else ""))
+        s_props.append({"pid": p["pid"], "id": e["id"], "status": st, "request": p.get("rid") if isinstance(p.get("rid"), str) else None,
+                        "sources": n_src, "results": n_res, "bbox": _fmt_box(b) if b else None})
     whole = scene_bbox(live)
     structured = {"counts": counts, "pages": s_pages, "items": s_items, "links": s_links, "strokes": s_strokes,
                   "bbox": _fmt_box(whole) if whole else None}
+    if s_props:
+        structured["proposals"] = s_props
     return "\n".join(lines), structured

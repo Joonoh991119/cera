@@ -1,0 +1,32 @@
+/* Proposal cards (WP-6). Colors come from .wb-board (--dk-*); the green matches the anchor (agentkit PROPOSAL_COLOR) and the 'proposed' chip */
+.wb-prop-card { position: absolute; box-sizing: border-box; display: grid; align-content: center; gap: 4px; padding: 6px 8px 6px 12px; border-radius: 12px;
+  background: var(--dk-bg); color: var(--dk-fg); border: 2px solid #1d8a5b; box-shadow: 0 2px 12px rgba(20, 24, 40, .18); pointer-events: auto; }
+.wb-prop-card.wb-prop-applied { border-color: #7b61ff; }
+.wb-prop-card.wb-ask-touch { padding: 6px 6px 6px 12px; }
+.wb-prop-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wb-prop-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 700; }
+.wb-ask-touch .wb-prop-title { font-size: 14.5px; }
+.wb-prop-note { line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--dk-mut); }
+.wb-prop-row { display: flex; gap: 6px; }
+.wb-prop-row .wb-ask-act { height: 28px; }
+.wb-prop-main { background: #1d8a5b !important; color: #fff !important; }
+.wb-prop-applied .wb-prop-main { background: #7b61ff !important; }
+.wb-ask-act:disabled { opacity: .5; cursor: default; }
+.wb-prop-q { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 11px; border: 0; background: #a16207; color: #fff; font: inherit; font-size: 13px; font-weight: 800; cursor: pointer; }
+.wb-ask-touch .wb-prop-q { width: 32px; height: 32px; border-radius: 16px; }
+.wb-prop-drift { flex: 0 0 auto; padding: 1px 8px; border-radius: 999px; background: #fff4e5; color: #8a4b00; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.wb-ask-head .wb-prop-drift { margin-left: 8px; }
+.wb-prop-pop { position: absolute; left: 0; top: calc(100% + 4px); z-index: 1; min-width: 200px; max-width: 320px; padding: 8px 10px; border-radius: 10px;
+  background: var(--dk-bg); color: var(--dk-fg); border: 1px solid var(--dk-line); box-shadow: 0 6px 20px rgba(0, 0, 0, .2); }
+.wb-prop-unsure { margin: 0; padding: 0 0 0 16px; font-size: 13.5px; display: grid; gap: 2px; }
+.wb-prop-unsure span { color: var(--dk-mut); }
+.wb-prop-sheetnote { margin: 0; font-size: 14px; color: var(--dk-mut); overflow-wrap: anywhere; }
+.wb-prop-big { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.wb-prop-big button { min-height: 52px; font-size: 15px; font-weight: 700; }
+.wb-prop-toast { position: fixed; left: 50%; top: 64px; transform: translateX(-50%); z-index: 30; display: flex; align-items: center; gap: 10px;
+  max-width: calc(100vw - 24px); box-sizing: border-box; padding: 6px 6px 6px 14px; border-radius: 12px; background: #1f2430; color: #fff;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25); font-size: 14px; font-weight: 600; pointer-events: auto; }
+.wb-prop-toast span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-sheeting .wb-prop-layer, .wb-sheeting .wb-prop-toast { display: none; }
+.wb-ask-touch .wb-prop-pop { max-width: calc(100vw - 32px); }
+.wb-ask-touch .wb-prop-unsure { font-size: 15px; }

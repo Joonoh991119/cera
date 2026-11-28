@@ -2,6 +2,7 @@
 // The functions near the top are pure logic (tests: web/tests/exporters.test.mjs). Only buildExport runs in the browser.
 import { pageElements } from "../pages/pages.js";
 import { tr } from "../../i18n.js";
+import { isAnchor } from "../proposal/proposal.js";
 //
 // scope is an open set: "all", "selection", "frame" (a single page, chosen by frameId). The all-pages PDF in features/pages/pagesPdf.js
 // calls buildExport("frame", JPEG) from this file for each page and bundles the results.
@@ -39,7 +40,7 @@ export function expandSelection(elements, selectedIds) {
 // Scope to elements to draw. An empty selection falls back to the whole board (fellBack).
 // frame: elements overlapping that page (generously; Excalidraw's exportingFrame re-picks what is actually drawn and crops to the page boundary).
 export function resolveScope(scope, elements, selectedIds, { frameId } = {}) {
-  const live = elements.filter((e) => !e.isDeleted);
+  const live = elements.filter((e) => !e.isDeleted && !isAnchor(e));   // a proposal's dashed anchor box is screen-only (WP-6)
   if (scope === "frame") {
     const frame = live.find((e) => e.id === frameId && e.type === "frame");
     return { elements: frame ? pageElements(live, frame) : [], frame: frame || null, scope: "frame", fellBack: false };

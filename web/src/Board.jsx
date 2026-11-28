@@ -35,6 +35,8 @@ import useRequests from "./features/ask/useRequests.js";   // 'Ask the AI': sele
 import AskButton from "./features/ask/AskButton.jsx";
 import AskSheet from "./features/ask/AskSheet.jsx";
 import RequestLayer from "./features/ask/RequestLayer.jsx";
+import ProposalLayer from "./features/proposal/ProposalLayer.jsx";   // proposal cards: apply / keep both / discard / revert (WP-6)
+import { hideCarded } from "./features/proposal/proposal.js";
 
 
 const PUSH_MS = 80;        // interval for batching and sending changed elements
@@ -186,6 +188,7 @@ export default function Board({ id, me }) {
   const agentJobs = useAgentJobs({ excal, id, client, viewOnly: me.role === "view", coarse });
   const ask = useRequests({ id, client, viewOnly: me.role === "view", toast: (message) => excal && excal.setToast({ message, duration: 3000 }) });
   const [asking, setAsking] = useState(null);   // ask window {ids, over, at}
+  const [cardPids, setCardPids] = useState("");  // proposals with a card on the board: their 'proposal ready' chip is not shown twice
 
 
   // Initial load: if it fails, retry after a moment (never leave the screen blank)
@@ -258,6 +261,7 @@ export default function Board({ id, me }) {
       else if (event === "meta") setMeta(data);
       else if (event === "job") agentJobs.notify(data);
       else if (event === "request") ask.notify(data);
+      else if (event === "proposal") window.dispatchEvent(new CustomEvent("wb-proposal", { detail: data }));   // toast on every screen (ProposalLayer)
     };
     const onReset = async (given) => {   // the server restarted or its log was trimmed: fetch the full state and merge, and resend my elements that the server lacks
       const d = given ? { elements: given } : await api.board(id);
@@ -821,7 +825,8 @@ export default function Board({ id, me }) {
       {excal && <PageBar pages={pages} viewOnly={viewOnly} mobile={mobile} />}
       {excal && <FollowLayer f={follow} me={me} others={others} />}
       {!viewOnly && excal && <QuickConnect excal={excal} touch={coarse} blocked={!!sheet || !!math || saving || !!importing || menu || fontPop || moreInk || deskOpen || follow.menu || !!asking} />}
-      {excal && <RequestLayer excal={excal} list={ask.list} touch={coarse} viewOnly={viewOnly} onAction={ask.act} />}
+      {excal && <RequestLayer excal={excal} list={hideCarded(ask.list, cardPids)} touch={coarse} viewOnly={viewOnly} onAction={ask.act} />}
+      {excal && <ProposalLayer excal={excal} boardId={id} client={client} touch={coarse} viewOnly={viewOnly} requests={ask.list} create={ask.create} onPids={setCardPids} />}
       {!viewOnly && excal && <AskButton excal={excal} touch={coarse} onOpen={setAsking} blocked={!!sheet || !!math || saving || !!importing || menu || fontPop || moreInk || deskOpen || follow.menu || !!asking} />}
       {asking && <AskSheet mobile={mobile} touch={coarse} at={asking.at} count={asking.ids.length} over={asking.over}
         onClose={() => { setAsking(null); setTimeout(refocus, 0); }}

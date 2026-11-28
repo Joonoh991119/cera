@@ -132,7 +132,7 @@ REQ_AGENT = {"working": ("open", "working", "interrupted"), "proposed": ("open",
 REQ_LIVE = ("open", "working", "proposed", "failed", "declined", "interrupted")   # shown as a chip until a person closes it (done / cancelled)
 REQ_META = ("requests", "request_n")   # meta keys that never leave the server as meta (requests go out only through req_public)
 REQ_NOTE_MAX = 200       # characters of a request note / agent reply (longer -> 400)
-REQ_MAX_OPEN = 20        # open + working + proposed requests per board (21st -> 429)
+REQ_MAX_OPEN = 20        # open + working requests per board (21st -> 429). proposed ones wait on people (their card closes them), so they do not count
 REQ_GAP = 3.0            # one new request per connection per this many seconds (429)
 REQ_TARGETS_MAX = 500
 REQ_KEEP = 86400.0       # requests are kept 24 h ...
@@ -140,6 +140,26 @@ REQ_KEEP_COUNT = 50      # ... and at most this many per board (finished ones dr
 REQ_GONE_S = 60.0        # working, but the agent that took it has had no presence for this long -> interrupted
 REQ_ID = re.compile(r"^[a-f0-9]{10}$")
 PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Proposal cards (WP-6, B2): the agent's result sits beside the originals with a locked dashed 'anchor' rectangle (id prop-<pid>) whose
+# customData.cera.proposal = {pid, rid, sources, results, status, home, src_box, deleted, ...}. People press apply / revert / keep / dismiss;
+# the server does it under the board lock (from_status must match, so two presses at once never both win) and broadcasts to everyone.
+PROP_PREFIX = "prop-"
+PROP_ACTIONS = {"apply": ("proposed",), "revert": ("applied",), "keep": ("proposed", "applied"), "dismiss": ("proposed",)}
+PROP_IDS_MAX = 20000     # sources / results ids the server acts on per proposal
+
+
+def proposal_of(e):
+    """The proposal record of an anchor element, or None."""
+    cd = e.get("customData") if isinstance(e, dict) else None
+    c = cd.get("cera") if isinstance(cd, dict) else None
+    p = c.get("proposal") if isinstance(c, dict) else None
+    return p if isinstance(p, dict) and isinstance(p.get("pid"), str) else None
+
+
+def _ids(v):
+    return [i for i in v[:PROP_IDS_MAX] if isinstance(i, str) and 0 < len(i) <= 64] if isinstance(v, list) else []
+
+
 _CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
 
 
@@ -657,7 +677,7 @@ class Board:
         if t - self.req_last.get(client, 0.0) < REQ_GAP:
             return 429, {"error": T("요청은 3초에 하나씩", "one request every 3 seconds"),
                          "retry_ms": int((REQ_GAP - (t - self.req_last[client])) * 1000) + 20}
-        if sum(1 for r in self._reqs() if r.get("status") in ("open", "working", "proposed")) >= REQ_MAX_OPEN:
+        if sum(1 for r in self._reqs() if r.get("status") in ("open", "working")) >= REQ_MAX_OPEN:
             return 429, {"error": T(f"열린 요청이 많다(최대 {REQ_MAX_OPEN}) — 끝난 것을 닫아 주세요",
                                     f"too many open requests (max {REQ_MAX_OPEN}) - close finished ones")}
         targets, boxes, seen = [], [], set()
@@ -766,6 +786,159 @@ class Board:
         for k in [k for k, v in self.agent_seen.items() if t - v > 2 * REQ_GONE_S]:
             self.agent_seen.pop(k, None)
         return changed
+
+    # ---------- proposal cards (WP-6) ----------
+    def proposal_act(self, pid, action, from_status, by):
+        """A person's apply · revert · keep · dismiss on proposal pid, all under the lock. from_status must be the card's status right now
+        (proposed · applied), otherwise 409 - so of two people pressing at once exactly one wins, and the originals and the result are never
+        both deleted (dismiss only from proposed, apply only while some result is alive, revert brings the originals back first).
+        Labels inside originals / results go with them; arrows from outside bound to a result follow it, arrows bound to an original let go
+        on apply and are bound again on revert. Every change goes out to everyone (the presser too) as a server change: it is not in anyone's
+        undo history. -> (status, body)"""
+        t = time.time()
+        req_changed = False
+        with self.lock:
+            a = self.elements.get(PROP_PREFIX + pid)
+            p = proposal_of(a)
+            if p is None or p.get("pid") != pid:
+                return 404, {"error": T("제안이 없다", "no such proposal")}
+            cur = "gone" if a.get("isDeleted") else str(p.get("status") or "proposed")
+            if cur != from_status or cur not in PROP_ACTIONS[action]:
+                return 409, {"error": T("그사이 다른 사람이 먼저 눌렀다", "someone else acted on it first"), "status": cur}
+            out = {}
+
+            def bump(e, **sets):
+                n = dict(out.get(e["id"]) or e, **sets)
+                if e["id"] not in out:
+                    try:
+                        n["version"] = int(e.get("version") or 0) + 1
+                    except (TypeError, ValueError):
+                        n["version"] = 1
+                    n["versionNonce"] = secrets.randbelow(2 ** 31)
+                    n["updated"] = int(t * 1000)
+                out[e["id"]] = n
+                return n
+
+            alive = [e for e in self.elements.values() if isinstance(e, dict) and not e.get("isDeleted")]
+
+            def with_labels(ids):   # ids plus the live text bound inside them (labels people added later too)
+                ids = [i for i in ids if isinstance(self.elements.get(i), dict) and not self.elements[i].get("isDeleted")]
+                have = set(ids)
+                return [self.elements[i] for i in ids] + [e for e in alive if e.get("containerId") in have and e["id"] not in have]
+
+            def num(v):
+                return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+            def moved(e, dx, dy):
+                x, y = num(e.get("x")), num(e.get("y"))
+                return {"x": x + dx, "y": y + dy} if x is not None and y is not None else {}
+
+            def union(els):
+                bs = [b for b in (element_box(e) for e in els) if b]
+                return (min(b[0] for b in bs), min(b[1] for b in bs), max(b[2] for b in bs), max(b[3] for b in bs)) if bs else None
+
+            def follow(ids, dx, dy):   # outside arrows bound to the moved elements: move the bound end(s) with them
+                for e in alive:
+                    if e.get("type") != "arrow" or e["id"] in ids or not (dx or dy):
+                        continue
+                    pts = e.get("points")
+                    ends = [isinstance(e.get(k), dict) and e[k].get("elementId") in ids for k in ("startBinding", "endBinding")]
+                    if not any(ends) or not isinstance(pts, list) or len(pts) < 2 or num(e.get("x")) is None or num(e.get("y")) is None or \
+                            not all(isinstance(q, (list, tuple)) and len(q) >= 2 and num(q[0]) is not None and num(q[1]) is not None for q in pts):
+                        continue
+                    if all(ends):
+                        bump(e, **moved(e, dx, dy))
+                        continue
+                    abs_ = [[e["x"] + q[0], e["y"] + q[1]] for q in pts]
+                    k = 0 if ends[0] else -1
+                    abs_[k] = [abs_[k][0] + dx, abs_[k][1] + dy]
+                    x0, y0 = abs_[0]
+                    bump(e, x=x0, y=y0, points=[[q[0] - x0, q[1] - y0] for q in abs_])
+
+            results = with_labels([i for i in _ids(p.get("results")) if i != a["id"]])
+            rids = {e["id"] for e in results}
+            np = dict(p)
+            if action == "apply":
+                if not results:
+                    return 409, {"error": T("제안 결과가 모두 지워져서 바꿀 수 없다", "every result of the proposal was deleted - nothing to put in"),
+                                 "status": cur}
+                src = [e for e in with_labels(_ids(p.get("sources"))) if e["id"] not in rids]
+                sids = {e["id"] for e in src}
+                sb = union(src)
+                if sb is None:
+                    b0 = p.get("src_box")
+                    sb = tuple(num(v) for v in b0) if isinstance(b0, list) and len(b0) == 4 and all(num(v) is not None for v in b0) else None
+                rb = union(results) or element_box(a)
+                dx, dy = (sb[0] - rb[0], sb[1] - rb[1]) if sb and rb else (0.0, 0.0)
+                unbound = []
+                for e in alive:   # arrows from outside bound to an original: let go now, bind again on revert
+                    if e.get("type") == "arrow" and e["id"] not in sids and e["id"] not in rids:
+                        for k in ("startBinding", "endBinding"):
+                            if isinstance(e.get(k), dict) and e[k].get("elementId") in sids:
+                                unbound.append([e["id"], k, e[k]])
+                                bump(e, **{k: None})
+                np.update(status="applied", deleted=[e["id"] for e in src], unbound=unbound, by_act=by)
+                bump(a, **moved(a, dx, dy), customData=self._prop_custom(a, np))   # the anchor first: its record must never be cut off
+                for e in src:
+                    bump(e, isDeleted=True)
+                for e in results:
+                    bump(e, **moved(e, dx, dy))
+                follow(rids, dx, dy)
+                new_status = "applied"
+            elif action == "revert":
+                home, ax, ay = p.get("home"), num(a.get("x")), num(a.get("y"))
+                ok = isinstance(home, list) and len(home) == 2 and all(num(v) is not None for v in home) and ax is not None and ay is not None
+                dx, dy = (home[0] - ax, home[1] - ay) if ok else (0.0, 0.0)
+                np.update(status="proposed", deleted=[], unbound=[], by_act=by)
+                bump(a, **moved(a, dx, dy), customData=self._prop_custom(a, np))
+                for i in _ids(p.get("deleted")):
+                    e = self.elements.get(i)
+                    if isinstance(e, dict) and e.get("isDeleted"):
+                        bump(e, isDeleted=False)
+                for e in results:
+                    bump(e, **moved(e, dx, dy))
+                follow(rids, dx, dy)
+                for u in p.get("unbound") or []:
+                    e = self.elements.get(u[0]) if isinstance(u, list) and len(u) == 3 and isinstance(u[0], str) else None
+                    if isinstance(e, dict) and not e.get("isDeleted") and u[1] in ("startBinding", "endBinding") and isinstance(u[2], dict) and \
+                            not (out.get(e["id"]) or e).get(u[1]):
+                        bump(e, **{u[1]: u[2]})
+                new_status = "proposed"
+            elif action == "keep":
+                bump(a, isDeleted=True)
+                new_status = "gone"
+            else:   # dismiss
+                bump(a, isDeleted=True)
+                for e in results:
+                    bump(e, isDeleted=True)
+                new_status = "gone"
+            lst_out = list(out.values())
+            took = []
+            for k in range(0, len(lst_out), MAX_ELEMENTS_PER_POST):   # merge takes MAX_ELEMENTS_PER_POST at a time; the lock is held throughout
+                took += self.merge(lst_out[k:k + MAX_ELEMENTS_PER_POST], "")   # client "" is nobody's: every screen gets it, the presser's too
+            rid = p.get("rid")
+            if isinstance(rid, str):   # the request follows the card: apply · keep · dismiss close it, revert reopens it as proposed
+                lst = self._reqs()
+                i = next((k for k, r in enumerate(lst) if r.get("rid") == rid), None)
+                want = "proposed" if action == "revert" else "done"
+                if i is not None and lst[i].get("status") != want and (lst[i].get("status") in REQ_LIVE or action == "revert"):
+                    new = dict(lst[i], status=want, updated=int(t * 1000))
+                    self.meta["requests"] = lst[:i] + [new] + lst[i + 1:]
+                    self.dirty = True
+                    self.publish("request", self.req_public(new))
+                    req_changed = True
+            self.publish("proposal", {"pid": pid, "action": action, "from": cur, "by": by, "status": new_status,
+                                      "rid": rid if isinstance(rid, str) else None})
+            body = {"pid": pid, "status": new_status, "applied": [{"id": e["id"], "version": e["version"]} for e in took]}
+        if req_changed:
+            self._requests_changed()
+        return 200, body
+
+    @staticmethod
+    def _prop_custom(a, np):
+        cd = dict(a.get("customData") or {})
+        cd["cera"] = dict(cd.get("cera") or {}, proposal=np)
+        return cd
 
     def pending_entries(self):
         """Requests waiting for an agent (open · interrupted), for the UserPromptSubmit hook's pending.json."""
@@ -1809,6 +1982,9 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 return self.send(201, b.meta_public())
             if path == "/api/whiteboard/boards/import":   # import into a new board
                 return self.do_import(None, data, "new", usr, client=str(data.get("client", ""))[:40])
+            pm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/proposals/([A-Za-z0-9_-]{1,40})$", path)
+            if pm:
+                return self.do_proposal(pm, data, usr)
             rm = re.match(r"^/api/whiteboard/boards/([a-z0-9]+)/requests(?:/([A-Za-z0-9]{1,40}))?$", path)
             if rm:
                 return self.do_request(rm, data, usr)
@@ -1902,6 +2078,26 @@ def make_handler(store: Store, dist: Path, trust_header: str | None, test_user: 
                 pid = data["pid"]
             by = re.sub(r"\s*·\s*AI$", "", usr["name"]) if agent else usr["name"]
             code, out = b.request_update(rid, status, by, client, agent, reply, pid)
+            return self.send(code, out)
+
+        def do_proposal(self, pm, data, usr):
+            """Proposal card buttons (WP-6): {action: apply|revert|keep|dismiss, from_status: proposed|applied, client}. A person's edit
+            connection only (view links were already refused; an agent may place a proposal but never decide it)."""
+            b = store.get(pm.group(1))
+            if not b:
+                return self.send(404, {"error": "no board"})
+            if not isinstance(data, dict):
+                return self.send(400, {"error": "body must be an object"})
+            if usr.get("agent"):
+                return self.send(403, {"error": T("사람 편집 연결만", "a person's edit connection only")})
+            if not CLIENT_ID.match(str(data.get("client", ""))):
+                return self.send(400, {"error": "client"})
+            action, frm = data.get("action"), data.get("from_status")
+            if not isinstance(action, str) or action not in PROP_ACTIONS:
+                return self.send(400, {"error": "action", "allowed": list(PROP_ACTIONS)})
+            if frm not in ("proposed", "applied"):
+                return self.send(400, {"error": "from_status", "allowed": ["proposed", "applied"]})
+            code, out = b.proposal_act(pm.group(2), action, frm, usr["name"])
             return self.send(code, out)
 
         def do_job(self, jm, data, usr):

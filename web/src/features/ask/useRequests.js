@@ -6,7 +6,7 @@ import { KEY, getName } from "../../key.js";
 import { tr } from "../../i18n.js";
 import { mergeRequest, replaceAll, copyText, ACTION_STATUS } from "./requests.js";
 
-async function call(method, url, body) {
+export async function call(method, url, body) {   // also used by the proposal cards (WP-6)
   const h = { "X-Whiteboard": "1" };
   if (KEY) h["X-Tb-Key"] = KEY;
   if (getName()) h["X-Tb-Name"] = encodeURIComponent(getName());
